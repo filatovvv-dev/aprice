@@ -1,0 +1,4 @@
+PyQt6>=6.6
+playwright>=1.40
+pandas>=2.1
+numpy>=1.26
