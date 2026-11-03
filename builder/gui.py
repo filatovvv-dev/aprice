@@ -26,6 +26,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -82,12 +83,14 @@ class ParseWorker(QThread):
         self._stop_event.set()
 
     def run(self) -> None:  # noqa: D102 — docstring наследуется от QThread
+        # Лимит марок читается из settings.json (builder.limit_brands;
+        # null = без лимита) — задача №2, п. 1.4. GUI-чекбокс синхронизирует
+        # этот же ключ конфига перед запуском воркера.
         parser = CatalogParser(
             db=self._db,
             config=self._config,
             progress_cb=lambda step, total, msg: self.progress.emit(step, total, msg),
             stop_event=self._stop_event,
-            limit_brands=5,  # валидационный объём этапа 1 (см. комментарий ТЗ)
         )
         try:
             parser.run()
@@ -122,7 +125,11 @@ class BuilderWindow(QMainWindow):
         """
         super().__init__()
         self._config = config
-        self._window_manager = WindowManager()
+        # Компонентный INI позиций окон (задача №2, п. 2.1): позиции
+        # Builder не пересекаются с будущими окнами Server/Client.
+        self._window_manager = WindowManager(
+            settings_filename=constants.BUILDER_WINDOW_SETTINGS_FILE
+        )
         self._worker: Optional[ParseWorker] = None
 
         self.setWindowTitle(constants.BUILDER_TITLE)
@@ -154,6 +161,20 @@ class BuilderWindow(QMainWindow):
         buttons_row.addStretch(1)
         buttons_row.addWidget(self.btn_save_log)
         layout.addLayout(buttons_row)
+
+        # Ограничение объёма прогона (задача №2, п. 1.4): состояние
+        # двусторонне синхронизировано с settings.json (builder.limit_brands).
+        self.chk_limit_brands = QCheckBox(
+            "Ограничить 5 марками (валидация)", central
+        )
+        self.chk_limit_brands.setToolTip(
+            "Снимите галочку для полного обхода всех марок каталога. "
+            "Значение сохраняется в config/settings.json (builder.limit_brands)."
+        )
+        saved_limit = self._config.get("builder", "limit_brands", 5)
+        self.chk_limit_brands.setChecked(saved_limit is not None)
+        self.chk_limit_brands.toggled.connect(self._on_limit_toggled)
+        layout.addWidget(self.chk_limit_brands)
 
         self.progress_bar = QProgressBar(central)
         self.progress_bar.setRange(0, 0)  # indeterminate до первого шага
@@ -212,6 +233,20 @@ class BuilderWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             self._worker.stop()
             self.btn_stop.setEnabled(False)
+
+    def _on_limit_toggled(self, checked: bool) -> None:
+        """Сохраняет выбор лимита марок в settings.json (задача №2, п. 1.4).
+
+        Args:
+            checked: ``True`` — ограничивать 5 марками (валидация),
+                ``False`` — полный обход (``limit_brands = null``).
+        """
+        self._config.set("builder", "limit_brands", 5 if checked else None)
+        self._config.save()
+        logger.info(
+            "Лимит марок: %s (сохранено в settings.json)",
+            "5 (валидация)" if checked else "без ограничения",
+        )
 
     def _on_progress(self, step: int, total: int, message: str) -> None:
         """Обновляет прогресс-бар по данным парсера."""

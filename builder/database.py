@@ -2,7 +2,8 @@
 
 Реализует:
 
-* создание схемы при первом запуске;
+* создание схемы при первом запуске (актуальная версия — 2);
+* автоматическую миграцию старых схем (:mod:`builder.migrations`);
 * UPSERT-записи (``INSERT ... ON CONFLICT ... DO UPDATE``) — требование P-09:
   повторный запуск обновляет ``updated_at``, а не дублирует строки;
 * агрегированные счётчики для строки статуса GUI.
@@ -16,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from builder import migrations
 from common import constants
 
 logger = logging.getLogger(__name__)
@@ -53,14 +55,17 @@ CREATE TABLE IF NOT EXISTS generations (
 CREATE TABLE IF NOT EXISTS configurations (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     generation_id      INTEGER NOT NULL,
-    transmission       TEXT,
-    fuel_type          TEXT,
+    transmission       TEXT,             -- МКПП | АКПП | Вариатор | Робот | DSG
+    fuel_type          TEXT,             -- Бензин | Дизель | Гибрид | Электро
     engine_volume_from REAL,
     engine_volume_to   REAL,
     power_from         INTEGER,
     power_to           INTEGER,
     updated_at         TEXT NOT NULL,
-    FOREIGN KEY (generation_id) REFERENCES generations(id)
+    FOREIGN KEY (generation_id) REFERENCES generations(id),
+    -- Бизнес-ключ конфигурации (схема v2, задача №2 п. 1.3):
+    -- одна запись на пару (КПП, топливо) в поколении.
+    UNIQUE (generation_id, transmission, fuel_type)
 );
 
 CREATE TABLE IF NOT EXISTS metadata (
@@ -101,13 +106,27 @@ class Database:
     # Жизненный цикл
     # ------------------------------------------------------------------
     def init_schema(self) -> None:
-        """Создаёт таблицы и индексы (IF NOT EXISTS), проставляет metadata."""
+        """Создаёт таблицы/индексы и выполняет миграции старых схем.
+
+        Для новой БД применяется схема версии :data:`constants.SCHEMA_VERSION`.
+        Для существующей базы v1 автоматически запускается
+        :func:`builder.migrations.migrate_to_v2` (с обязательной резервной
+        копией ``aprice.db.bak-v1``).
+        """
         self._conn.executescript(_SCHEMA_SQL)
+        # Миграция v1 -> v2: добавляет UNIQUE(generation_id, transmission,
+        # fuel_type) в configurations, если база создана по старой схеме.
+        try:
+            migrations.migrate_to_v2(self._conn, db_path=self._path)
+        except Exception:  # noqa: BLE001 — логируем и поднимаем дальше
+            logger.exception("Миграция схемы до v2 завершилась с ошибкой")
+            raise
         self.set_metadata("schema_version", constants.SCHEMA_VERSION)
         if self.get_metadata("source") is None:
             self.set_metadata("source", "auto.ru/cars-base.ru")
         self._conn.commit()
-        logger.info("Схема БД проверена/создана: %s", self._path)
+        logger.info("Схема БД проверена/мигрирована (v%s): %s",
+                    constants.SCHEMA_VERSION, self._path)
 
     def close(self) -> None:
         """Закрывает соединение с базой."""
@@ -239,18 +258,27 @@ class Database:
     ) -> None:
         """Добавляет/обновляет конфигурацию (КПП/топливо/объём/мощность).
 
-        Конфигурации не имеют уникального бизнес-ключа в схеме ТЗ, поэтому
-        дедупликация выполняется по кортежу всех значений (частичный индекс
-        реализуется через SELECT перед INSERT).
+        Схема v2: бизнес-ключ ``(generation_id, transmission, fuel_type)``
+        защищён ``UNIQUE``-ограничением, поэтому дедупликация выполняется
+        честным UPSERT (``INSERT ... ON CONFLICT ... DO UPDATE``) без
+        «SELECT перед INSERT» (задача №2, п. 1.3). Существующая запись
+        обновляется целиком (диапазоны объёма/мощности актуализируются),
+        ``updated_at`` перезаписывается — требование P-09.
         """
         now = utc_now_iso()
-        existing = self._conn.execute(
+        self._conn.execute(
             """
-            SELECT id FROM configurations
-            WHERE generation_id IS ? AND transmission IS ? AND fuel_type IS ?
-              AND engine_volume_from IS ? AND engine_volume_to IS ?
-              AND power_from IS ? AND power_to IS ?
-            LIMIT 1
+            INSERT INTO configurations
+                (generation_id, transmission, fuel_type,
+                 engine_volume_from, engine_volume_to,
+                 power_from, power_to, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(generation_id, transmission, fuel_type) DO UPDATE
+                SET engine_volume_from = excluded.engine_volume_from,
+                    engine_volume_to   = excluded.engine_volume_to,
+                    power_from         = excluded.power_from,
+                    power_to           = excluded.power_to,
+                    updated_at         = excluded.updated_at
             """,
             (
                 generation_id,
@@ -260,33 +288,9 @@ class Database:
                 engine_volume_to,
                 power_from,
                 power_to,
+                now,
             ),
-        ).fetchone()
-        if existing:
-            self._conn.execute(
-                "UPDATE configurations SET updated_at = ? WHERE id = ?",
-                (now, existing["id"]),
-            )
-        else:
-            self._conn.execute(
-                """
-                INSERT INTO configurations
-                    (generation_id, transmission, fuel_type,
-                     engine_volume_from, engine_volume_to,
-                     power_from, power_to, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    generation_id,
-                    transmission,
-                    fuel_type,
-                    engine_volume_from,
-                    engine_volume_to,
-                    power_from,
-                    power_to,
-                    now,
-                ),
-            )
+        )
 
     def commit(self) -> None:
         """Фиксирует текущую транзакцию."""
