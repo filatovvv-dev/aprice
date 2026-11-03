@@ -53,6 +53,16 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, int, str], None]
 
 
+class _Unset:
+    """Служебный маркер «параметр не передан» для различения ``None``."""
+
+    def __repr__(self) -> str:  # noqa: D105
+        return "<UNSET>"
+
+
+_UNSET = _Unset()
+
+
 class CaptchaDetectedError(RuntimeError):
     """Ошибка, сигназирующая о CAPTCHA/блокировке со стороны источника (P-08)."""
 
@@ -250,7 +260,7 @@ class CatalogParser:
         config: Config,
         progress_cb: Optional[ProgressCallback] = None,
         stop_event: Optional[threading.Event] = None,
-        limit_brands: Optional[int] = 5,
+        limit_brands: object = _UNSET,
     ) -> None:
         """Инициализирует парсер.
 
@@ -260,13 +270,33 @@ class CatalogParser:
             progress_cb: Колбэк прогресса ``(step, total, message)``;
                 ``total == -1`` означает неизвестное общее число шагов.
             stop_event: Флаг остановки («Остановить» в GUI).
-            limit_brands: Максимум марок за прогон (``None`` — все).
+            limit_brands: Максимум марок за прогон. Если параметр не
+                передан — значение читается из ``settings.json``
+                (``builder.limit_brands``, ``null`` = без лимита);
+                явный ``None`` также означает «без лимита».
         """
         self._db = db
         self._config = config
         self._progress = progress_cb or (lambda *_: None)
         self._stop = stop_event or threading.Event()
-        self._limit = limit_brands
+
+        # Лимит марок: явный аргумент приоритетнее конфига; в значениях по
+        # умолчанию лимит берётся из settings.json (builder.limit_brands,
+        # null = без лимита) — задача №2, п. 1.4.
+        if limit_brands is _UNSET:
+            raw_limit = config.get("builder", "limit_brands", 5)
+            self._limit: Optional[int] = int(raw_limit) if raw_limit is not None else None
+        elif limit_brands is None:
+            # Явно переданный None трактуем как «без лимита» только через
+            # sentinel _UNSET; для обратной совместимости None == без лимита.
+            self._limit = None
+        else:
+            self._limit = int(limit_brands)
+
+        # Токен API cars-base.ru из конфига (задача №2, п. 6).
+        self._token = str(config.get("builder", "cars_base_token", constants.CARS_BASE_TOKEN))
+        # Режим браузера HTML-фолбэка (задача №2, п. 5 ревью).
+        self._headless = bool(config.get("builder", "headless", True))
 
         delay = config.get("builder", "request_delay_sec", [1, 3])
         lo, hi = (float(delay[0]), float(delay[1])) if len(delay) >= 2 else (1.0, 3.0)
@@ -436,6 +466,16 @@ class CatalogParser:
         Используется только если API недоступен. Извлекает ссылки марок/моделей
         со страниц каталога; при обнаружении CAPTCHA бросает
         :class:`CaptchaDetectedError` (P-08).
+
+        Перед запуском браузера выполняется предпроверка наличия Chromium для
+        Playwright (задача №2, п. 1.1): если браузер не установлен — бросается
+        :class:`RuntimeError` с инструкцией ``playwright install chromium``;
+        сообщение доставляется в GUI через ``failed.emit`` без трейсбека.
+
+        Raises:
+            RuntimeError: Playwright или Chromium не установлены / фолбэк
+                недоступен.
+            CaptchaDetectedError: auto.ru показал CAPTCHA (P-08).
         """
         try:
             from playwright.sync_api import sync_playwright  # type: ignore
@@ -448,7 +488,21 @@ class CatalogParser:
         blocked_types = {"image", "media", "font", "stylesheet"}
         brands: list[BrandData] = []
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            # П. 1.1: предпроверка установленного браузера до launch().
+            try:
+                executable = pw.chromium.executable_path
+            except Exception as exc:  # noqa: BLE001 — трактуем как отсутствие браузера
+                raise RuntimeError(
+                    "Браузер Chromium для Playwright не установлен. "
+                    "Выполните в командной строке: playwright install chromium"
+                ) from exc
+            if not executable or not Path(executable).exists():
+                raise RuntimeError(
+                    "Браузер Chromium для Playwright не установлен. "
+                    "Выполните в командной строке: playwright install chromium"
+                )
+
+            browser = pw.chromium.launch(headless=self._headless)
             context = browser.new_context(
                 user_agent=constants.USER_AGENT,
                 locale="ru-RU",
@@ -551,14 +605,26 @@ class CatalogParser:
     def _http_json_cached(self, url: str) -> dict:
         """Возвращает JSON по URL, пользуясь дисковым кэшем (P-06).
 
-        Сетевой запрос сопровождается паузой 1–3 с (P-07). При HTTP 403/429 или
-        тексте CAPTCHA в ответе бросает :class:`CaptchaDetectedError` (P-08).
+        Сетевой запрос сопровождается паузой 1–3 с (P-07). Детект блокировок
+        (P-08, задача №2 п. 1.2 — без ложных срабатываний):
+
+        * ``Content-Type: application/json`` → тело всегда парсится как JSON,
+          слово «captcha» в тексте игнорируется;
+        * не-JSON тело → CAPTCHA считается найденной, если в итоговом URL
+          (с учётом редиректов) есть ``showcaptcha``/``smartcaptcha``, либо в
+          первых 500 символах тела встречается ``showcaptcha``;
+        * HTTP 403/429 → :class:`CaptchaDetectedError`; прочие коды и
+          битый JSON → :class:`RuntimeError` с указанием URL и кода.
 
         Args:
             url: Полный URL эндпоинта (без токена — он добавляется здесь).
 
         Returns:
             dict: разобранный JSON-ответ.
+
+        Raises:
+            CaptchaDetectedError: реальная CAPTCHA/блокировка источника.
+            RuntimeError: сетевая/HTTP-ошибка или некорректный ответ.
         """
         request_url = self._decorate_url(url)
         cached = self._cache.get(request_url)
@@ -581,6 +647,8 @@ class CatalogParser:
                 request, timeout=constants.HTTP_TIMEOUT_SEC
             ) as response:
                 status = response.status
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                final_url = response.geturl()
                 body = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403, 429):
@@ -594,11 +662,15 @@ class CatalogParser:
 
         if status != 200:
             raise RuntimeError(f"HTTP {status} при запросе {url}")
-        if "captcha" in body.lower()[:2000] and not body.lstrip().startswith("{"):
-            raise CaptchaDetectedError("В ответе обнаружена CAPTCHA — парсинг прекращён.")
+
+        is_json_ct = "application/json" in content_type
+        if not is_json_ct and self._looks_like_captcha(final_url, body):
+            raise CaptchaDetectedError(
+                "В ответе обнаружена страница CAPTCHA — парсинг прекращён."
+            )
 
         try:
-            data = json.loads(body)
+            data = json.loads(body.lstrip("\ufeff \t\r\n"))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Некорректный JSON от {url}: {exc}") from exc
 
@@ -606,12 +678,44 @@ class CatalogParser:
         return data
 
     @staticmethod
-    def _decorate_url(url: str) -> str:
-        """Добавляет публичный тестовый токен к эндпоинтам cars-base.ru."""
+    def _looks_like_captcha(final_url: str, body: str) -> bool:
+        """Эвристика детекта CAPTCHA для НЕ-json ответов (задача №2, п. 1.2).
+
+        Проверяет итоговый URL после редиректов на маркеры ``showcaptcha`` /
+        ``smartcaptcha`` и начало тела страницы. Для ответов с
+        ``Content-Type: application/json`` не вызывается — это исключает
+        ложные срабатывания на легальном тексте «captcha» в данных.
+
+        Args:
+            final_url: URL ответа после всех редиректов.
+            body: Текстовое тело ответа.
+
+        Returns:
+            bool: ``True``, если ответ похож на страницу CAPTCHA/блокировки.
+        """
+        lowered_url = (final_url or "").lower()
+        if "showcaptcha" in lowered_url or "smartcaptcha" in lowered_url:
+            return True
+        head = body[:500].lower()
+        return "showcaptcha" in head
+
+    def _decorate_url(self, url: str) -> str:
+        """Добавляет токен к эндпоинтам cars-base.ru (значение — из конфига).
+
+        Токен читается из ``settings.json`` (``builder.cars_base_token``,
+        по умолчанию публичный тестовый ключ ``"test"``): при переходе на
+        постоянный ключ меняется только конфиг, не код (задача №2, п. 6).
+
+        Args:
+            url: URL эндпоинта без токена.
+
+        Returns:
+            str: URL с параметром ``token`` (для сторонних URL — без изменений).
+        """
         if "cars-base.ru" not in url:
             return url
         separator = "&" if "?" in url else "?"
-        return f"{url}{separator}token={constants.CARS_BASE_TOKEN}"
+        return f"{url}{separator}token={self._token}"
 
     def _sleep_polite(self) -> None:
         """Пауза 1–3 секунды между запросами (P-07), прерываемая остановкой."""

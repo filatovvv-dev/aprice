@@ -1,4 +1,1 @@
-__pycache__/
-*.pyc
-data/cache/
-logs/
+*.db.bak*
