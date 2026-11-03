@@ -37,13 +37,19 @@ def tmp_config(tmp_path: Path) -> Config:
 
 @pytest.fixture()
 def parser_factory(tmp_path: Path):
-    """Создаёт CatalogParser поверх изолированной БД и кэша."""
+    """Создаёт CatalogParser поверх изолированной БД и кэша.
+
+    Каталог кэша перенаправляется в tmp-директорию, чтобы тесты не
+    использовали общий ``data/cache/`` (иначе закэшированный реальный
+    ответ скрывал бы сетевые моки).
+    """
 
     def _make(config: Config | None = None, **kwargs) -> CatalogParser:
         db = Database(db_path=tmp_path / "test.db")
         db.init_schema()
         cfg = config or Config(path=tmp_path / "settings.json").load()
-        return CatalogParser(db=db, config=cfg, **kwargs)
+        cache_dir = tmp_path / f"cache_{len(list(tmp_path.glob('cache_*')))}"
+        return CatalogParser(db=db, config=cfg, cache_dir=cache_dir, **kwargs)
 
     return _make
 

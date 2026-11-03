@@ -261,6 +261,7 @@ class CatalogParser:
         progress_cb: Optional[ProgressCallback] = None,
         stop_event: Optional[threading.Event] = None,
         limit_brands: object = _UNSET,
+        cache_dir: Optional[Path] = None,
     ) -> None:
         """Инициализирует парсер.
 
@@ -274,6 +275,9 @@ class CatalogParser:
                 передан — значение читается из ``settings.json``
                 (``builder.limit_brands``, ``null`` = без лимита);
                 явный ``None`` также означает «без лимита».
+            cache_dir: Каталог JSON-кэша ответов (P-06). По умолчанию —
+                ``data/cache/``; параметр позволяет изолировать кэш
+                (тесты, несколько экземпляров парсера).
         """
         self._db = db
         self._config = config
@@ -302,8 +306,12 @@ class CatalogParser:
         lo, hi = (float(delay[0]), float(delay[1])) if len(delay) >= 2 else (1.0, 3.0)
         self._delay_range = (lo, hi)
 
+        # Каталог кэша: по умолчанию data/cache/ рядом с проектом (P-06);
+        # аргумент cache_dir позволяет изолировать кэш (тесты, несколько
+        # экземпляров парсера).
         self._cache = ResponseCache(
-            constants.CACHE_DIR, float(config.get("builder", "cache_ttl_hours", 168))
+            Path(cache_dir) if cache_dir is not None else constants.CACHE_DIR,
+            float(config.get("builder", "cache_ttl_hours", 168)),
         )
 
     # ------------------------------------------------------------------

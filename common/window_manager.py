@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import logging
 
-from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtGui import QGuiApplication, QRect
+from PyQt6.QtCore import QRect, QSettings, Qt
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication, QDialog, QWidget
 
 from common import constants
