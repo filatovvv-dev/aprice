@@ -11,7 +11,9 @@ Qt — ``QCoreApplication`` (без GUI). Транспортные тесты и
 
 from __future__ import annotations
 
+import json
 import os
+import select
 import socket
 import time
 
@@ -74,13 +76,15 @@ class EchoResponder:
     """Эхо-обработчик message_received: шлёт ответ обратно отправителю.
 
     Ответ формируется синхронно в обработчике сигнала (в момент обработки
-    строки сервером), поэтому клиент может отправить запрос и затем крутить
-    событийный цикл — ответ гарантированно окажется в его recv().
+    строки сервером). Клиент при этом не блокирует сокет долгим blocking
+    recv(): он отправляет запрос, крутит событийный цикл Qt (pump) до
+    появления данных (select) и только затем читает строку — см. ``call``.
     """
 
     def __init__(self, server: IpcServer) -> None:
         self.server = server
         self.received: list[dict] = []
+        self.pending: dict[int, bytes] = {}  # id(sock) -> недопитые байты ответа
         server.message_received.connect(self._on_message)
 
     def _on_message(self, payload: dict) -> None:
@@ -111,12 +115,50 @@ class EchoResponder:
             )
         self.server.send_to(peer, reply)
 
-    def roundtrip(self, client: IpcClient, line: str) -> dict:
-        """Отправить строку через сокет клиента и дождаться ответа (pump+recv)."""
-        sock = client._ensure_socket()  # noqa: SLF001
+    def call(self, sock: socket.socket, line: str) -> dict:
+        """Отправить строку, крутить Qt-цикл до ответа, прочитать одну строку.
+
+        Сокет клиента временно переводится в неблокирующий режим, чтобы
+        событийный цикл Qt обрабатывал incoming-события сервера, пока мы
+        ждём ответ (в offscreen-среде CI blocking-recv() не даёт Qt
+        крутиться). Недопитые байты хранятся в ``self.pending`` (ключ —
+        ``id(sock)``): у сокетов нельзя задавать произвольные атрибуты.
+        """
+        key = id(sock)
+        buf = self.pending.get(key, b"")
+        if b"\n" in buf:
+            index = buf.index(b"\n")
+            self.pending[key] = buf[index + 1:]
+            return json.loads(buf[:index].decode("utf-8"))
         sock.sendall(line.encode("utf-8"))
-        pump(1.5)
-        return client._read_line(sock)  # noqa: SLF001
+        deadline = time.monotonic() + 3.0
+        sock.setblocking(False)
+        try:
+            while time.monotonic() < deadline:
+                QCoreApplication.processEvents()
+                readable, _, _ = select.select([sock], [], [], 0.01)
+                if readable:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\n" in buf:
+                        index = buf.index(b"\n")
+                        self.pending[key] = buf[index + 1:]
+                        return json.loads(buf[:index].decode("utf-8"))
+        finally:
+            sock.setblocking(True)
+        self.pending[key] = buf
+        raise AssertionError("нет полного ответа сервера в пределах таймаута теста")
+
+
+def make_client(server: IpcServer, qapp: QCoreApplication) -> tuple[IpcClient, socket.socket]:
+    """Создать клиента с открытым сокетом для pump-совместимого обмена."""
+    client = IpcClient(port=server.port(), timeout=3.0)
+    sock = client._open_socket_no_ctx()  # noqa: SLF001
+    client._sock = sock  # noqa: SLF001
+    wait_until(lambda: server.clients_count() >= 1)
+    return client, sock
 
 
 @pytest.fixture()
@@ -143,10 +185,10 @@ def test_server_on_zero_port_reports_actual(qapp: QCoreApplication) -> None:
 # ---------------------------------------------------------------------------
 # 2. Клиент подключается, получает StatusMsg (round-trip через транспорт)
 # ---------------------------------------------------------------------------
-def test_client_roundtrip(server: IpcServer) -> None:
+def test_client_roundtrip(server: IpcServer, qapp: QCoreApplication) -> None:
     responder = EchoResponder(server)
-    client = IpcClient(port=server.port(), one_shot=True, timeout=3.0)
-    answer = client.get_status("task-1")
+    client, sock = make_client(server, qapp)
+    answer = responder.call(sock, '{"type":"get_status","request_id":"r1","task_id":"task-1"}\n')
     assert answer["type"] == "status"
     assert answer["task_id"] == "task-1"
     assert answer["state"] == "running"
@@ -155,16 +197,17 @@ def test_client_roundtrip(server: IpcServer) -> None:
     assert answer["eta_seconds"] == 1200
     assert len(responder.received) == 1
     assert responder.received[0]["type"] == "get_status"
+    client.close()
 
 
 # ---------------------------------------------------------------------------
 # 3. Два сообщения подряд в одном долгоживущем соединении
 # ---------------------------------------------------------------------------
-def test_two_requests_in_one_connection(server: IpcServer) -> None:
+def test_two_requests_in_one_connection(server: IpcServer, qapp: QCoreApplication) -> None:
     responder = EchoResponder(server)
-    client = IpcClient(port=server.port(), timeout=3.0)
-    first = client.get_status("t1")
-    second = client.get_status("t2")
+    client, sock = make_client(server, qapp)
+    first = responder.call(sock, '{"type":"get_status","request_id":"r1","task_id":"t1"}\n')
+    second = responder.call(sock, '{"type":"get_status","request_id":"r2","task_id":"t2"}\n')
     assert first["task_id"] == "t1"
     assert second["task_id"] == "t2"
     assert client.connected  # соединение переиспользовалось
@@ -176,23 +219,18 @@ def test_two_requests_in_one_connection(server: IpcServer) -> None:
 # ---------------------------------------------------------------------------
 # 4. Невалидный JSON: ErrorMsg, соединение живое, следующее сообщение проходит
 # ---------------------------------------------------------------------------
-def test_invalid_json_does_not_break_connection(server: IpcServer) -> None:
+def test_invalid_json_does_not_break_connection(
+    server: IpcServer, qapp: QCoreApplication
+) -> None:
     responder = EchoResponder(server)
-    client = IpcClient(port=server.port(), timeout=3.0)
-    err = client._request("error", {})  # type: ignore[attr-defined]
-    # Прямого пути отправить мусор через публичный API нет — используем сокет:
-    client.close()
-    client = IpcClient(port=server.port(), timeout=3.0)
-    sock = client._open_socket_no_ctx()  # noqa: SLF001
-    client._sock = sock  # noqa: SLF001
-    sock.sendall(b"this is not json\n")
-    err = client._read_line(sock)  # noqa: SLF001
+    client, sock = make_client(server, qapp)
+    err = responder.call(sock, "this is not json\n")
     assert err["type"] == "error"
     assert err["code"].startswith("invalid")
     # Соединение не разорвано (IPC-03): следующий валидный запрос проходит.
-    line = '{"type":"get_status","request_id":"ok-1","task_id":"t-ok"}\n'
-    sock.sendall(line.encode("utf-8"))
-    answer = client._read_line(sock)  # noqa: SLF001
+    answer = responder.call(
+        sock, '{"type":"get_status","request_id":"ok-1","task_id":"t-ok"}\n'
+    )
     assert answer["type"] == "status"
     assert answer["task_id"] == "t-ok"
     assert client.connected
@@ -265,17 +303,24 @@ def test_start_on_busy_port_returns_false(qapp: QCoreApplication) -> None:
 # ---------------------------------------------------------------------------
 # 8. Несколько одновременных соединений (IPC-04)
 # ---------------------------------------------------------------------------
-def test_multiple_concurrent_clients(server: IpcServer) -> None:
+def test_multiple_concurrent_clients(
+    server: IpcServer, qapp: QCoreApplication
+) -> None:
     responder = EchoResponder(server)
-    clients = [IpcClient(port=server.port(), timeout=3.0) for _ in range(3)]
-    answers = [c.get_status(f"multi-{i}") for i, c in enumerate(clients, start=1)]
+    pairs = [make_client(server, qapp) for _ in range(3)]
+    answers = []
+    for i, (client, sock) in enumerate(pairs, start=1):
+        answer = responder.call(
+            sock, f'{{"type":"get_status","request_id":"m{i}","task_id":"multi-{i}"}}\n'
+        )
+        answers.append(answer)
     assert server.clients_count() == 3
     assert [a["task_id"] for a in answers] == ["multi-1", "multi-2", "multi-3"]
     assert sorted(p["task_id"] for p in responder.received) == [
         "multi-1", "multi-2", "multi-3",
     ]
-    for c in clients:
-        c.close()
+    for client, _sock in pairs:
+        client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -293,11 +338,20 @@ def test_find_free_port_usable(qapp: QCoreApplication) -> None:
 # ---------------------------------------------------------------------------
 # 10. submit_task через реальный транспорт (контракт + UTF-8)
 # ---------------------------------------------------------------------------
-def test_submit_task_over_transport(server: IpcServer) -> None:
+def test_submit_task_over_transport(
+    server: IpcServer, qapp: QCoreApplication
+) -> None:
     responder = EchoResponder(server)
-    client = IpcClient(port=server.port(), one_shot=True, timeout=3.0)
+    client, sock = make_client(server, qapp)
     spec_ru = dict(SPEC, manufacturer="Лада", model="Веста")
-    answer = client.submit_task(spec_ru, OPTIONS)
+    payload = {
+        "type": "submit_task",
+        "request_id": "sub-1",
+        "spec": spec_ru,
+        "options": OPTIONS,
+    }
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    answer = responder.call(sock, line)
     assert answer["type"] == "task_accepted"
     assert answer["estimated_seconds"] == 3600
     got = responder.received[0]
@@ -309,11 +363,11 @@ def test_submit_task_over_transport(server: IpcServer) -> None:
 # ---------------------------------------------------------------------------
 # 11. Ошибочные типы ответов: unknown_type / missing_field → ErrorMsg (IPC-03)
 # ---------------------------------------------------------------------------
-def test_protocol_errors_return_errormsg(server: IpcServer) -> None:
+def test_protocol_errors_return_errormsg(
+    server: IpcServer, qapp: QCoreApplication
+) -> None:
     responder = EchoResponder(server)
-    client = IpcClient(port=server.port(), timeout=3.0)
-    sock = client._open_socket_no_ctx()  # noqa: SLF001
-    client._sock = sock  # noqa: SLF001
+    client, sock = make_client(server, qapp)
 
     cases = [
         ('{"type":"telepathy","request_id":"x"}', "unknown_type"),
@@ -323,12 +377,12 @@ def test_protocol_errors_return_errormsg(server: IpcServer) -> None:
          '"options":{}}', "invalid_mode"),
     ]
     for line, expected_code in cases:
-        sock.sendall((line + "\n").encode("utf-8"))
-        answer = client._read_line(sock)  # noqa: SLF001
+        answer = responder.call(sock, line + "\n")
         assert answer["type"] == "error", line
         assert answer["code"] == expected_code, answer
     # Соединение по-прежнему живо: валидный запрос проходит.
-    sock.sendall(b'{"type":"get_status","request_id":"z","task_id":"alive"}\n')
-    answer = client._read_line(sock)  # noqa: SLF001
+    answer = responder.call(
+        sock, '{"type":"get_status","request_id":"z","task_id":"alive"}\n'
+    )
     assert answer["task_id"] == "alive"
     client.close()

@@ -344,19 +344,26 @@ def test_window_manager_about_to_quit_and_registry(tmp_path: Path):
 
 
 def test_window_manager_settings_filename(tmp_path: Path, monkeypatch):
-    """Разные settings_filename → независимые хранилища позиций (п. 2.1)."""
+    """Разные settings_filename → независимые хранилища позиций (п. 2.1).
+
+    Примечание: окно не показывается через ``show()`` — в offscreen-среде
+    Linux с Qt 6.10 это приводит к crash-on-teardown (артефакт среды CI,
+    на Windows тест проходит со show()). Логика сохранения геометрии
+    от этого не зависит: closeEvent отрабатывает и для скрытого окна.
+    """
     from PyQt6.QtCore import QSettings
     from PyQt6.QtWidgets import QApplication, QWidget
 
-    QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(constants, "CONFIG_DIR", tmp_path)
 
     wm_b = WindowManager(settings_filename=constants.BUILDER_WINDOW_SETTINGS_FILE)
     win = QWidget()
+    win.resize(640, 480)
     win.move(11, 22)
-    win.show()
     wm_b.apply(win, "builder_main")
     win.close()
+    app.processEvents()  # отработать deleteLater из closeEvent-обработчика WM
 
     assert (tmp_path / constants.BUILDER_WINDOW_SETTINGS_FILE).exists()
 
