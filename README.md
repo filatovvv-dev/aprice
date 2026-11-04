@@ -9,7 +9,7 @@ Windows-приложение для оценки рыночной стоимос
 | **APrice-Server** | Фоновый сборщик объявлений | 🔒 заглушка (задача №3); `common` подготовлен к переиспользованию |
 | **APrice-Client** | GUI оценки | 🔒 заглушка (задача №4) |
 
-**Стек:** Python 3.11+, PyQt6, Playwright (Chromium), SQLite, pandas/numpy.
+**Стек:** Разработка и сборка — Python 3.11.x или 3.12.x (НЕ 3.15), PyQt6, Playwright (Chromium), SQLite, pandas/numpy, PyQt6.QtNetwork (IPC на QTcpServer).
 **Целевая ОС:** Windows 10/11 x64 (разработка возможна на Linux).
 
 ---
@@ -212,7 +212,7 @@ IPC_TIMEOUT_SEC`, паузы и объёмы сбора `DEFAULT_SERVER_*`, сп
 ## Тесты
 
 ```bat
-pip install pytest
+pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
@@ -224,13 +224,7 @@ python -m pytest tests -q
 реестр окон + сохранение по `aboutToQuit`, независимость INI-файлов компонентов,
 логгер для произвольного компонента, константы IPC/Server.
 
-**Примечание для Linux-среды разработки:** GUI-тесты требуют
-`QT_QPA_PLATFORM=offscreen python -m pytest tests -q`. В текущей тестовой
-среде один GUI-тест (`test_window_manager_settings_filename`) прерывает процесс
-на этапе teardown после успешной проверки INI-файлов — это артефакт среды
-(Qt offscreen-платформа в комбинации с плагином libtmux), а не дефект кода:
-тот же сценарий, выполненный standalone-скриптом, проходит успешно
-(`exists: True`, `contains: False`). На Windows 10/11 тест выполняется штатно.
+Покрытие 3.1: контракт IPC (round-trip 11 типов, валидация spec/options, коды ошибок), транспорт (port=0, несколько соединений, ErrorMsg без разрыва, idle-таймаут, занятый порт), UTF-8 сквозь TCP.
 
 ## Допущения и открытые вопросы
 
