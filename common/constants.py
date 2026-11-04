@@ -45,6 +45,8 @@ CONFIG_DIR: Path = ROOT_DIR / "config"
 LOGS_DIR: Path = ROOT_DIR / "logs"
 
 DB_FILE: Path = DATA_DIR / "aprice.db"
+# Отдельная БД состояния Server (подзадача 3.2) — не смешивать со справочниками.
+SERVER_STATE_DB: Path = DATA_DIR / "aprice_server_state.db"
 SETTINGS_FILE: Path = CONFIG_DIR / "settings.json"
 
 # INI-файлы позиций окон (WindowManager): у каждого компонента — свой файл,
