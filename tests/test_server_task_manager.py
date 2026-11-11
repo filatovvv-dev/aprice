@@ -19,9 +19,14 @@ from typing import Callable
 import pytest
 from PyQt6.QtCore import QCoreApplication
 
+from common.config import Config
 from server import protocol
 from server.state import StateStore
-from server.task_manager import STUB_ADS_PER_PAGE, TaskManager
+from server.task_manager import (
+    MAX_ADS_PER_PAGE_ESTIMATE,
+    STUB_ADS_PER_PAGE,
+    TaskManager,
+)
 
 SPEC = {
     "mode": "range",
@@ -87,9 +92,9 @@ def store(tmp_path) -> StateStore:
 
 
 @pytest.fixture()
-def mgr(qapp, store):
+def mgr(qapp, store, tmp_path):
     """TaskManager с персистентностью; по окончании теста — shutdown."""
-    m = TaskManager(store)
+    m = TaskManager(Config(tmp_path / "settings.json"), store)
     yield m
     m.shutdown()
 
@@ -165,7 +170,10 @@ def test_fsm_queued_running_completed_and_signal_order(mgr, store):
     assert kinds[-1] == "completed"
     assert kinds.count("progress") == len(THREE) * 2
     assert set(kinds[1:-1]) == {"progress"}
-    assert rec.events[-1][2] == len(THREE) * 2 * STUB_ADS_PER_PAGE
+    total = rec.events[-1][2]
+    assert total == mgr.get_task(task_id).total_ads == store.count_ads(task_id)
+    assert len(THREE) * 2 * STUB_ADS_PER_PAGE <= total
+    assert total <= len(THREE) * 2 * MAX_ADS_PER_PAGE_ESTIMATE
 
     assert mgr.get_status(task_id)["state"] == "completed"
     row = store.load_task(task_id)
@@ -181,21 +189,23 @@ def test_per_site_updated_after_completion(mgr):
     task = mgr.get_task(task_id)
     assert set(task.per_site) == set(FOUR)
     for site in FOUR:
-        assert task.per_site[site] == {
-            "pages_done": 4,
-            "ads": 4 * STUB_ADS_PER_PAGE,
-        }
-    assert task.total_ads == 4 * 4 * STUB_ADS_PER_PAGE
+        stats = task.per_site[site]
+        assert stats["pages_done"] == 4
+        assert 4 * STUB_ADS_PER_PAGE <= stats["ads"] <= 4 * MAX_ADS_PER_PAGE_ESTIMATE
+    assert task.total_ads == sum(v["ads"] for v in task.per_site.values())
 
 
-def test_ads_limit_per_site_truncates_pages(mgr):
-    """max_ads_per_site=50 -> 3 страницы (20+20+10), лимит не превышен."""
+def test_ads_limit_per_site_truncates_pages(mgr, store):
+    """max_ads_per_site=50 -> страниц не больше ceil(50/20)=3, лимит не превышен."""
     rec = Recorder(mgr)
     task_id = mgr.submit(SPEC, fast(pages=10, max_ads_per_site=50))
     run_to_end(mgr, rec, task_id)
     task = mgr.get_task(task_id)
     for site in THREE:
-        assert task.per_site[site] == {"pages_done": 3, "ads": 50}
+        stats = task.per_site[site]
+        assert 1 <= stats["pages_done"] <= 3  # страница даёт 20–50 объявлений
+        assert stats["ads"] == 50  # заглушка отдаёт ≥ 20/страницу, обрезается до лимита
+        assert store.count_ads(task_id, site) == 50
     assert rec.events[-1] == ("completed", task_id, 150)
 
 
@@ -265,11 +275,23 @@ def test_stop_running_task(mgr, store):
     assert mgr.current_task_id() is None
 
 
-def test_stop_unknown_or_queued_returns_false(mgr):
-    """stop для неизвестного/ожидающего в очереди задания -> False."""
+def test_stop_unknown_returns_false(mgr):
+    """stop для неизвестного задания -> False."""
     assert mgr.stop("nope") is False
+
+
+def test_stop_queued_cancels_task(mgr, store):
+    """stop для queued (3.4b): True, cancelled, task_stopped(id, 0)."""
+    rec = Recorder(mgr)
     task_id = mgr.submit(SPEC, fast())
-    assert mgr.stop(task_id) is False  # ещё queued
+    assert mgr.stop(task_id) is True
+    assert mgr.get_status(task_id)["state"] == "cancelled"
+    assert ("stopped", task_id, 0) in rec.events
+    assert mgr.queue_length() == 0
+    assert store.load_task(task_id)["state"] == "cancelled"
+    assert mgr.stop(task_id) is False  # повторно — уже завершено
+    pump_until(lambda: True)
+    assert not rec.has("started", task_id)
 
 
 # ----------------------------------------------------------------------
@@ -419,5 +441,8 @@ def test_progress_is_persisted_in_state_store(mgr, store):
     task_id = mgr.submit(SPEC, fast(pages=2))
     run_to_end(mgr, rec, task_id)
     progress = store.load_task(task_id)["progress"]
-    assert progress["ads_collected"] == len(THREE) * 2 * STUB_ADS_PER_PAGE
+    assert progress["ads_collected"] == store.count_ads(task_id)
+    assert progress["ads_collected"] == sum(
+        v["ads"] for v in progress["per_site"].values()
+    )
     assert progress["per_site"]["auto.ru"]["pages_done"] == 2
