@@ -92,6 +92,8 @@ IPC_TIMEOUT_SEC: float = 5.0
 # Server: паузы и объёмы по умолчанию (подготовка к задаче №3)
 # ---------------------------------------------------------------------------
 DEFAULT_SERVER_PAGE_DELAY_SEC: list[int] = [120, 300]      # 2–5 мин между страницами
+# DEPRECATED: not used in round-robin (3.4a rev 2) — паузы между площадками
+# заменены равномерным сдвигом первых запросов (avg_delay / N).
 DEFAULT_SERVER_SITE_DELAY_SEC: list[int] = [600, 1200]     # 10–20 мин между площадками
 DEFAULT_SERVER_PAGES_PER_SITE: int = 10
 DEFAULT_SERVER_ADS_PER_SITE: int = 500
