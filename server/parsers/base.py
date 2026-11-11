@@ -25,6 +25,7 @@ from threading import Event
 from typing import Any, Callable, ClassVar, Optional
 
 from common.config import Config
+from common.utils import interruptible_sleep
 
 logger = logging.getLogger("aprice.server.parsers")
 
@@ -157,7 +158,8 @@ class BaseSiteParser(ABC):
     #: Диапазон паузы между страницами в test_fast_mode, сек.
     FAST_PAGE_DELAY_SEC: ClassVar[tuple[float, float]] = (0.1, 0.3)
 
-    #: Интервал проверки stop_event во время паузы, сек (S-12).
+    #: Интервал проверки stop_event во время паузы, сек (S-12);
+    #: передаётся в :func:`common.utils.interruptible_sleep`.
     STOP_CHECK_INTERVAL_SEC: ClassVar[float] = 0.5
 
     #: Диапазон количества фейковых объявлений на страницу у заглушек.
@@ -210,30 +212,6 @@ class BaseSiteParser(ABC):
         if options.get("test_fast_mode"):
             return self.FAST_PAGE_DELAY_SEC
         return self.PAGE_DELAY_SEC
-
-    def _interruptible_sleep(self, seconds: float, stop_event: Event) -> bool:
-        """Прерываемая пауза с проверкой ``stop_event`` каждые 0.5 с.
-
-        Реализация S-12: пауза разбивается на интервалы
-        :attr:`STOP_CHECK_INTERVAL_SEC`; каждый интервал выполняется через
-        ``stop_event.wait()``, поэтому остановка действует почти мгновенно.
-
-        Args:
-            seconds: длительность паузы, сек.
-            stop_event: событие остановки.
-
-        Returns:
-            bool: ``True``, если пауза была прервана остановкой.
-        """
-        remaining = seconds
-        while remaining > 0:
-            if stop_event.is_set():
-                return True
-            chunk = min(self.STOP_CHECK_INTERVAL_SEC, remaining)
-            if stop_event.wait(chunk):
-                return True
-            remaining -= chunk
-        return stop_event.is_set()
 
     def _random_ad(self, spec: dict, index: int) -> Ad:
         """Генерирует одно реалистичное фейковое объявление (для заглушек).
@@ -349,8 +327,10 @@ class BaseSiteParser(ABC):
             if page >= max_pages or len(ads) >= max_ads:
                 break
 
-            if self._interruptible_sleep(
-                random.uniform(delay_min, delay_max), stop_event
+            if not interruptible_sleep(
+                stop_event,
+                random.uniform(delay_min, delay_max),
+                check_interval=self.STOP_CHECK_INTERVAL_SEC,
             ):
                 logger.info("[%s] пауза прервана остановкой", self.site_name)
                 break
