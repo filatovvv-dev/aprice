@@ -32,6 +32,9 @@ logger = logging.getLogger("aprice.server.parsers")
 #: Callback прогресса: (page, ads_collected) -> None
 ProgressCallback = Callable[[int, int], None]
 
+#: Callback постраничной отдачи: список объявлений одной страницы (S-06).
+PageCallback = Callable[[list["Ad"]], None]
+
 
 # ----------------------------------------------------------------------
 # Исключения (п. 2.1)
@@ -181,8 +184,9 @@ class BaseSiteParser(ABC):
         options: dict,
         stop_event: Event,
         progress_cb: Optional[ProgressCallback] = None,
+        on_page: Optional[PageCallback] = None,
     ) -> list[Ad]:
-        """Собирает объявления по спецификации.
+        """Собирает объявления по спецификации (все страницы сразу).
 
         Args:
             spec: спецификация задания (mode, manufacturer, model, годы...).
@@ -190,6 +194,9 @@ class BaseSiteParser(ABC):
                 test_fast_mode, simulate_captcha, simulate_block...).
             stop_event: событие остановки — проверять каждые 0.5 с (S-12).
             progress_cb: вызывается после каждой страницы: ``(page, ads)``.
+            on_page: вызывается после каждой страницы со списком объявлений
+                именно этой страницы (для сохранения после каждого шага,
+                S-06). Возвращаемое значение остаётся полным списком.
 
         Returns:
             list[Ad]: собранные объявления (при остановке — частичные).
@@ -198,6 +205,41 @@ class BaseSiteParser(ABC):
             CaptchaDetectedError: обнаружена CAPTCHA (без попыток обхода).
             BlockedError: площадка заблокировала доступ.
         """
+
+    def fetch_page(
+        self,
+        spec: dict,
+        options: dict,
+        page: int,
+        stop_event: Event,
+    ) -> list[Ad]:
+        """Запрашивает **одну** страницу выдачи (для планировщика TaskManager).
+
+        Round-robin планировщик сам выдерживает паузы между запросами к
+        площадке, поэтому метод не спит и не обходит остальные страницы —
+        в отличие от :meth:`collect`. Реализация по умолчанию — заглушка
+        (3.3/3.4b); реальные парсеры (3.7–3.10) **обязаны переопределить**.
+
+        Args:
+            spec: спецификация задания.
+            options: опции задания (``simulate_captcha``, ``simulate_block``...).
+            page: номер страницы выдачи, начиная с 1.
+            stop_event: событие остановки.
+
+        Returns:
+            list[Ad]: объявления страницы (пусто, если остановка запрошена).
+
+        Raises:
+            CaptchaDetectedError: эмуляция капчи активна для площадки.
+            BlockedError: эмуляция блокировки активна для площадки.
+        """
+        self._check_simulation(options)
+        if stop_event.is_set():
+            return []
+        per_page = random.randint(*self.ADS_PER_PAGE_RANGE)
+        logger.info("[%s] страница %d (заглушка), %d объявлений",
+                    self.site_name, page, per_page)
+        return [self._random_ad(spec, i) for i in range(per_page)]
 
     # ------------------------ хелперы потомков ------------------------
     def _page_delays(self, options: dict) -> tuple[float, float]:
@@ -275,6 +317,7 @@ class BaseSiteParser(ABC):
         options: dict,
         stop_event: Event,
         progress_cb: Optional[ProgressCallback] = None,
+        on_page: Optional[PageCallback] = None,
     ) -> list[Ad]:
         """Общий алгоритм заглушки: страницы → паузы → прогресс → лимиты.
 
@@ -288,6 +331,7 @@ class BaseSiteParser(ABC):
             options: опции задания.
             stop_event: событие остановки.
             progress_cb: колбэк прогресса ``(page, ads)``.
+            on_page: колбэк постраничной отдачи (объявления этой страницы).
 
         Returns:
             list[Ad]: собранные объявления (частичные при остановке).
@@ -316,6 +360,8 @@ class BaseSiteParser(ABC):
             per_page = min(per_page, max_ads - len(ads))
             batch = [self._random_ad(spec, i) for i in range(per_page)]
             ads.extend(batch)
+            if on_page is not None:
+                on_page(list(batch))
 
             logger.info(
                 "[%s] страница %d/%d, собрано %d объявлений",
