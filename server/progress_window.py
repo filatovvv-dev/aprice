@@ -212,6 +212,25 @@ class ProgressWindow(QWidget):
         self.set_idle()
         self.close()
 
+    def show_current(self) -> None:
+        """Обновляет окно по идущему заданию и показывает его (PW-09).
+
+        Вызывается точкой входа по двойному щелчку на трее и пункту меню
+        «Прогресс»: если сбор уже идёт, поля сразу актуальны (а не ждут
+        следующего ``task_progress``); без задания окно открывается в режиме
+        ожидания. Номер задания берётся у менеджера (``current_task_id``),
+        при его отсутствии — из последнего ``task_started``.
+        """
+        getter = getattr(self._task_manager, "current_task_id", None)
+        task_id = getter() if callable(getter) else self._task_id
+        if task_id is not None:
+            self._on_progress(task_id, {})
+        else:
+            self.set_idle()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     # ------------------------------------------------------------------
     # Закрытие (PW-07)
     # ------------------------------------------------------------------
