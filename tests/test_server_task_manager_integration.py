@@ -6,7 +6,7 @@
 S-14, S-15), восстановление после перезапуска (S-07) и правило «в БД пишет
 только поток менеджера».
 
-Qt — только ``QCoreApplication``; цикл событий «качается» через
+Qt — общий ``QApplication`` из ``conftest.py``; цикл событий «качается» через
 :func:`pump_until`. Тесты не требуют сети.
 """
 
@@ -17,7 +17,7 @@ import time
 from typing import Callable
 
 import pytest
-from PyQt6.QtCore import QCoreApplication
+from PyQt6.QtWidgets import QApplication
 
 from common.config import Config
 from server.parsers import AutoRuParser, DromParser
@@ -39,21 +39,15 @@ THREE = ["auto.ru", "drom.ru", "avito.ru"]
 # ----------------------------------------------------------------------
 # Инфраструктура
 # ----------------------------------------------------------------------
-@pytest.fixture(scope="module")
-def qapp() -> QCoreApplication:
-    """Один QCoreApplication на модуль."""
-    return QCoreApplication.instance() or QCoreApplication([])
-
-
 def pump_until(cond: Callable[[], bool], timeout: float = 15.0) -> None:
     """Крутит цикл событий, пока ``cond()`` не станет истинным."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         if cond():
             return
         time.sleep(0.005)
-    QCoreApplication.processEvents()
+    QApplication.processEvents()
     assert cond(), "pump_until: условие не выполнено за отведённое время"
 
 

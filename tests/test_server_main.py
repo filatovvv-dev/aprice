@@ -17,7 +17,7 @@ import time  # noqa: E402
 from typing import Callable  # noqa: E402
 
 import pytest  # noqa: E402
-from PyQt6.QtCore import QCoreApplication, QObject, QSettings, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QObject, QSettings, pyqtSignal  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from common.config import Config  # noqa: E402
@@ -48,24 +48,14 @@ FAST = {
 # ----------------------------------------------------------------------
 # Инфраструктура
 # ----------------------------------------------------------------------
-@pytest.fixture(scope="module")
-def qapp() -> QApplication:
-    app = QCoreApplication.instance()
-    if app is None:
-        app = QApplication([])
-    if not isinstance(app, QApplication):
-        pytest.skip("создан QCoreApplication без GUI")
-    return app
-
-
 def pump_until(cond: Callable[[], bool], timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         if cond():
             return
         time.sleep(0.005)
-    QCoreApplication.processEvents()
+    QApplication.processEvents()
     assert cond(), "pump_until: условие не выполнено"
 
 
@@ -380,3 +370,9 @@ def test_main_second_instance_returns_0(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(server_main, "setup_logging", lambda **k: None)
     monkeypatch.setattr(server_main.ServerApp, "start", lambda self: False)
     assert server_main.main([]) == 0
+
+
+def test_all_tests_share_one_qapplication(qapp):
+    """Sanity: в сессии один экземпляр, и это именно ``QApplication`` (с GUI)."""
+    assert QApplication.instance() is qapp
+    assert isinstance(QApplication.instance(), QApplication)
