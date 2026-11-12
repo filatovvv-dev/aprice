@@ -392,6 +392,26 @@ class TaskManager(QObject):
         self._current_id = None
         logger.info("TaskManager остановлен")
 
+    def page_totals(self, task_id: str) -> Optional[tuple[int, int]]:
+        """Возвращает ``(выполнено_страниц, всего_страниц)`` по всем площадкам.
+
+        Нужен окну прогресса (PW-08) для определённого прогресс-бара; в
+        контракт ``progress``/``StatusMsg`` эти числа не входят.
+
+        Args:
+            task_id: идентификатор задания.
+
+        Returns:
+            tuple | None: ``None``, если задание неизвестно.
+        """
+        task = self._tasks.get(task_id)
+        if task is None:
+            return None
+        total = len(self._sites(task)) * self._pages_per_site(task)
+        with task.lock:
+            done = sum(int(s["pages_done"]) for s in task.per_site.values())
+        return min(done, total), total
+
     def queue_length(self) -> int:
         """Число заданий, ожидающих в очереди."""
         return len(self._queue)
