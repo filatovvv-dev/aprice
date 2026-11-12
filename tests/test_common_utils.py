@@ -10,7 +10,9 @@ from __future__ import annotations
 import threading
 import time
 
-from common.utils import interruptible_sleep
+import pytest
+
+from common.utils import format_eta, interruptible_sleep
 
 
 def test_full_pause_returns_true() -> None:
@@ -54,3 +56,28 @@ def test_custom_check_interval_is_accepted() -> None:
     stop = threading.Event()
     assert interruptible_sleep(stop, 0.05, check_interval=0.01) is True
     assert interruptible_sleep(stop, 0.05, check_interval=0) is True
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [
+        (None, "меньше минуты"),
+        (-5, "меньше минуты"),
+        (0, "меньше минуты"),
+        (45, "меньше минуты"),
+        (59, "меньше минуты"),
+        (60, "~1 мин"),
+        (90, "~1 мин"),
+        (119, "~1 мин"),
+        (1800, "~30 мин"),
+        (3599, "~59 мин"),
+        (3600, "~1 ч"),
+        (3700, "~1 ч 1 мин"),
+        (7200, "~2 ч"),
+        (7260, "~2 ч 1 мин"),
+        (90_000.0, "~25 ч"),
+    ],
+)
+def test_format_eta_boundaries(seconds, expected) -> None:
+    """format_eta: границы минуты/часа, None, отрицательные, float."""
+    assert format_eta(seconds) == expected

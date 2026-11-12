@@ -1,8 +1,12 @@
 """Общие утилиты проекта «АвтоПрайс» (APrice).
 
-Сейчас содержит :func:`interruptible_sleep` — прерываемую пассивную паузу,
-которой пользуются и парсеры площадок (``BaseSiteParser``), и планировщик
-``TaskManager`` (S-12: остановка сбора должна действовать почти мгновенно).
+Содержит:
+
+* :func:`interruptible_sleep` — прерываемую пассивную паузу, которой
+  пользуются и парсеры площадок (``BaseSiteParser``), и планировщик
+  ``TaskManager`` (S-12: остановка сбора должна действовать почти мгновенно);
+* :func:`format_eta` — человекочитаемое оставшееся время (трей и окно
+  прогресса Server, S-09/S-10; позже — окно прогресса Client).
 """
 
 from __future__ import annotations
@@ -45,3 +49,36 @@ def interruptible_sleep(
             return not stop_event.is_set()
         if stop_event.wait(min(chunk_limit, remaining)):
             return False
+
+
+def format_eta(seconds: int | float | None) -> str:
+    """Форматирует оставшееся время в человекочитаемую строку.
+
+    Минуты округляются **вниз** (оценка «~» и так приблизительная).
+    ``None`` и отрицательные значения трактуются как «меньше минуты».
+
+    Примеры:
+        >>> format_eta(45)
+        'меньше минуты'
+        >>> format_eta(90)
+        '~1 мин'
+        >>> format_eta(3700)
+        '~1 ч 1 мин'
+        >>> format_eta(7200)
+        '~2 ч'
+
+    Args:
+        seconds: оставшееся время, сек.
+
+    Returns:
+        str: ``"меньше минуты"``, ``"~N мин"``, ``"~H ч"`` или ``"~H ч M мин"``.
+    """
+    if seconds is None or seconds < 60:
+        return "меньше минуты"
+    total_minutes = int(seconds // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours == 0:
+        return f"~{minutes} мин"
+    if minutes == 0:
+        return f"~{hours} ч"
+    return f"~{hours} ч {minutes} мин"
