@@ -3,7 +3,7 @@
 Проверяются требования IPC-01..IPC-09, CL-01..CL-07 и список проверок
 раздела 5.2 промпта. Все серверы поднимаются на ``port=0`` (фиксированный
 8765 не используется — чтобы не конфликтовать с реальным Server).
-Qt — ``QCoreApplication`` (без GUI). Транспортные тесты используют
+Qt — общий ``QApplication`` из ``conftest.py``. Транспортные тесты используют
 ``IpcClient(one_shot=True)``: сокет клиента открывается до того, как Qt
 успеет обработ incoming-событие, поэтому ответ приходит в тот же recv() без
 зависимости от Qt-polling (он ненадёжен в offscreen-среде CI).
@@ -21,7 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
-from PyQt6.QtCore import QCoreApplication
+from PyQt6.QtWidgets import QApplication
 
 from common.ipc_client import IpcClient, IpcConnectionError
 from server import protocol
@@ -42,18 +42,11 @@ SPEC = {
 OPTIONS = {"sites": ["auto.ru"], "max_ads_per_site": 500, "max_pages_per_site": 10}
 
 
-@pytest.fixture(scope="module")
-def qapp() -> QCoreApplication:
-    """Один QCoreApplication на модуль (QTcpServer требует event loop)."""
-    app = QCoreApplication.instance() or QCoreApplication([])
-    yield app
-
-
 def pump(seconds: float = 0.3) -> None:
     """Крутить событийный цикл Qt фиксированное время."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         time.sleep(0.005)
 
 
@@ -65,7 +58,7 @@ def wait_until(predicate, timeout: float = 2.0) -> None:
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         if predicate():
             return
         time.sleep(0.005)
@@ -135,7 +128,7 @@ class EchoResponder:
         sock.setblocking(False)
         try:
             while time.monotonic() < deadline:
-                QCoreApplication.processEvents()
+                QApplication.processEvents()
                 readable, _, _ = select.select([sock], [], [], 0.01)
                 if readable:
                     chunk = sock.recv(4096)
@@ -152,7 +145,7 @@ class EchoResponder:
         raise AssertionError("нет полного ответа сервера в пределах таймаута теста")
 
 
-def make_client(server: IpcServer, qapp: QCoreApplication) -> tuple[IpcClient, socket.socket]:
+def make_client(server: IpcServer, qapp: QApplication) -> tuple[IpcClient, socket.socket]:
     """Создать клиента с открытым сокетом для pump-совместимого обмена."""
     client = IpcClient(port=server.port(), timeout=3.0)
     sock = client._open_socket_no_ctx()  # noqa: SLF001
@@ -162,7 +155,7 @@ def make_client(server: IpcServer, qapp: QCoreApplication) -> tuple[IpcClient, s
 
 
 @pytest.fixture()
-def server(qapp: QCoreApplication) -> IpcServer:
+def server(qapp: QApplication) -> IpcServer:
     """IpcServer на порту 0; гарантированная остановка после теста."""
     srv = IpcServer(port=0, timeout_sec=5.0)
     assert srv.start() is True
@@ -173,7 +166,7 @@ def server(qapp: QCoreApplication) -> IpcServer:
 # ---------------------------------------------------------------------------
 # 1. port=0 возвращает фактический порт; stop() гасит сервер
 # ---------------------------------------------------------------------------
-def test_server_on_zero_port_reports_actual(qapp: QCoreApplication) -> None:
+def test_server_on_zero_port_reports_actual(qapp: QApplication) -> None:
     srv = IpcServer(port=0)
     assert srv.start() is True
     actual = srv.port()
@@ -185,7 +178,7 @@ def test_server_on_zero_port_reports_actual(qapp: QCoreApplication) -> None:
 # ---------------------------------------------------------------------------
 # 2. Клиент подключается, получает StatusMsg (round-trip через транспорт)
 # ---------------------------------------------------------------------------
-def test_client_roundtrip(server: IpcServer, qapp: QCoreApplication) -> None:
+def test_client_roundtrip(server: IpcServer, qapp: QApplication) -> None:
     responder = EchoResponder(server)
     client, sock = make_client(server, qapp)
     answer = responder.call(sock, '{"type":"get_status","request_id":"r1","task_id":"task-1"}\n')
@@ -203,7 +196,7 @@ def test_client_roundtrip(server: IpcServer, qapp: QCoreApplication) -> None:
 # ---------------------------------------------------------------------------
 # 3. Два сообщения подряд в одном долгоживущем соединении
 # ---------------------------------------------------------------------------
-def test_two_requests_in_one_connection(server: IpcServer, qapp: QCoreApplication) -> None:
+def test_two_requests_in_one_connection(server: IpcServer, qapp: QApplication) -> None:
     responder = EchoResponder(server)
     client, sock = make_client(server, qapp)
     first = responder.call(sock, '{"type":"get_status","request_id":"r1","task_id":"t1"}\n')
@@ -220,7 +213,7 @@ def test_two_requests_in_one_connection(server: IpcServer, qapp: QCoreApplicatio
 # 4. Невалидный JSON: ErrorMsg, соединение живое, следующее сообщение проходит
 # ---------------------------------------------------------------------------
 def test_invalid_json_does_not_break_connection(
-    server: IpcServer, qapp: QCoreApplication
+    server: IpcServer, qapp: QApplication
 ) -> None:
     responder = EchoResponder(server)
     client, sock = make_client(server, qapp)
@@ -241,7 +234,7 @@ def test_invalid_json_does_not_break_connection(
 # ---------------------------------------------------------------------------
 # 5. Таймаут: молчаливый клиент рвёт соединение через timeout_sec (IPC-05)
 # ---------------------------------------------------------------------------
-def test_idle_timeout_closes_connection(qapp: QCoreApplication) -> None:
+def test_idle_timeout_closes_connection(qapp: QApplication) -> None:
     timeout = 0.5
     errors: list[str] = []
     srv = IpcServer(port=0, timeout_sec=timeout)
@@ -251,7 +244,7 @@ def test_idle_timeout_closes_connection(qapp: QCoreApplication) -> None:
     wait_until(lambda: srv.clients_count() == 1)
     deadline = time.monotonic() + timeout * 8
     while time.monotonic() < deadline:
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         if srv.clients_count() == 0:
             break
         time.sleep(0.01)
@@ -285,7 +278,7 @@ def test_stop_closes_all_connections(server: IpcServer) -> None:
 # ---------------------------------------------------------------------------
 # 7. start() при занятом порту возвращает False (основа single-instance, IPC-08)
 # ---------------------------------------------------------------------------
-def test_start_on_busy_port_returns_false(qapp: QCoreApplication) -> None:
+def test_start_on_busy_port_returns_false(qapp: QApplication) -> None:
     first = IpcServer(port=0)
     assert first.start() is True
     port = first.port()
@@ -304,7 +297,7 @@ def test_start_on_busy_port_returns_false(qapp: QCoreApplication) -> None:
 # 8. Несколько одновременных соединений (IPC-04)
 # ---------------------------------------------------------------------------
 def test_multiple_concurrent_clients(
-    server: IpcServer, qapp: QCoreApplication
+    server: IpcServer, qapp: QApplication
 ) -> None:
     responder = EchoResponder(server)
     pairs = [make_client(server, qapp) for _ in range(3)]
@@ -326,7 +319,7 @@ def test_multiple_concurrent_clients(
 # ---------------------------------------------------------------------------
 # 9. find_free_port выдаёт неиспользуемый порт
 # ---------------------------------------------------------------------------
-def test_find_free_port_usable(qapp: QCoreApplication) -> None:
+def test_find_free_port_usable(qapp: QApplication) -> None:
     port = find_free_port()
     assert 0 < port < 65536
     srv = IpcServer(port=port)
@@ -339,7 +332,7 @@ def test_find_free_port_usable(qapp: QCoreApplication) -> None:
 # 10. submit_task через реальный транспорт (контракт + UTF-8)
 # ---------------------------------------------------------------------------
 def test_submit_task_over_transport(
-    server: IpcServer, qapp: QCoreApplication
+    server: IpcServer, qapp: QApplication
 ) -> None:
     responder = EchoResponder(server)
     client, sock = make_client(server, qapp)
@@ -364,7 +357,7 @@ def test_submit_task_over_transport(
 # 11. Ошибочные типы ответов: unknown_type / missing_field → ErrorMsg (IPC-03)
 # ---------------------------------------------------------------------------
 def test_protocol_errors_return_errormsg(
-    server: IpcServer, qapp: QCoreApplication
+    server: IpcServer, qapp: QApplication
 ) -> None:
     responder = EchoResponder(server)
     client, sock = make_client(server, qapp)

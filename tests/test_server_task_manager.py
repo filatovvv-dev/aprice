@@ -1,8 +1,8 @@
 """Тесты TaskManager (подзадача 3.4a rev 2): FSM, очередь, round-robin, ETA.
 
-Qt — только ``QCoreApplication`` (без GUI). Рабочий поток планировщика шлёт
+Qt — общий ``QApplication`` из ``conftest.py``. Рабочий поток планировщика шлёт
 внутренние queued-сигналы, поэтому тесты «качают» цикл событий через
-``QCoreApplication.processEvents()`` (хелпер :func:`pump_until`).
+``QApplication.processEvents()`` (хелпер :func:`pump_until`).
 
 Паузы проверяются в ``test_fast_mode`` с фиксированным ``test_delay``;
 интервалы берутся из монотонных меток ``Task.request_log`` (момент
@@ -17,7 +17,7 @@ import time
 from typing import Callable
 
 import pytest
-from PyQt6.QtCore import QCoreApplication
+from PyQt6.QtWidgets import QApplication
 
 from common.config import Config
 from server import protocol
@@ -42,21 +42,15 @@ FOUR = ["auto.ru", "drom.ru", "avito.ru", "bibika.ru"]
 # ----------------------------------------------------------------------
 # Инфраструктура
 # ----------------------------------------------------------------------
-@pytest.fixture(scope="module")
-def qapp() -> QCoreApplication:
-    """Один QCoreApplication на модуль."""
-    return QCoreApplication.instance() or QCoreApplication([])
-
-
 def pump_until(cond: Callable[[], bool], timeout: float = 10.0) -> None:
     """Крутит цикл событий, пока ``cond()`` не станет истинным."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        QCoreApplication.processEvents()
+        QApplication.processEvents()
         if cond():
             return
         time.sleep(0.005)
-    QCoreApplication.processEvents()
+    QApplication.processEvents()
     assert cond(), "pump_until: условие не выполнено за отведённое время"
 
 
@@ -371,7 +365,7 @@ def test_shutdown_stops_current_and_clears_queue(mgr, store):
     assert not [t for t in threading.enumerate() if t.name.startswith("aprice-task")]
 
     n_events = len(rec.events)
-    QCoreApplication.processEvents()
+    QApplication.processEvents()
     assert len(rec.events) == n_events  # после shutdown сигналов нет
     assert not rec.has("started", second)
     # Прерванное и ожидавшее остаются «активными» для восстановления (S-07).
