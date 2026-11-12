@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PyQt6 import sip  # noqa: E402
-from PyQt6.QtCore import QCoreApplication, QObject, QPoint, QSettings, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QObject, QPoint, QSettings, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QCloseEvent  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon  # noqa: E402
 
@@ -56,17 +56,6 @@ class FakeTaskManager(QObject):
 
     def page_totals(self, task_id: str):  # noqa: ANN201
         return self.totals
-
-
-@pytest.fixture(scope="module")
-def qapp() -> QApplication:
-    """Один ``QApplication`` на модуль (виджетам нужен именно он)."""
-    app = QCoreApplication.instance()
-    if app is None:
-        app = QApplication([])
-    if not isinstance(app, QApplication):
-        pytest.skip("уже создан QCoreApplication без GUI — виджеты недоступны")
-    return app
 
 
 @pytest.fixture()
