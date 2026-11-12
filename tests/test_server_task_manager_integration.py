@@ -453,3 +453,16 @@ def test_fetch_page_single_page_no_pause_and_simulation(config):
         parser.fetch_page(SPEC, {"simulate_captcha": "drom.ru"}, 1, threading.Event())
     with pytest.raises(BlockedError):
         parser.fetch_page(SPEC, {"simulate_block": "drom.ru"}, 1, threading.Event())
+
+
+# ----------------------------------------------------------------------
+# page_totals (3.5): данные для определённого прогресс-бара окна
+# ----------------------------------------------------------------------
+def test_page_totals_counts_pages_across_sites(mgr):
+    """page_totals -> (выполнено, всего) по всем площадкам; неизвестное -> None."""
+    rec = Recorder(mgr)
+    task_id = mgr.submit(SPEC, fast(sites=FOUR, pages=3))
+    assert mgr.page_totals(task_id) == (0, 12)
+    assert mgr.page_totals("nope") is None
+    run_to_end(rec, task_id)
+    assert mgr.page_totals(task_id) == (12, 12)
