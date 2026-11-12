@@ -371,3 +371,8 @@ def test_main_second_instance_returns_0(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(server_main.ServerApp, "start", lambda self: False)
     assert server_main.main([]) == 0
 
+
+def test_all_tests_share_one_qapplication(qapp):
+    """Sanity: в сессии один экземпляр, и это именно ``QApplication`` (с GUI)."""
+    assert QApplication.instance() is qapp
+    assert isinstance(QApplication.instance(), QApplication)
