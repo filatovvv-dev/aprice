@@ -420,3 +420,19 @@ def test_captcha_dialog_reject_counts_as_skip(qapp, wm):
     d.reject()
     assert len(skipped.calls) == 1
     d.deleteLater()
+
+
+def test_show_current_refreshes_running_task_and_shows(window, tm):
+    """PW-09 (3.6): show_current() при идущем задании сразу заполняет поля."""
+    tm.current_task_id = lambda: "t1"  # type: ignore[method-assign]
+    tm.status = dict(RUNNING_STATUS)
+    window.show_current()
+    assert window.isVisible()
+    assert window.current_task_id == "t1"
+    assert "auto.ru" in window.label_site.text()
+
+
+def test_show_current_without_task_shows_idle(window, tm):
+    tm.current_task_id = lambda: None  # type: ignore[method-assign]
+    window.show_current()
+    assert window.isVisible() and window.current_task_id is None
