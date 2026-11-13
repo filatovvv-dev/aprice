@@ -203,6 +203,25 @@ cars-base.ru окажется недоступен. Перед запуском 
   (задача №2, п. 2.2).
 * Дублирование в GUI-панель — потокобезопасный `QtLogEmitter` (сигнал → слот).
 
+## SSL/прокси и парсер auto.ru (Server, 3.7)
+
+Server читает секцию `server` из `config/settings.json`:
+
+```json
+"server": { "ignore_https_errors": true, "playwright_headless": true }
+```
+
+* `ignore_https_errors` (по умолчанию `true`) — Playwright игнорирует ошибки
+  сертификатов. Нужно в сетях с MITM-прокси и self-signed сертификатом, иначе
+  `net::ERR_CERT_AUTHORITY_INVALID`. Если MITM нет — поставьте `false`.
+* `playwright_headless` — `false` покажет окно Chromium (удобно для отладки CAPTCHA).
+* Браузер: `playwright install chromium` (в тестах не нужен — они на моках).
+* auto.ru без прогретых cookie часто отдаёт CAPTCHA (Yandex SmartCaptcha) —
+  это ожидаемое поведение: парсер сообщает о ней (`CaptchaDetectedError`), сервер
+  показывает диалог; CAPTCHA не обходится. Разбор выдачи auto.ru реализован по
+  публичным примерам и **не проверен в сети** — см. docstring `server/parsers/autoru.py`.
+* В `test_fast_mode` парсер auto.ru работает как заглушка (без сети).
+
 ## Подготовка к задаче №3 (Server)
 
 В `common/constants.py` объявлены (без реализации): `IPC_HOST/IPC_PORT/
