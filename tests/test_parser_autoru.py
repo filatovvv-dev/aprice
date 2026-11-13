@@ -112,7 +112,7 @@ def test_build_url_contains_all_filters(parser):
     url = parser._build_url(SPEC, {}, 1)
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
-    assert parsed.path == "/cars/bmw/x5/all/"
+    assert parsed.path == "/moskva/cars/bmw/x5/all/"
     assert query["year_from"] == ["2018"] and query["year_to"] == ["2021"]
     assert query["transmission"] == ["AUTOMATIC"]
     assert query["fuel_type"] == ["PETROL"]
@@ -123,7 +123,7 @@ def test_build_url_page_and_multiple_values(parser):
     spec = dict(SPEC, transmissions=["АКПП", "Робот"], fuels=["Дизель"],
                 manufacturer="Land Rover", model="Range Rover")
     url = parser._build_url(spec, {}, 3)
-    assert "/cars/land_rover/range_rover/all/" in url
+    assert "/moskva/cars/land_rover/range_rover/all/" in url
     query = parse_qs(urlparse(url).query)
     assert query["transmission"] == ["AUTOMATIC", "AMT"]
     assert query["page"] == ["3"]

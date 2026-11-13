@@ -17,7 +17,7 @@
 на Windows (раздел 8 промпта 3.7). Все допущения собраны в константах модуля,
 чтобы правка после проверки была локальной.
 
-* **URL:** ``https://auto.ru/cars/{марка}/{модель}/all/?year_from=..&year_to=..
+* **URL:** ``https://auto.ru/{регион}/cars/{марка}/{модель}/all/?year_from=..&year_to=..
   &transmission=..&fuel_type=..&page=N``. Значения ``transmission``
   (``AUTOMATIC``/``MECHANICAL``/``CVT``/``AMT``) и ``fuel_type``
   (``PETROL``/``DIESEL``/``HYBRID``/``ELECTRO``) — по промпту 3.7; у самого
@@ -72,6 +72,8 @@ except ImportError:  # pragma: no cover - зависит от окружения
 logger = logging.getLogger("aprice.server.parsers.autoru")
 
 BASE_URL = "https://auto.ru"
+#: Регион по умолчанию: без региона в пути auto.ru отдаёт заглушку/пустую выдачу.
+DEFAULT_REGION = "moskva"
 GOTO_TIMEOUT_MS = 30_000  # FX-05: не увеличивать
 SELECTOR_TIMEOUT_MS = 5_000
 #: Причины :class:`BlockedError` (в ``detail``) — различают сценарии отказа.
@@ -312,7 +314,8 @@ class AutoRuParser(BaseSiteParser):
         """Строит URL выдачи по фильтрам ``spec`` (см. исследование в docstring модуля).
 
         Args:
-            spec: спецификация (``manufacturer``, ``model``, ``year_from``,
+            spec: спецификация (``region`` — slug региона, по умолчанию
+                ``moskva``; ``manufacturer``, ``model``, ``year_from``,
                 ``year_to``, ``transmissions``, ``fuels``; необязательные
                 ``manufacturer_slug``/``model_slug`` переопределяют slug).
             options: опции задания (не используются, зарезервировано).
@@ -321,6 +324,7 @@ class AutoRuParser(BaseSiteParser):
         Returns:
             str: готовый URL.
         """
+        region = _slug(str(spec.get("region") or DEFAULT_REGION))
         make = spec.get("manufacturer_slug") or _slug(str(spec.get("manufacturer", "")))
         model = spec.get("model_slug") or _slug(str(spec.get("model", "")))
         params: list[tuple[str, Any]] = []
@@ -335,7 +339,7 @@ class AutoRuParser(BaseSiteParser):
             if name in FUEL_PARAMS:
                 params.append((FUEL_PARAM_NAME, FUEL_PARAMS[name]))
         params.append(("page", page))
-        return f"{BASE_URL}/cars/{make}/{model}/all/?{urlencode(params)}"
+        return f"{BASE_URL}/{region}/cars/{make}/{model}/all/?{urlencode(params)}"
 
     # ------------------------------------------------------------------
     # Разбор выдачи
