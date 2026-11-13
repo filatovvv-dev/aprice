@@ -63,10 +63,22 @@ from server.parsers.base import (
 )
 from server.parsers.browser import PlaywrightBrowser
 
+try:  # исключение таймаута Playwright; без пакета ловить нечего
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+except ImportError:  # pragma: no cover - зависит от окружения
+    class PlaywrightTimeoutError(Exception):  # type: ignore[no-redef]
+        """Запасной тип, если Playwright не установлен."""
+
 logger = logging.getLogger("aprice.server.parsers.autoru")
 
 BASE_URL = "https://auto.ru"
-GOTO_TIMEOUT_MS = 30_000
+GOTO_TIMEOUT_MS = 30_000  # FX-05: не увеличивать
+SELECTOR_TIMEOUT_MS = 5_000
+#: Причины :class:`BlockedError` (в ``detail``) — различают сценарии отказа.
+GOTO_TIMEOUT_REASON = "goto_timeout"
+NO_LISTINGS_REASON = "no_listings_selector"
+#: Признаки выдачи в DOM (FX-04).
+LISTING_SELECTOR = '[data-bem*="offer"], .___1h2y, div[class*="ListingItem"]'
 
 #: Коробка передач (как в ``spec.transmissions``) -> значение параметра URL.
 TRANSMISSION_PARAMS = {
@@ -95,7 +107,7 @@ FUEL_LABELS = {
     "HYBRID": "Гибрид", "ELECTRO": "Электро", "LPG": "Газ",
 }
 
-CAPTCHA_URL_MARKERS = ("showcaptcha",)
+CAPTCHA_URL_MARKERS = ("showcaptcha", "smartcaptcha")
 CAPTCHA_HTML_MARKERS = ("smartcaptcha", "showcaptcha")
 EMPTY_MARKERS = ("Ничего не найдено", "Объявления не найдены")
 BLOCKED_STATUSES = (403, 429)
@@ -172,8 +184,11 @@ class AutoRuParser(BaseSiteParser):
             list[Ad]: объявления страницы; ``[]`` — пустая выдача или остановка.
 
         Raises:
-            CaptchaDetectedError: обнаружена CAPTCHA (без обхода).
-            BlockedError: HTTP 403/429.
+            CaptchaDetectedError: CAPTCHA в URL (в т.ч. после таймаута
+                навигации) или в HTML (без обхода).
+            BlockedError: HTTP 403/429 (``detail="HTTP <код>"``), таймаут
+                навигации вне CAPTCHA (``detail="goto_timeout"``) или нет
+                признаков выдачи за 5 с (``detail="no_listings_selector"``).
             ParserError: нет ответа на запрос.
         """
         self._check_simulation(options)
@@ -188,25 +203,62 @@ class AutoRuParser(BaseSiteParser):
             headless=self._headless, ignore_https_errors=self._ignore_ssl
         ) as browser:
             tab = browser.new_page()
-            response = tab.goto(url, timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+            # FX-01: "commit" возвращается по заголовкам ответа. DOMContentLoaded
+            # на антибот-заглушке не наступает, и 30 с уходили впустую.
+            response = None
+            goto_error: Optional[PlaywrightTimeoutError] = None
+            try:
+                response = tab.goto(url, timeout=GOTO_TIMEOUT_MS, wait_until="commit")
+            except PlaywrightTimeoutError as exc:
+                goto_error = exc
+
+            # FX-02/FX-06: URL проверяем сразу, в том числе после таймаута.
+            current_url = tab.url or ""
+            response_url = (getattr(response, "url", "") or "") if response else ""
+            for candidate in (current_url, response_url):
+                if self._is_captcha_url(candidate):
+                    raise CaptchaDetectedError(self.site_name, candidate)
+            if goto_error is not None:  # FX-03: таймаут не на капче — сайт завис
+                raise BlockedError(self.site_name, GOTO_TIMEOUT_REASON)
             if stop_event.is_set():
                 return []
             if response is None:
                 raise ParserError(f"auto.ru: no response for {url}")
-            current_url = tab.url or ""
-            response_url = response.url or ""
-            if any(m in current_url or m in response_url for m in CAPTCHA_URL_MARKERS):
-                raise CaptchaDetectedError(self.site_name, current_url or response_url)
+
+            if response.status in BLOCKED_STATUSES:  # FX-07
+                # Страница отказа может быть самой капчей — сначала смотрим HTML.
+                self._raise_if_captcha_html(tab.content(), current_url or url)
+                raise BlockedError(self.site_name, f"HTTP {response.status}")
+
+            try:  # FX-04: выдача должна появиться за короткое время
+                tab.wait_for_selector(
+                    LISTING_SELECTOR, timeout=SELECTOR_TIMEOUT_MS, state="attached"
+                )
+            except PlaywrightTimeoutError:
+                html = tab.content()
+                self._raise_if_captcha_html(html, current_url or url)
+                if any(m in html for m in EMPTY_MARKERS):
+                    return []
+                raise BlockedError(self.site_name, NO_LISTINGS_REASON)
             html = tab.content()
 
-        lowered = html.lower()
-        if any(m in lowered for m in CAPTCHA_HTML_MARKERS):
-            raise CaptchaDetectedError(self.site_name, current_url or url)
-        if response.status in BLOCKED_STATUSES:
-            raise BlockedError(self.site_name, f"HTTP {response.status}")
+        # FX-07: капча в HTML (в т.ч. во фрейме), пустая выдача, разбор.
+        self._raise_if_captcha_html(html, current_url or url)
         if any(m in html for m in EMPTY_MARKERS):
             return []
         return self._parse_listings(html, spec)
+
+    @staticmethod
+    def _is_captcha_url(url: str) -> bool:
+        """``True``, если URL указывает на страницу CAPTCHA."""
+        lowered = url.lower()
+        return any(m in lowered for m in CAPTCHA_URL_MARKERS)
+
+    def _raise_if_captcha_html(self, html: str, url: str) -> None:
+        """Бросает :class:`CaptchaDetectedError`, если в HTML есть признаки CAPTCHA."""
+        lowered = html.lower()
+        if any(m in lowered for m in CAPTCHA_HTML_MARKERS):
+            raise CaptchaDetectedError(self.site_name, url)
 
     def collect(
         self,
