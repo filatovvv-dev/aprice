@@ -112,6 +112,16 @@ def test_spec_exact_and_range_valid() -> None:
                                         options=dict(VALID_OPTIONS))))
 
 
+def test_spec_region_optional_and_validated() -> None:
+    """3.7-fix2: spec.region необязателен; это slug (латиница, цифры, _ и -)."""
+    validate_spec(dict(VALID_SPEC_RANGE))
+    validate_spec(dict(VALID_SPEC_RANGE, region="petrozavodsk"))
+    validate_spec(dict(VALID_SPEC_RANGE, region="nizhniy_novgorod"))
+    for bad in ("Москва", "", "mos kva", 5):
+        with pytest.raises(InvalidMessageError, match="invalid_field"):
+            validate_spec(dict(VALID_SPEC_RANGE, region=bad))
+
+
 # ---------------------------------------------------------------------------
 # 3. Неверный mode
 # ---------------------------------------------------------------------------
