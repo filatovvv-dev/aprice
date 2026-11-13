@@ -124,6 +124,14 @@ DEFAULT_SETTINGS: dict = {
         # ревью): false — запускать видимое окно Chromium.
         "headless": True,
     },
+    "server": {
+        # Игнорировать ошибки сертификатов в Playwright: в сети Заказчика
+        # MITM-прокси с self-signed сертификатом (иначе
+        # net::ERR_CERT_AUTHORITY_INVALID). Отключить, если MITM нет.
+        "ignore_https_errors": True,
+        # Chromium без окна; false — видимое окно (отладка CAPTCHA).
+        "playwright_headless": True,
+    },
     "logging": {
         "level": "INFO",
         "max_file_size_mb": 10,

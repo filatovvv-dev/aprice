@@ -7,6 +7,10 @@
     "cache_ttl_hours": 168,
     "source": "auto.ru"
   },
+  "server": {
+    "ignore_https_errors": true,
+    "playwright_headless": true
+  },
   "logging": {
     "level": "INFO",
     "max_file_size_mb": 10,
