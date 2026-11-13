@@ -1,25 +1,212 @@
-"""Заглушка парсера auto.ru (подзадача 3.3).
+"""Парсер выдачи auto.ru (подзадача 3.7).
 
-Реальная реализация на Playwright появится в подзадаче 3.7. Сейчас класс
-эмулирует поведение сборщика: паузы, лимиты, прерывание по ``stop_event``,
-генерация фейковых объявлений и эмуляция CAPTCHA по флагам ``options``.
+Реальная реализация на Playwright (:class:`~server.parsers.browser.PlaywrightBrowser`).
+Планировщик ``TaskManager`` вызывает :meth:`AutoRuParser.fetch_page` — **одну**
+страницу выдачи за вызов; паузы между запросами выдерживает он сам.
+
+В ``test_fast_mode`` (и при ``simulate_captcha`` / ``simulate_block``)
+парсер ведёт себя как заглушка 3.3: так автотесты 3.4–3.6 по-прежнему не
+ходят в сеть.
+
+Исследование структуры auto.ru
+------------------------------
+**НЕ ПРОВЕРЕНО В СЕТИ.** Из среды разработки auto.ru недоступен (внешний
+доступ ограничен allowlist-прокси; по задаче №1 «голый» HTTP к нему
+редиректит на ``showcaptcha``), поэтому разбор реализован по структуре из
+публичных примеров/документации и должен быть подтверждён ручным smoke-тестом
+на Windows (раздел 8 промпта 3.7). Все допущения собраны в константах модуля,
+чтобы правка после проверки была локальной.
+
+* **URL:** ``https://auto.ru/cars/{марка}/{модель}/all/?year_from=..&year_to=..
+  &transmission=..&fuel_type=..&page=N``. Значения ``transmission``
+  (``AUTOMATIC``/``MECHANICAL``/``CVT``/``AMT``) и ``fuel_type``
+  (``PETROL``/``DIESEL``/``HYBRID``/``ELECTRO``) — по промпту 3.7; у самого
+  auto.ru, возможно, иные имена/значения (например ``engine_group``,
+  ``VARIATOR``, ``ROBOT``) — таблицы :data:`TRANSMISSION_PARAMS` и
+  :data:`FUEL_PARAMS`, имя параметра — :data:`FUEL_PARAM_NAME`.
+* **Данные (приоритет 1):** JSON ``<script id="__NEXT_DATA__">`` (Next.js);
+  объявлением считается любой словарь с ``id`` и ``price_info`` или
+  ``vehicle_info``; поля: ``price_info.RUR`` (цена), ``documents.year``,
+  ``state.mileage``, ``vehicle_info.mark_info/model_info.name``,
+  ``vehicle_info.tech_param.transmission/engine_type/displacement`` (см³).
+  Поиск рекурсивный, поэтому точный путь к списку не важен.
+* **Данные (приоритет 2, запасной):** DOM-блоки ``ListingItem`` — ссылка
+  ``ListingItemTitle__link``, ``ListingItem__price``, ``ListingItem__year``,
+  ``ListingItem__kmAge``, сводка ``ListingItemTechSummary``.
+* Поле, которое не нашлось, равно ``None``; разбор не падает.
+
+CAPTCHA не обходится: ``showcaptcha`` в URL/HTML или ``smartcaptcha`` в HTML
+→ :class:`CaptchaDetectedError`; HTTP 403/429 → :class:`BlockedError`.
 """
 
 from __future__ import annotations
 
+import html as html_lib
+import json
 import logging
+import random
+import re
 from threading import Event
-from typing import Optional
+from typing import Any, Iterator, Optional
+from urllib.parse import quote, urlencode
 
-from server.parsers.base import BaseSiteParser, PageCallback, ProgressCallback
+from common.config import Config
+from common.utils import interruptible_sleep
+from server.parsers.base import (
+    Ad,
+    BaseSiteParser,
+    BlockedError,
+    CaptchaDetectedError,
+    ParserError,
+    PageCallback,
+    ProgressCallback,
+)
+from server.parsers.browser import PlaywrightBrowser
 
 logger = logging.getLogger("aprice.server.parsers.autoru")
 
+BASE_URL = "https://auto.ru"
+GOTO_TIMEOUT_MS = 30_000
+
+#: Коробка передач (как в ``spec.transmissions``) -> значение параметра URL.
+TRANSMISSION_PARAMS = {
+    "АКПП": "AUTOMATIC",
+    "МКПП": "MECHANICAL",
+    "Вариатор": "CVT",
+    "Робот": "AMT",
+}
+#: Топливо (как в ``spec.fuels``) -> значение параметра URL.
+FUEL_PARAMS = {
+    "Бензин": "PETROL",
+    "Дизель": "DIESEL",
+    "Гибрид": "HYBRID",
+    "Электро": "ELECTRO",
+}
+#: Имя параметра URL для типа топлива (не подтверждено, см. docstring модуля).
+FUEL_PARAM_NAME = "fuel_type"
+
+#: Значения из JSON/DOM -> единые русские названия ``Ad``.
+TRANSMISSION_LABELS = {
+    "AUTOMATIC": "АКПП", "MECHANICAL": "МКПП", "VARIATOR": "Вариатор",
+    "CVT": "Вариатор", "ROBOT": "Робот", "AMT": "Робот",
+}
+FUEL_LABELS = {
+    "GASOLINE": "Бензин", "PETROL": "Бензин", "DIESEL": "Дизель",
+    "HYBRID": "Гибрид", "ELECTRO": "Электро", "LPG": "Газ",
+}
+
+CAPTCHA_URL_MARKERS = ("showcaptcha",)
+CAPTCHA_HTML_MARKERS = ("smartcaptcha", "showcaptcha")
+EMPTY_MARKERS = ("Ничего не найдено", "Объявления не найдены")
+BLOCKED_STATUSES = (403, 429)
+
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
+)
+
+
+def _slug(value: str) -> str:
+    """Slug для пути URL: нижний регистр, пробелы -> ``_``, экранирование."""
+    return quote(value.strip().lower().replace(" ", "_"), safe="_-")
+
+
+def _to_int(value: Any) -> Optional[int]:
+    """Целое из числа или строки вида ``"1 250 000 ₽"``; иначе ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        digits = re.sub(r"\D", "", value)
+        return int(digits) if digits else None
+    return None
+
+
+def _walk_offers(node: Any) -> Iterator[dict]:
+    """Рекурсивно отдаёт словари, похожие на объявление auto.ru."""
+    if isinstance(node, dict):
+        if "id" in node and ("price_info" in node or "vehicle_info" in node):
+            yield node
+        else:
+            for value in node.values():
+                yield from _walk_offers(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_offers(item)
+
 
 class AutoRuParser(BaseSiteParser):
-    """Заглушка парсера каталога выдач auto.ru."""
+    """Парсер выдачи auto.ru на Playwright (см. исследование в docstring модуля)."""
 
     site_name = "auto.ru"
+
+    def __init__(self, config: Config) -> None:
+        """Читает настройки браузера из секции ``server`` (BR-07).
+
+        Args:
+            config: конфигурация приложения.
+        """
+        super().__init__(config)
+        self._headless = bool(config.get("server", "playwright_headless", True))
+        self._ignore_ssl = bool(config.get("server", "ignore_https_errors", True))
+
+    # ------------------------------------------------------------------
+    # Публичный API
+    # ------------------------------------------------------------------
+    def fetch_page(
+        self,
+        spec: dict,
+        options: dict,
+        page: int,
+        stop_event: Event,
+    ) -> list[Ad]:
+        """Собирает одну страницу выдачи auto.ru.
+
+        Args:
+            spec: спецификация задания.
+            options: опции задания.
+            page: номер страницы, с 1.
+            stop_event: событие остановки (проверяется до и после загрузки).
+
+        Returns:
+            list[Ad]: объявления страницы; ``[]`` — пустая выдача или остановка.
+
+        Raises:
+            CaptchaDetectedError: обнаружена CAPTCHA (без обхода).
+            BlockedError: HTTP 403/429.
+            ParserError: нет ответа на запрос.
+        """
+        self._check_simulation(options)
+        if options.get("test_fast_mode"):
+            return super().fetch_page(spec, options, page, stop_event)
+        if stop_event.is_set():
+            return []
+
+        url = self._build_url(spec, options, page)
+        logger.info("[auto.ru] страница %d: %s", page, url)
+        with PlaywrightBrowser(
+            headless=self._headless, ignore_https_errors=self._ignore_ssl
+        ) as browser:
+            tab = browser.new_page()
+            response = tab.goto(url, timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+            if stop_event.is_set():
+                return []
+            if response is None:
+                raise ParserError(f"auto.ru: no response for {url}")
+            current_url = tab.url or ""
+            response_url = response.url or ""
+            if any(m in current_url or m in response_url for m in CAPTCHA_URL_MARKERS):
+                raise CaptchaDetectedError(self.site_name, current_url or response_url)
+            html = tab.content()
+
+        lowered = html.lower()
+        if any(m in lowered for m in CAPTCHA_HTML_MARKERS):
+            raise CaptchaDetectedError(self.site_name, current_url or url)
+        if response.status in BLOCKED_STATUSES:
+            raise BlockedError(self.site_name, f"HTTP {response.status}")
+        if any(m in html for m in EMPTY_MARKERS):
+            return []
+        return self._parse_listings(html, spec)
 
     def collect(
         self,
@@ -28,26 +215,214 @@ class AutoRuParser(BaseSiteParser):
         stop_event: Event,
         progress_cb: Optional[ProgressCallback] = None,
         on_page: Optional[PageCallback] = None,
-    ) -> list:
-        """Эмулирует сбор объявлений с auto.ru.
+    ) -> list[Ad]:
+        """Собирает все страницы подряд (обратная совместимость с 3.3).
+
+        Планировщик использует :meth:`fetch_page`; этот метод нужен
+        автономным вызовам. В ``test_fast_mode`` работает как заглушка.
+        """
+        self._check_simulation(options)
+        if options.get("test_fast_mode"):
+            return self._collect_stub(spec, options, stop_event, progress_cb, on_page)
+
+        max_pages = int(options.get("max_pages_per_site") or 10)
+        max_ads = int(options.get("max_ads_per_site") or 500)
+        delay_min, delay_max = self._page_delays(options)
+        ads: list[Ad] = []
+        page = 0
+        while page < max_pages and len(ads) < max_ads and not stop_event.is_set():
+            page += 1
+            batch = self.fetch_page(spec, options, page, stop_event)[: max_ads - len(ads)]
+            if not batch:
+                break  # пустая выдача или остановка
+            ads.extend(batch)
+            if on_page is not None:
+                on_page(list(batch))
+            if progress_cb is not None:
+                progress_cb(page, len(ads))
+            if page >= max_pages or len(ads) >= max_ads:
+                break
+            if not interruptible_sleep(
+                stop_event,
+                random.uniform(delay_min, delay_max),
+                check_interval=self.STOP_CHECK_INTERVAL_SEC,
+            ):
+                break
+        return ads
+
+    def close(self) -> None:
+        """No-op: браузер создаётся и закрывается в каждом ``fetch_page`` (4.8)."""
+
+    # ------------------------------------------------------------------
+    # URL
+    # ------------------------------------------------------------------
+    def _build_url(self, spec: dict, options: dict, page: int) -> str:
+        """Строит URL выдачи по фильтрам ``spec`` (см. исследование в docstring модуля).
 
         Args:
-            spec: спецификация задания из IPC.
-            options: опции задания из IPC; поддерживает ключи
-                ``test_fast_mode``, ``simulate_captcha``, ``simulate_block``,
-                ``max_pages_per_site``, ``max_ads_per_site``.
-            stop_event: событие остановки (S-12).
-            progress_cb: колбэк прогресса ``(page, ads_collected)``.
-            on_page: колбэк постраничной отдачи объявлений (S-06).
+            spec: спецификация (``manufacturer``, ``model``, ``year_from``,
+                ``year_to``, ``transmissions``, ``fuels``; необязательные
+                ``manufacturer_slug``/``model_slug`` переопределяют slug).
+            options: опции задания (не используются, зарезервировано).
+            page: номер страницы, с 1.
 
         Returns:
-            list: собранные (фейковые) объявления :class:`Ad`.
-
-        Raises:
-            CaptchaDetectedError: ``options["simulate_captcha"] == "auto.ru"``.
-            BlockedError: ``options["simulate_block"] == "auto.ru"``.
+            str: готовый URL.
         """
-        logger.debug("[auto.ru] старт сбора (заглушка)")
-        return self._collect_stub(
-            spec, options, stop_event, progress_cb, on_page
+        make = spec.get("manufacturer_slug") or _slug(str(spec.get("manufacturer", "")))
+        model = spec.get("model_slug") or _slug(str(spec.get("model", "")))
+        params: list[tuple[str, Any]] = []
+        if spec.get("year_from"):
+            params.append(("year_from", spec["year_from"]))
+        if spec.get("year_to"):
+            params.append(("year_to", spec["year_to"]))
+        for name in spec.get("transmissions") or []:
+            if name in TRANSMISSION_PARAMS:
+                params.append(("transmission", TRANSMISSION_PARAMS[name]))
+        for name in spec.get("fuels") or []:
+            if name in FUEL_PARAMS:
+                params.append((FUEL_PARAM_NAME, FUEL_PARAMS[name]))
+        params.append(("page", page))
+        return f"{BASE_URL}/cars/{make}/{model}/all/?{urlencode(params)}"
+
+    # ------------------------------------------------------------------
+    # Разбор выдачи
+    # ------------------------------------------------------------------
+    def _parse_listings(self, html: str, spec: dict) -> list[Ad]:
+        """Извлекает объявления: сначала ``__NEXT_DATA__``, затем DOM.
+
+        Args:
+            html: HTML страницы выдачи.
+            spec: спецификация (марка/модель — запасные значения полей).
+
+        Returns:
+            list[Ad]: объявления без дублей по ``url``.
+        """
+        ads = self._parse_next_data(html, spec)
+        if not ads:
+            ads = self._parse_dom(html, spec)
+        unique: dict[str, Ad] = {}
+        for ad in ads:
+            unique.setdefault(ad.url, ad)
+        return list(unique.values())
+
+    def _parse_next_data(self, html: str, spec: dict) -> list[Ad]:
+        """Объявления из JSON ``__NEXT_DATA__`` (приоритет 1)."""
+        match = _NEXT_DATA_RE.search(html)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(1))
+        except ValueError:
+            logger.warning("[auto.ru] __NEXT_DATA__ не разобран как JSON")
+            return []
+        ads = []
+        for offer in _walk_offers(data):
+            ad = self._offer_to_ad(offer, spec)
+            if ad is not None:
+                ads.append(ad)
+        return ads
+
+    def _offer_to_ad(self, offer: dict, spec: dict) -> Optional[Ad]:
+        """Преобразует JSON-объявление в :class:`Ad` (``None`` — нет id)."""
+        offer_id = offer.get("id")
+        if not offer_id:
+            return None
+        vehicle = offer.get("vehicle_info") or {}
+        mark = vehicle.get("mark_info") or {}
+        model = vehicle.get("model_info") or {}
+        tech = vehicle.get("tech_param") or {}
+        price_info = offer.get("price_info") or {}
+        displacement = _to_int(tech.get("displacement"))
+        url = offer.get("url") or (
+            f"{BASE_URL}/cars/used/sale/"
+            f"{str(mark.get('code') or spec.get('manufacturer', '')).lower()}/"
+            f"{str(model.get('code') or spec.get('model', '')).lower()}/{offer_id}/"
         )
+        transmission = str(tech.get("transmission") or "").upper()
+        fuel = str(tech.get("engine_type") or "").upper()
+        return Ad(
+            url=url,
+            price=_to_int(price_info.get("RUR") or price_info.get("price")),
+            year=_to_int((offer.get("documents") or {}).get("year")),
+            manufacturer=mark.get("name") or spec.get("manufacturer"),
+            model=model.get("name") or spec.get("model"),
+            transmission=TRANSMISSION_LABELS.get(transmission) or tech.get("transmission"),
+            fuel=FUEL_LABELS.get(fuel) or tech.get("engine_type"),
+            engine_volume=(
+                round(displacement / 1000, 1) if displacement is not None else None
+            ),
+            mileage=_to_int((offer.get("state") or {}).get("mileage")),
+            raw_json={
+                "source": "auto.ru",
+                "id": offer_id,
+                "price_info": price_info,
+                "documents": offer.get("documents"),
+                "mileage": (offer.get("state") or {}).get("mileage"),
+                "tech_param": tech,
+            },
+        )
+
+    def _parse_dom(self, html: str, spec: dict) -> list[Ad]:
+        """Объявления из DOM-блоков ``ListingItem`` (запасной вариант)."""
+        blocks = re.split(r'(?=<div[^>]*class="ListingItem[\s"])', html)[1:]
+        ads: list[Ad] = []
+        for block in blocks:
+            link = re.search(
+                r'<a[^>]*class="[^"]*ListingItemTitle__link[^"]*"[^>]*href="([^"]+)"', block
+            ) or re.search(
+                r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*ListingItemTitle__link', block
+            )
+            if not link:
+                continue
+            url = html_lib.unescape(link.group(1))
+            if url.startswith("/"):
+                url = BASE_URL + url
+            text = self._text(block)
+            ads.append(Ad(
+                url=url,
+                price=self._dom_int(block, "ListingItem__price"),
+                year=self._dom_int(block, "ListingItem__year"),
+                manufacturer=spec.get("manufacturer"),
+                model=spec.get("model"),
+                transmission=self._dom_label(text, TRANSMISSION_DOM_LABELS),
+                fuel=self._dom_label(text, FUEL_DOM_LABELS),
+                engine_volume=self._dom_volume(text),
+                mileage=self._dom_int(block, "ListingItem__kmAge"),
+                raw_json={"source": "auto.ru", "via": "dom"},
+            ))
+        return ads
+
+    @staticmethod
+    def _text(fragment: str) -> str:
+        """Текст фрагмента без тегов."""
+        return html_lib.unescape(re.sub(r"<[^>]+>", " ", fragment))
+
+    @staticmethod
+    def _dom_int(block: str, css_class: str) -> Optional[int]:
+        """Целое из элемента с классом ``css_class`` (цена, год, пробег)."""
+        match = re.search(rf'class="[^"]*{css_class}[^"]*"[^>]*>(.*?)</', block, re.DOTALL)
+        return _to_int(re.sub(r"<[^>]+>", "", match.group(1))) if match else None
+
+    @staticmethod
+    def _dom_label(text: str, labels: dict[str, str]) -> Optional[str]:
+        """Первое найденное в тексте слово из словаря ``признак -> название``."""
+        lowered = text.lower()
+        for needle, label in labels.items():
+            if needle in lowered:
+                return label
+        return None
+
+    @staticmethod
+    def _dom_volume(text: str) -> Optional[float]:
+        """Объём двигателя из текста вида ``2.0 л``."""
+        match = re.search(r"(\d[.,]\d)\s*л\b", text)
+        return float(match.group(1).replace(",", ".")) if match else None
+
+
+TRANSMISSION_DOM_LABELS = {
+    "автомат": "АКПП", "механика": "МКПП", "вариатор": "Вариатор", "робот": "Робот",
+}
+FUEL_DOM_LABELS = {
+    "бензин": "Бензин", "дизель": "Дизель", "гибрид": "Гибрид", "электро": "Электро",
+}
