@@ -361,7 +361,9 @@ def test_restored_task_waits_before_first_request(mgr, store):
 def test_restore_without_snapshot_uses_ads_estimate(mgr, store):
     """Нет progress -> грубая оценка pages_done = ads // 50 (не с нуля)."""
     task_id = seed_task(store, "running", fast(sites=["auto.ru"], pages=5))
-    ads = [AutoRuParser(Config()).fetch_page(SPEC, {}, 1, threading.Event())][0][:1]
+    ads = [AutoRuParser(Config()).fetch_page(
+        SPEC, {"test_fast_mode": True}, 1, threading.Event()
+    )][0][:1]
     batch = []
     for i in range(100):
         d = ads[0].to_dict()
