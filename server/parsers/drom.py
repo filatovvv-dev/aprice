@@ -22,10 +22,13 @@
   применяется или страницы не листаются, менять :data:`QUERY_PARAMS`. Параметры
   коробки, топлива и объёма **не передаются** (фильтрация — на стороне Client).
 * **Выдача:** маркеры ``data-ftid`` (стабильнее CSS-классов): карточка —
-  ``[data-ftid="bulls-list_bull"]``, ссылка на объявление —
-  ``a[data-ftid="bull_title"]`` (:data:`LISTINGS_SELECTOR`). Основной способ —
-  найти ссылки ``bull_title`` и взять текст ближайшего предка-карточки;
-  запасной — карточки ``bulls-list_bull`` и их первая ссылка.
+  ``[data-ftid="bulls-list_bull"]``, заголовок/ссылка —
+  ``[data-ftid="bull_title"]`` (:data:`LISTINGS_SELECTOR`; ``a`` не требуется:
+  ссылка берётся у самого элемента, его предка или потомка). Основной способ —
+  найти заголовки ``bull_title`` и взять текст ближайшего предка-карточки;
+  запасной — карточки ``bulls-list_bull`` и их первая ссылка. Селекторы
+  **не проверены** на ``auto.drom.ru``: при 0 карточек смотреть HTML из
+  ``data/debug/drom_page_*.html``.
 * **Поля** берутся из текста карточки регулярками: цена — число перед ``₽`` или
   ``руб``, пробег — перед ``км``, год — ``19xx``/``20xx``, объём — ``N.N л``,
   коробка и топливо — по ключевым словам. Марка и модель — из ``spec``. Весь
@@ -87,7 +90,8 @@ NO_LISTINGS_REASON = "no_listings_selector"
 DEBUG_DIR: Path = constants.DATA_DIR / "debug"
 
 #: Ссылка на объявление и карточка (атрибуты ``data-ftid``).
-TITLE_SELECTOR = 'a[data-ftid="bull_title"]'
+#: Без ``a``: на ``auto.drom.ru`` маркер может стоять и на обёртке заголовка.
+TITLE_SELECTOR = '[data-ftid="bull_title"]'
 CARD_SELECTOR = '[data-ftid="bulls-list_bull"]'
 #: Признак готовности выдачи: карточка или ссылка на объявление.
 LISTINGS_SELECTOR = f"{CARD_SELECTOR}, {TITLE_SELECTOR}"
@@ -104,7 +108,8 @@ TITLES_SCRIPT = (
     " if (!c) { c = a;"
     "  for (let i = 0; i < 5 && c.parentElement && !/₽|руб/.test(c.innerText || ''); i++)"
     "   c = c.parentElement; }"
-    " return {href: a.href || null, text: c.innerText || ''}; })"
+    " const l = a.matches('a') ? a : (a.closest('a') || a.querySelector('a'));"
+    " return {href: (l && l.href) || null, text: c.innerText || ''}; })"
 )
 #: JS для ``evaluate_all`` по карточкам (запасной путь).
 CARDS_SCRIPT = (
