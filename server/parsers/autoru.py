@@ -17,7 +17,7 @@
 на Windows (раздел 8 промпта 3.7). Все допущения собраны в константах модуля,
 чтобы правка после проверки была локальной.
 
-* **URL:** ``https://auto.ru/cars/{марка}/{модель}/all/?year_from=..&year_to=..
+* **URL:** ``https://auto.ru/{регион}/cars/{марка}/{модель}/all/?year_from=..&year_to=..
   &transmission=..&fuel_type=..&page=N``. Значения ``transmission``
   (``AUTOMATIC``/``MECHANICAL``/``CVT``/``AMT``) и ``fuel_type``
   (``PETROL``/``DIESEL``/``HYBRID``/``ELECTRO``) — по промпту 3.7; у самого
@@ -46,10 +46,13 @@ import json
 import logging
 import random
 import re
+import time
+from pathlib import Path
 from threading import Event
 from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlencode
 
+from common import constants
 from common.config import Config
 from common.utils import interruptible_sleep
 from server.parsers.base import (
@@ -72,6 +75,10 @@ except ImportError:  # pragma: no cover - зависит от окружения
 logger = logging.getLogger("aprice.server.parsers.autoru")
 
 BASE_URL = "https://auto.ru"
+#: Регион по умолчанию: без региона в пути auto.ru отдаёт заглушку/пустую выдачу.
+DEFAULT_REGION = "moskva"
+#: Каталог дампов HTML пустых страниц (в ``.gitignore``).
+DEBUG_DIR: Path = constants.DATA_DIR / "debug"
 GOTO_TIMEOUT_MS = 30_000  # FX-05: не увеличивать
 SELECTOR_TIMEOUT_MS = 5_000
 #: Причины :class:`BlockedError` (в ``detail``) — различают сценарии отказа.
@@ -236,17 +243,48 @@ class AutoRuParser(BaseSiteParser):
                 )
             except PlaywrightTimeoutError:
                 html = tab.content()
+                logger.info("[auto.ru] финальный URL: %s, html_len=%d", current_url, len(html))
                 self._raise_if_captcha_html(html, current_url or url)
                 if any(m in html for m in EMPTY_MARKERS):
+                    self._report_empty(html, current_url, page)
                     return []
                 raise BlockedError(self.site_name, NO_LISTINGS_REASON)
             html = tab.content()
+            logger.info("[auto.ru] финальный URL: %s, html_len=%d", current_url, len(html))
 
         # FX-07: капча в HTML (в т.ч. во фрейме), пустая выдача, разбор.
         self._raise_if_captcha_html(html, current_url or url)
         if any(m in html for m in EMPTY_MARKERS):
+            self._report_empty(html, current_url, page)
             return []
-        return self._parse_listings(html, spec)
+        ads = self._parse_listings(html, spec)
+        if not ads:
+            self._report_empty(html, current_url, page)
+        return ads
+
+    def _report_empty(self, html: str, url: str, page: int) -> None:
+        """Диагностика пустого результата: предупреждение в лог и дамп HTML.
+
+        HTML сохраняется в :data:`DEBUG_DIR` для анализа селекторов; сбой
+        записи не должен ронять сбор.
+
+        Args:
+            html: HTML страницы, давшей 0 объявлений.
+            url: финальный URL страницы.
+            page: номер страницы выдачи.
+        """
+        logger.warning(
+            "[auto.ru] парсинг вернул 0 объявлений: url=%s, html_len=%d, "
+            "has_next_data=%s, has_offers_key=%s",
+            url, len(html), "__NEXT_DATA__" in html, '"offers"' in html,
+        )
+        try:
+            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            path = DEBUG_DIR / f"autoru_page_{page}_{int(time.time())}.html"
+            path.write_text(html, encoding="utf-8")
+            logger.warning("[auto.ru] HTML сохранён: %s", path)
+        except OSError:
+            logger.warning("[auto.ru] не удалось сохранить HTML для анализа", exc_info=True)
 
     @staticmethod
     def _is_captcha_url(url: str) -> bool:
@@ -312,7 +350,8 @@ class AutoRuParser(BaseSiteParser):
         """Строит URL выдачи по фильтрам ``spec`` (см. исследование в docstring модуля).
 
         Args:
-            spec: спецификация (``manufacturer``, ``model``, ``year_from``,
+            spec: спецификация (``region`` — slug региона, по умолчанию
+                ``moskva``; ``manufacturer``, ``model``, ``year_from``,
                 ``year_to``, ``transmissions``, ``fuels``; необязательные
                 ``manufacturer_slug``/``model_slug`` переопределяют slug).
             options: опции задания (не используются, зарезервировано).
@@ -321,6 +360,7 @@ class AutoRuParser(BaseSiteParser):
         Returns:
             str: готовый URL.
         """
+        region = _slug(str(spec.get("region") or DEFAULT_REGION))
         make = spec.get("manufacturer_slug") or _slug(str(spec.get("manufacturer", "")))
         model = spec.get("model_slug") or _slug(str(spec.get("model", "")))
         params: list[tuple[str, Any]] = []
@@ -335,7 +375,7 @@ class AutoRuParser(BaseSiteParser):
             if name in FUEL_PARAMS:
                 params.append((FUEL_PARAM_NAME, FUEL_PARAMS[name]))
         params.append(("page", page))
-        return f"{BASE_URL}/cars/{make}/{model}/all/?{urlencode(params)}"
+        return f"{BASE_URL}/{region}/cars/{make}/{model}/all/?{urlencode(params)}"
 
     # ------------------------------------------------------------------
     # Разбор выдачи

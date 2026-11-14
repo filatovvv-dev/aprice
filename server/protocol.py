@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional, Union
 
@@ -335,6 +336,15 @@ def validate_spec(spec: Any) -> None:
             raise InvalidMessageError(
                 f"invalid_field: spec.{name} должен быть списком строк"
             )
+
+    region = spec.get("region")
+    if region is not None and (
+        not isinstance(region, str) or not re.fullmatch(r"[a-z0-9_-]+", region)
+    ):
+        raise InvalidMessageError(
+            "invalid_field: spec.region должен быть slug региона "
+            "(латиница, цифры, «_», «-»), например 'moskva'"
+        )
 
     vol_from = spec.get("engine_volume_from")
     vol_to = spec.get("engine_volume_to")

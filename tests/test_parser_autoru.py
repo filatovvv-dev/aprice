@@ -79,6 +79,14 @@ DOM_HTML = """
 """
 
 
+@pytest.fixture(autouse=True)
+def debug_dir(tmp_path, monkeypatch):
+    """Дампы HTML пустых страниц — во временный каталог, не в data/debug."""
+    path = tmp_path / "debug"
+    monkeypatch.setattr(autoru_module, "DEBUG_DIR", path)
+    return path
+
+
 @pytest.fixture()
 def parser(tmp_path) -> AutoRuParser:
     return AutoRuParser(Config(tmp_path / "settings.json"))
@@ -112,18 +120,36 @@ def test_build_url_contains_all_filters(parser):
     url = parser._build_url(SPEC, {}, 1)
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
-    assert parsed.path == "/cars/bmw/x5/all/"
+    assert parsed.path == "/moskva/cars/bmw/x5/all/"
     assert query["year_from"] == ["2018"] and query["year_to"] == ["2021"]
     assert query["transmission"] == ["AUTOMATIC"]
     assert query["fuel_type"] == ["PETROL"]
     assert query["page"] == ["1"]
 
 
+def test_build_url_exact_region_url(parser):
+    spec = {"manufacturer": "BMW", "model": "X5", "year_from": 2018, "year_to": 2021}
+    assert parser._build_url(spec, {}, 1) == (
+        "https://auto.ru/moskva/cars/bmw/x5/all/?year_from=2018&year_to=2021&page=1"
+    )
+
+
+def test_build_url_uses_spec_region(parser):
+    url = parser._build_url(dict(SPEC, region="petrozavodsk"), {}, 2)
+    assert urlparse(url).path == "/petrozavodsk/cars/bmw/x5/all/"
+
+
+def test_build_url_empty_region_falls_back_to_default(parser):
+    assert urlparse(parser._build_url(dict(SPEC, region=""), {}, 1)).path.startswith(
+        "/moskva/cars/"
+    )
+
+
 def test_build_url_page_and_multiple_values(parser):
     spec = dict(SPEC, transmissions=["АКПП", "Робот"], fuels=["Дизель"],
                 manufacturer="Land Rover", model="Range Rover")
     url = parser._build_url(spec, {}, 3)
-    assert "/cars/land_rover/range_rover/all/" in url
+    assert "/moskva/cars/land_rover/range_rover/all/" in url
     query = parse_qs(urlparse(url).query)
     assert query["transmission"] == ["AUTOMATIC", "AMT"]
     assert query["page"] == ["3"]
@@ -285,6 +311,33 @@ def test_fetch_page_empty_results(parser):
     # На пустой выдаче сайт может показывать рекомендации — они не результат.
     html = "<html><h1>Ничего не найдено</h1>" + DOM_HTML + "</html>"
     patcher, _, _ = make_browser_mock(html)
+    with patcher:
+        assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
+
+
+def test_fetch_page_zero_ads_dumps_html_and_warns(parser, debug_dir, caplog):
+    """Парсинг дал 0 объявлений -> предупреждение и дамп HTML для анализа."""
+    html = "<html><body><script>window.__NEXT_DATA__ = {}</script>пусто</body></html>"
+    patcher, _, _ = make_browser_mock(html)
+    with patcher, caplog.at_level("INFO", logger="aprice.server.parsers.autoru"):
+        assert parser.fetch_page(SPEC, {}, 2, threading.Event()) == []
+    dumps = list(debug_dir.glob("autoru_page_2_*.html"))
+    assert len(dumps) == 1 and dumps[0].read_text(encoding="utf-8") == html
+    text = caplog.text
+    assert "0 объявлений" in text and "html_len=%d" not in text
+    assert f"html_len={len(html)}" in text and "финальный URL" in text
+
+
+def test_fetch_page_with_ads_writes_no_dump(parser, debug_dir):
+    patcher, _, _ = make_browser_mock(next_data_html(offer("1-a", 1, 2020)))
+    with patcher:
+        assert len(parser.fetch_page(SPEC, {}, 1, threading.Event())) == 1
+    assert not debug_dir.exists()
+
+
+def test_dump_failure_does_not_break_fetch(parser, debug_dir):
+    debug_dir.parent.joinpath("debug").write_text("файл вместо каталога")
+    patcher, _, _ = make_browser_mock("<html>пусто</html>")
     with patcher:
         assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
 
