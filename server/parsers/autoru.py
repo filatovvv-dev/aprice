@@ -10,29 +10,27 @@
 
 Исследование структуры auto.ru
 ------------------------------
-**НЕ ПРОВЕРЕНО В СЕТИ.** Из среды разработки auto.ru недоступен (внешний
-доступ ограничен allowlist-прокси; по задаче №1 «голый» HTTP к нему
-редиректит на ``showcaptcha``), поэтому разбор реализован по структуре из
-публичных примеров/документации и должен быть подтверждён ручным smoke-тестом
-на Windows (раздел 8 промпта 3.7). Все допущения собраны в константах модуля,
-чтобы правка после проверки была локальной.
+Структура подтверждена **ручным анализом реальной страницы** (смоук-тест 3.7:
+HTML загружается, ``__NEXT_DATA__`` в нём нет). В среде разработки auto.ru
+недоступен, поэтому код проверен только на моках и фрагментах HTML; финальная
+проверка — смоук на Windows.
 
 * **URL:** ``https://auto.ru/{регион}/cars/{марка}/{модель}/all/?year_from=..&year_to=..
   &transmission=..&fuel_type=..&page=N``. Значения ``transmission``
   (``AUTOMATIC``/``MECHANICAL``/``CVT``/``AMT``) и ``fuel_type``
-  (``PETROL``/``DIESEL``/``HYBRID``/``ELECTRO``) — по промпту 3.7; у самого
-  auto.ru, возможно, иные имена/значения (например ``engine_group``,
-  ``VARIATOR``, ``ROBOT``) — таблицы :data:`TRANSMISSION_PARAMS` и
-  :data:`FUEL_PARAMS`, имя параметра — :data:`FUEL_PARAM_NAME`.
-* **Данные (приоритет 1):** JSON ``<script id="__NEXT_DATA__">`` (Next.js);
-  объявлением считается любой словарь с ``id`` и ``price_info`` или
-  ``vehicle_info``; поля: ``price_info.RUR`` (цена), ``documents.year``,
-  ``state.mileage``, ``vehicle_info.mark_info/model_info.name``,
-  ``vehicle_info.tech_param.transmission/engine_type/displacement`` (см³).
-  Поиск рекурсивный, поэтому точный путь к списку не важен.
-* **Данные (приоритет 2, запасной):** DOM-блоки ``ListingItem`` — ссылка
-  ``ListingItemTitle__link``, ``ListingItem__price``, ``ListingItem__year``,
-  ``ListingItem__kmAge``, сводка ``ListingItemTechSummary``.
+  (``PETROL``/``DIESEL``/``HYBRID``/``ELECTRO``) — по промпту 3.7, **не
+  подтверждены** (см. :data:`TRANSMISSION_PARAMS`, :data:`FUEL_PARAMS`,
+  :data:`FUEL_PARAM_NAME`).
+* **Выдача:** карточки — прямые потомки ``div.ListingCars__items``
+  (:data:`CARDS_SELECTOR`); контейнер появляется после React-рендеринга,
+  поэтому после ``goto(wait_until="commit")`` ждём селектор до 10 с.
+* **Поля карточки** берутся из её видимого текста (``inner_text``) регулярными
+  выражениями — они устойчивее динамических CSS-классов: цена — число перед
+  ``₽``, пробег — перед ``км``, год — ``19xx``/``20xx``, объём — ``N.N л``,
+  коробка и топливо — по ключевым словам. Ссылка — ``href`` первого ``<a>``.
+  Марка и модель берутся из ``spec``. Весь текст карточки сохраняется в
+  ``raw_json["text"]`` для отладки.
+* ``__NEXT_DATA__`` и ``app-config`` не используются (объявлений в них нет).
 * Поле, которое не нашлось, равно ``None``; разбор не падает.
 
 CAPTCHA не обходится: ``showcaptcha`` в URL/HTML или ``smartcaptcha`` в HTML
@@ -41,15 +39,13 @@ CAPTCHA не обходится: ``showcaptcha`` в URL/HTML или ``smartcaptc
 
 from __future__ import annotations
 
-import html as html_lib
-import json
 import logging
 import random
 import re
 import time
 from pathlib import Path
 from threading import Event
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 from urllib.parse import quote, urlencode
 
 from common import constants
@@ -80,12 +76,12 @@ DEFAULT_REGION = "moskva"
 #: Каталог дампов HTML пустых страниц (в ``.gitignore``).
 DEBUG_DIR: Path = constants.DATA_DIR / "debug"
 GOTO_TIMEOUT_MS = 30_000  # FX-05: не увеличивать
-SELECTOR_TIMEOUT_MS = 5_000
+LISTINGS_TIMEOUT_MS = 10_000
 #: Причины :class:`BlockedError` (в ``detail``) — различают сценарии отказа.
 GOTO_TIMEOUT_REASON = "goto_timeout"
 NO_LISTINGS_REASON = "no_listings_selector"
-#: Признаки выдачи в DOM (FX-04).
-LISTING_SELECTOR = '[data-bem*="offer"], .___1h2y, div[class*="ListingItem"]'
+#: Карточки объявлений: прямые потомки контейнера выдачи.
+CARDS_SELECTOR = "div.ListingCars__items > div"
 
 #: Коробка передач (как в ``spec.transmissions``) -> значение параметра URL.
 TRANSMISSION_PARAMS = {
@@ -104,54 +100,15 @@ FUEL_PARAMS = {
 #: Имя параметра URL для типа топлива (не подтверждено, см. docstring модуля).
 FUEL_PARAM_NAME = "fuel_type"
 
-#: Значения из JSON/DOM -> единые русские названия ``Ad``.
-TRANSMISSION_LABELS = {
-    "AUTOMATIC": "АКПП", "MECHANICAL": "МКПП", "VARIATOR": "Вариатор",
-    "CVT": "Вариатор", "ROBOT": "Робот", "AMT": "Робот",
-}
-FUEL_LABELS = {
-    "GASOLINE": "Бензин", "PETROL": "Бензин", "DIESEL": "Дизель",
-    "HYBRID": "Гибрид", "ELECTRO": "Электро", "LPG": "Газ",
-}
-
 CAPTCHA_URL_MARKERS = ("showcaptcha", "smartcaptcha")
 CAPTCHA_HTML_MARKERS = ("smartcaptcha", "showcaptcha")
 EMPTY_MARKERS = ("Ничего не найдено", "Объявления не найдены")
 BLOCKED_STATUSES = (403, 429)
 
-_NEXT_DATA_RE = re.compile(
-    r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
-)
-
 
 def _slug(value: str) -> str:
     """Slug для пути URL: нижний регистр, пробелы -> ``_``, экранирование."""
     return quote(value.strip().lower().replace(" ", "_"), safe="_-")
-
-
-def _to_int(value: Any) -> Optional[int]:
-    """Целое из числа или строки вида ``"1 250 000 ₽"``; иначе ``None``."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        digits = re.sub(r"\D", "", value)
-        return int(digits) if digits else None
-    return None
-
-
-def _walk_offers(node: Any) -> Iterator[dict]:
-    """Рекурсивно отдаёт словари, похожие на объявление auto.ru."""
-    if isinstance(node, dict):
-        if "id" in node and ("price_info" in node or "vehicle_info" in node):
-            yield node
-        else:
-            for value in node.values():
-                yield from _walk_offers(value)
-    elif isinstance(node, list):
-        for item in node:
-            yield from _walk_offers(item)
 
 
 class AutoRuParser(BaseSiteParser):
@@ -195,7 +152,7 @@ class AutoRuParser(BaseSiteParser):
                 навигации) или в HTML (без обхода).
             BlockedError: HTTP 403/429 (``detail="HTTP <код>"``), таймаут
                 навигации вне CAPTCHA (``detail="goto_timeout"``) или нет
-                признаков выдачи за 5 с (``detail="no_listings_selector"``).
+                карточек выдачи за 10 с (``detail="no_listings_selector"``).
             ParserError: нет ответа на запрос.
         """
         self._check_simulation(options)
@@ -237,9 +194,9 @@ class AutoRuParser(BaseSiteParser):
                 self._raise_if_captcha_html(tab.content(), current_url or url)
                 raise BlockedError(self.site_name, f"HTTP {response.status}")
 
-            try:  # FX-04: выдача должна появиться за короткое время
+            try:  # карточки рисует React уже после commit — ждём контейнер выдачи
                 tab.wait_for_selector(
-                    LISTING_SELECTOR, timeout=SELECTOR_TIMEOUT_MS, state="attached"
+                    CARDS_SELECTOR, state="attached", timeout=LISTINGS_TIMEOUT_MS
                 )
             except PlaywrightTimeoutError:
                 html = tab.content()
@@ -251,13 +208,13 @@ class AutoRuParser(BaseSiteParser):
                 raise BlockedError(self.site_name, NO_LISTINGS_REASON)
             html = tab.content()
             logger.info("[auto.ru] финальный URL: %s, html_len=%d", current_url, len(html))
+            ads = self._parse_listings_from_page(tab, spec)  # пока вкладка открыта
 
         # FX-07: капча в HTML (в т.ч. во фрейме), пустая выдача, разбор.
         self._raise_if_captcha_html(html, current_url or url)
         if any(m in html for m in EMPTY_MARKERS):
             self._report_empty(html, current_url, page)
             return []
-        ads = self._parse_listings(html, spec)
         if not ads:
             self._report_empty(html, current_url, page)
         return ads
@@ -380,124 +337,88 @@ class AutoRuParser(BaseSiteParser):
     # ------------------------------------------------------------------
     # Разбор выдачи
     # ------------------------------------------------------------------
-    def _parse_listings(self, html: str, spec: dict) -> list[Ad]:
-        """Извлекает объявления: сначала ``__NEXT_DATA__``, затем DOM.
+    def _parse_listings_from_page(self, tab: Any, spec: dict) -> list[Ad]:
+        """Извлекает объявления из карточек ``div.ListingCars__items > div``.
+
+        Один вызов в браузер забирает у каждой карточки ``href`` первой ссылки
+        и видимый текст; дальше разбор идёт регулярными выражениями
+        (:meth:`_card_to_ad`). Карточки без ссылки и без цены, года и пробега
+        (баннеры, заглушки загрузки) пропускаются.
 
         Args:
-            html: HTML страницы выдачи.
-            spec: спецификация (марка/модель — запасные значения полей).
+            tab: открытая страница Playwright.
+            spec: спецификация (источник марки и модели).
 
         Returns:
-            list[Ad]: объявления без дублей по ``url``.
+            list[Ad]: объявления без дублей по ``url``; ``[]`` — карточек нет.
         """
-        ads = self._parse_next_data(html, spec)
-        if not ads:
-            ads = self._parse_dom(html, spec)
+        cards = tab.locator(CARDS_SELECTOR).evaluate_all(CARDS_SCRIPT) or []
         unique: dict[str, Ad] = {}
-        for ad in ads:
-            unique.setdefault(ad.url, ad)
+        for card in cards:
+            ad = self._card_to_ad(card.get("href"), card.get("text") or "", spec)
+            if ad is not None:
+                unique.setdefault(ad.url, ad)
         return list(unique.values())
 
-    def _parse_next_data(self, html: str, spec: dict) -> list[Ad]:
-        """Объявления из JSON ``__NEXT_DATA__`` (приоритет 1)."""
-        match = _NEXT_DATA_RE.search(html)
-        if not match:
-            return []
-        try:
-            data = json.loads(match.group(1))
-        except ValueError:
-            logger.warning("[auto.ru] __NEXT_DATA__ не разобран как JSON")
-            return []
-        ads = []
-        for offer in _walk_offers(data):
-            ad = self._offer_to_ad(offer, spec)
-            if ad is not None:
-                ads.append(ad)
-        return ads
+    def _card_to_ad(self, href: Optional[str], text: str, spec: dict) -> Optional[Ad]:
+        """Собирает :class:`Ad` из ссылки и текста карточки.
 
-    def _offer_to_ad(self, offer: dict, spec: dict) -> Optional[Ad]:
-        """Преобразует JSON-объявление в :class:`Ad` (``None`` — нет id)."""
-        offer_id = offer.get("id")
-        if not offer_id:
+        Args:
+            href: ``href`` первой ссылки карточки (``None`` — ссылки нет).
+            text: видимый текст карточки.
+            spec: спецификация (марка и модель).
+
+        Returns:
+            Optional[Ad]: объявление или ``None``, если карточка не похожа
+            на объявление.
+        """
+        if not href:
             return None
-        vehicle = offer.get("vehicle_info") or {}
-        mark = vehicle.get("mark_info") or {}
-        model = vehicle.get("model_info") or {}
-        tech = vehicle.get("tech_param") or {}
-        price_info = offer.get("price_info") or {}
-        displacement = _to_int(tech.get("displacement"))
-        url = offer.get("url") or (
-            f"{BASE_URL}/cars/used/sale/"
-            f"{str(mark.get('code') or spec.get('manufacturer', '')).lower()}/"
-            f"{str(model.get('code') or spec.get('model', '')).lower()}/{offer_id}/"
-        )
-        transmission = str(tech.get("transmission") or "").upper()
-        fuel = str(tech.get("engine_type") or "").upper()
+        url = BASE_URL + href if href.startswith("/") else href
+        price = self._extract_price(text)
+        year = self._extract_year(text)
+        mileage = self._extract_mileage(text)
+        if price is None and year is None and mileage is None:
+            return None
         return Ad(
             url=url,
-            price=_to_int(price_info.get("RUR") or price_info.get("price")),
-            year=_to_int((offer.get("documents") or {}).get("year")),
-            manufacturer=mark.get("name") or spec.get("manufacturer"),
-            model=model.get("name") or spec.get("model"),
-            transmission=TRANSMISSION_LABELS.get(transmission) or tech.get("transmission"),
-            fuel=FUEL_LABELS.get(fuel) or tech.get("engine_type"),
-            engine_volume=(
-                round(displacement / 1000, 1) if displacement is not None else None
-            ),
-            mileage=_to_int((offer.get("state") or {}).get("mileage")),
-            raw_json={
-                "source": "auto.ru",
-                "id": offer_id,
-                "price_info": price_info,
-                "documents": offer.get("documents"),
-                "mileage": (offer.get("state") or {}).get("mileage"),
-                "tech_param": tech,
-            },
+            price=price,
+            year=year,
+            manufacturer=spec.get("manufacturer"),
+            model=spec.get("model"),
+            transmission=self._find_label(text, TRANSMISSION_DOM_LABELS),
+            fuel=self._find_label(text, FUEL_DOM_LABELS),
+            engine_volume=self._extract_volume(text),
+            mileage=mileage,
+            raw_json={"source": "auto.ru", "text": text},
         )
 
-    def _parse_dom(self, html: str, spec: dict) -> list[Ad]:
-        """Объявления из DOM-блоков ``ListingItem`` (запасной вариант)."""
-        blocks = re.split(r'(?=<div[^>]*class="ListingItem[\s"])', html)[1:]
-        ads: list[Ad] = []
-        for block in blocks:
-            link = re.search(
-                r'<a[^>]*class="[^"]*ListingItemTitle__link[^"]*"[^>]*href="([^"]+)"', block
-            ) or re.search(
-                r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*ListingItemTitle__link', block
-            )
-            if not link:
-                continue
-            url = html_lib.unescape(link.group(1))
-            if url.startswith("/"):
-                url = BASE_URL + url
-            text = self._text(block)
-            ads.append(Ad(
-                url=url,
-                price=self._dom_int(block, "ListingItem__price"),
-                year=self._dom_int(block, "ListingItem__year"),
-                manufacturer=spec.get("manufacturer"),
-                model=spec.get("model"),
-                transmission=self._dom_label(text, TRANSMISSION_DOM_LABELS),
-                fuel=self._dom_label(text, FUEL_DOM_LABELS),
-                engine_volume=self._dom_volume(text),
-                mileage=self._dom_int(block, "ListingItem__kmAge"),
-                raw_json={"source": "auto.ru", "via": "dom"},
-            ))
-        return ads
+    @staticmethod
+    def _extract_price(text: str) -> Optional[int]:
+        """Цена: число перед ``₽`` (``"7 700 000 ₽"`` -> ``7700000``)."""
+        match = _PRICE_RE.search(text)
+        return int(re.sub(r"\D", "", match.group(1))) if match else None
 
     @staticmethod
-    def _text(fragment: str) -> str:
-        """Текст фрагмента без тегов."""
-        return html_lib.unescape(re.sub(r"<[^>]+>", " ", fragment))
+    def _extract_mileage(text: str) -> Optional[int]:
+        """Пробег: число перед ``км`` (``"81 000 км"`` -> ``81000``)."""
+        match = _MILEAGE_RE.search(text)
+        return int(re.sub(r"\D", "", match.group(1))) if match else None
 
     @staticmethod
-    def _dom_int(block: str, css_class: str) -> Optional[int]:
-        """Целое из элемента с классом ``css_class`` (цена, год, пробег)."""
-        match = re.search(rf'class="[^"]*{css_class}[^"]*"[^>]*>(.*?)</', block, re.DOTALL)
-        return _to_int(re.sub(r"<[^>]+>", "", match.group(1))) if match else None
+    def _extract_year(text: str) -> Optional[int]:
+        """Год выпуска: первое отдельно стоящее ``19xx``/``20xx``."""
+        match = _YEAR_RE.search(text)
+        return int(match.group(1)) if match else None
 
     @staticmethod
-    def _dom_label(text: str, labels: dict[str, str]) -> Optional[str]:
+    def _extract_volume(text: str) -> Optional[float]:
+        """Объём двигателя из текста вида ``3.0 л``."""
+        match = _VOLUME_RE.search(text)
+        return float(match.group(1).replace(",", ".")) if match else None
+
+    @staticmethod
+    def _find_label(text: str, labels: dict[str, str]) -> Optional[str]:
         """Первое найденное в тексте слово из словаря ``признак -> название``."""
         lowered = text.lower()
         for needle, label in labels.items():
@@ -505,15 +426,27 @@ class AutoRuParser(BaseSiteParser):
                 return label
         return None
 
-    @staticmethod
-    def _dom_volume(text: str) -> Optional[float]:
-        """Объём двигателя из текста вида ``2.0 л``."""
-        match = re.search(r"(\d[.,]\d)\s*л\b", text)
-        return float(match.group(1).replace(",", ".")) if match else None
 
+#: Число с пробелами-разделителями тысяч (группы строго по 3 цифры, без перевода
+#: строки, начало — не посреди числа), чтобы год или другое число на соседней
+#: строке не «слипались» с суммой или пробегом.
+_NUMBER = r"(?<!\d)(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)"
+_PRICE_RE = re.compile(_NUMBER + r"\s*₽")
+_MILEAGE_RE = re.compile(_NUMBER + r"\s*км", re.IGNORECASE)
+_YEAR_RE = re.compile(r"\b(19[5-9]\d|20[0-3]\d)\b")
+_VOLUME_RE = re.compile(r"(\d[.,]\d)\s*л(?![а-яё])", re.IGNORECASE)
+
+#: JS для ``Locator.evaluate_all``: ``href`` первой ссылки и текст каждой карточки.
+CARDS_SCRIPT = (
+    "els => els.map(e => ({"
+    "href: (e.querySelector('a') || {}).href || null, "
+    "text: e.innerText || ''}))"
+)
 
 TRANSMISSION_DOM_LABELS = {
-    "автомат": "АКПП", "механика": "МКПП", "вариатор": "Вариатор", "робот": "Робот",
+    "акпп": "АКПП", "автомат": "АКПП",
+    "мкпп": "МКПП", "механик": "МКПП", "механич": "МКПП",
+    "вариатор": "Вариатор", "робот": "Робот",
 }
 FUEL_DOM_LABELS = {
     "бензин": "Бензин", "дизель": "Дизель", "гибрид": "Гибрид", "электро": "Электро",
