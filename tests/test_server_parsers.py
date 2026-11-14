@@ -23,7 +23,7 @@ from server.parsers.base import (
     UnsupportedSiteError,
 )
 
-SUPPORTED_SITES = ["auto.ru", "drom.ru", "avito.ru", "bibika.ru"]
+SUPPORTED_SITES = ["auto.ru", "drom.ru", "avito.ru"]
 
 
 # ----------------------------------------------------------------------
@@ -80,6 +80,14 @@ class TestFactory:
         """sberauto.com -> UnsupportedSiteError (S-15), файла-парсера нет."""
         with pytest.raises(UnsupportedSiteError):
             get_parser("sberauto.com", config)
+
+    def test_factory_bibika_disabled(self, config: Config) -> None:
+        """bibika.ru отключена решением Заказчика -> UnsupportedSiteError, парсера нет."""
+        from server.parsers import PARSER_REGISTRY, UNSUPPORTED_SITES
+
+        assert "bibika.ru" in UNSUPPORTED_SITES and "bibika.ru" not in PARSER_REGISTRY
+        with pytest.raises(UnsupportedSiteError):
+            get_parser("bibika.ru", config)
 
     def test_factory_unknown_site(self, config: Config) -> None:
         """Неизвестная площадка -> UnsupportedSiteError."""
@@ -175,7 +183,7 @@ class TestStopEvent:
 
     def test_stop_during_pause(self, config: Config, spec: dict) -> None:
         """stop_event во время паузы -> быстрый выход (< 2 с) с частичным результатом."""
-        parser = get_parser("bibika.ru", config)
+        parser = get_parser("drom.ru", config)
         stop = threading.Event()
         result: list[Ad] = []
 
@@ -328,12 +336,12 @@ class TestFastMode:
 
     def test_normal_mode_delays(self, config: Config, spec: dict) -> None:
         """Без fast_mode паузы ~1–3 с: две страницы дольше 1 с суммарно."""
-        parser = get_parser("bibika.ru", config)
+        parser = get_parser("drom.ru", config)
         stop = threading.Event()
         start = time.monotonic()
         ads = parser.collect(
             spec,
-            {"max_pages_per_site": 3, "max_ads_per_site": 500},
+            {"max_pages_per_site": 3, "max_ads_per_site": 500, "use_stub_data": True},
             stop,
         )
         elapsed = time.monotonic() - start

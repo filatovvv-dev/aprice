@@ -36,7 +36,8 @@ SPEC = {
     "year_to": 2021,
 }
 THREE = ["auto.ru", "drom.ru", "avito.ru"]
-FOUR = ["auto.ru", "drom.ru", "avito.ru", "bibika.ru"]
+FOUR = THREE + ["stub4.test"]  # четвёртая — тестовая заглушка (fourth_stub_site)
+pytestmark = pytest.mark.usefixtures("fourth_stub_site")
 
 
 # ----------------------------------------------------------------------

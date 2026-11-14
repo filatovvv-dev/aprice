@@ -753,3 +753,45 @@ def test_without_wait_delayed_page_gives_one_card_in_real_browser(chromium_page,
     chromium_page.set_content(DELAYED_HTML)
     assert len(parser._parse_listings_from_page(chromium_page, SPEC)) == 1
     chromium_page.wait_for_timeout(1_000)  # не оставляем таймер для следующих тестов
+
+
+# ----------------------------------------------------------------------
+# 3.11: пост-фильтр по годам (страховка, если фильтр URL не сработал)
+# ----------------------------------------------------------------------
+def _year_card(year, n: int = 1) -> dict:
+    text = f"BMW X5, {year}\n4 190 000 ₽\n160 661 км" if year else "BMW X5\n4 190 000 ₽"
+    return {"source": "card", "href": f"https://moscow.drom.ru/bmw/x5/{1000000 + n}.html",
+            "text": text}
+
+
+def test_year_outside_range_is_dropped(parser):
+    tab = locator_results(**{CONTAINERS: [_year_card(2026, 1), _year_card(2019, 2),
+                                          _year_card(2017, 3)]})
+    assert [a.year for a in parser._parse_listings_from_page(tab, SPEC)] == [2019]  # 2018–2021
+
+
+def test_card_without_year_passes_year_filter(parser):
+    tab = locator_results(**{CONTAINERS: [_year_card(None)]})
+    ads = parser._parse_listings_from_page(tab, SPEC)
+    assert len(ads) == 1 and ads[0].year is None
+
+
+@pytest.mark.parametrize("year, kept", [(2017, False), (2018, True), (2021, True), (2022, False)])
+def test_year_filter_boundaries_are_inclusive(parser, year, kept):
+    tab = locator_results(**{CONTAINERS: [_year_card(year)]})
+    assert bool(parser._parse_listings_from_page(tab, SPEC)) is kept
+
+
+def test_year_filter_without_bounds_keeps_everything(parser):
+    tab = locator_results(**{CONTAINERS: [_year_card(2026)]})
+    spec = {k: v for k, v in SPEC.items() if not k.startswith("year_")}
+    assert len(parser._parse_listings_from_page(tab, spec)) == 1
+
+
+def test_all_cards_out_of_range_warns_and_dumps_html(parser, debug_dir, caplog):
+    cards = [_year_card(2026, i) for i in range(6)]
+    patcher, _, _ = make_browser_mock(LISTING_HTML, cards=cards)
+    with patcher, caplog.at_level("WARNING", logger="aprice.server.parsers"):
+        assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
+    assert "игнорирует фильтр по годам" in caplog.text
+    assert list(debug_dir.glob("drom_page_1_*.html"))  # 0 объявлений -> дамп
