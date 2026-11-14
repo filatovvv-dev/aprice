@@ -411,7 +411,7 @@ def test_parser_reads_browser_settings_from_config(tmp_path):
 def test_test_fast_mode_and_simulation_do_not_touch_browser(parser):
     patcher, cls, _ = make_browser_mock()
     with patcher:
-        ads = parser.fetch_page(SPEC, {"test_fast_mode": True}, 1, threading.Event())
+        ads = parser.fetch_page(SPEC, {"test_fast_mode": True, "use_stub_data": True}, 1, threading.Event())
         assert ads and ads[0].raw_json["source"] == "stub"
         with pytest.raises(CaptchaDetectedError):
             parser.fetch_page(SPEC, {"simulate_captcha": "auto.ru"}, 1, threading.Event())

@@ -57,7 +57,7 @@ def _fast_options(**extra) -> dict:
         "sites": SUPPORTED_SITES,
         "max_ads_per_site": 500,
         "max_pages_per_site": 10,
-        "test_fast_mode": True,
+        "test_fast_mode": True, "use_stub_data": True,
     }
     options.update(extra)
     return options

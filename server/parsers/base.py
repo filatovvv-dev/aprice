@@ -158,7 +158,8 @@ class BaseSiteParser(ABC):
     #: Диапазон паузы между страницами в обычном режиме, сек.
     PAGE_DELAY_SEC: ClassVar[tuple[float, float]] = (1.0, 3.0)
 
-    #: Диапазон паузы между страницами в test_fast_mode, сек.
+    #: Диапазон паузы между страницами в ``test_fast_mode``, сек. Флаг **только**
+    #: сокращает паузы; заглушку включает отдельный ``use_stub_data`` (3.9).
     FAST_PAGE_DELAY_SEC: ClassVar[tuple[float, float]] = (0.1, 0.3)
 
     #: Интервал проверки stop_event во время паузы, сек (S-12);
@@ -191,7 +192,8 @@ class BaseSiteParser(ABC):
         Args:
             spec: спецификация задания (mode, manufacturer, model, годы...).
             options: опции задания (max_pages_per_site, max_ads_per_site,
-                test_fast_mode, simulate_captcha, simulate_block...).
+                test_fast_mode (только короткие паузы), use_stub_data (только
+                заглушка вместо сети), simulate_captcha, simulate_block...).
             stop_event: событие остановки — проверять каждые 0.5 с (S-12).
             progress_cb: вызывается после каждой страницы: ``(page, ads)``.
             on_page: вызывается после каждой страницы со списком объявлений
@@ -218,7 +220,8 @@ class BaseSiteParser(ABC):
         Round-robin планировщик сам выдерживает паузы между запросами к
         площадке, поэтому метод не спит и не обходит остальные страницы —
         в отличие от :meth:`collect`. Реализация по умолчанию — заглушка
-        (3.3/3.4b); реальные парсеры (3.7–3.10) **обязаны переопределить**.
+        (3.3/3.4b); реальные парсеры (3.7–3.10) **обязаны переопределить** и
+        возвращать заглушку через ``super()`` только при ``use_stub_data``.
 
         Args:
             spec: спецификация задания.
@@ -242,6 +245,15 @@ class BaseSiteParser(ABC):
         return [self._random_ad(spec, i) for i in range(per_page)]
 
     # ------------------------ хелперы потомков ------------------------
+    @staticmethod
+    def _use_stub(options: dict) -> bool:
+        """``True``, если задание просит заглушку (``use_stub_data``), а не сеть.
+
+        ``test_fast_mode`` на выбор заглушки **не влияет**: он лишь сокращает
+        паузы (в смоуках 3.8 оба эффекта в одном флаге вводили в заблуждение).
+        """
+        return bool(options.get("use_stub_data"))
+
     def _page_delays(self, options: dict) -> tuple[float, float]:
         """Возвращает диапазон паузы между страницами.
 

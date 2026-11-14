@@ -98,7 +98,7 @@ def fast(sites=None, pages=3, delay=(0.05, 0.05), **extra) -> dict:
     opts = {
         "sites": list(sites or THREE),
         "max_pages_per_site": pages,
-        "test_fast_mode": True,
+        "test_fast_mode": True, "use_stub_data": True,
         "test_delay": list(delay),
     }
     opts.update(extra)

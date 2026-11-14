@@ -6,8 +6,9 @@
 регулярными выражениями. Планировщик вызывает :meth:`DromParser.fetch_page` —
 одну страницу за вызов.
 
-В ``test_fast_mode`` (и при ``simulate_captcha`` / ``simulate_block``) парсер
-ведёт себя как заглушка 3.3: автотесты не ходят в сеть.
+При ``use_stub_data`` (и ``simulate_captcha`` / ``simulate_block``) парсер ведёт
+себя как заглушка 3.3: автотесты не ходят в сеть. ``test_fast_mode`` только
+сокращает паузы.
 
 Исследование структуры drom.ru
 ------------------------------
@@ -219,7 +220,7 @@ class DromParser(BaseSiteParser):
             ParserError: нет ответа на запрос.
         """
         self._check_simulation(options)
-        if options.get("test_fast_mode"):
+        if self._use_stub(options):
             return super().fetch_page(spec, options, page, stop_event)
         if stop_event.is_set():
             return []
@@ -306,10 +307,10 @@ class DromParser(BaseSiteParser):
         """Собирает все страницы подряд (обратная совместимость с 3.3).
 
         Планировщик использует :meth:`fetch_page`; этот метод нужен
-        автономным вызовам. В ``test_fast_mode`` работает как заглушка.
+        автономным вызовам. При ``use_stub_data`` работает как заглушка.
         """
         self._check_simulation(options)
-        if options.get("test_fast_mode"):
+        if self._use_stub(options):
             return self._collect_stub(spec, options, stop_event, progress_cb, on_page)
 
         max_pages = int(options.get("max_pages_per_site") or 10)

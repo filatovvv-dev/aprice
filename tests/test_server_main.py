@@ -40,7 +40,7 @@ SPEC = {
 FAST = {
     "sites": ["auto.ru"],
     "max_pages_per_site": 3,
-    "test_fast_mode": True,
+    "test_fast_mode": True, "use_stub_data": True,
     "test_delay": [0.05, 0.05],
 }
 
