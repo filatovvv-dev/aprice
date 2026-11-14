@@ -359,6 +359,35 @@ def test_four_ads_is_incomplete(parser, debug_dir):
     assert (debug_dir / "drom_page_1_incomplete.html").exists()
 
 
+def cheap_cards(n: int, price: int) -> list[dict]:
+    return [dict(c, text=f"BMW X5, 2019\n{price:,} ₽".replace(",", " "))
+            for c in twenty_cards(n)]
+
+
+def test_suspiciously_cheap_page_saves_html(parser, debug_dir, caplog):
+    """>5 объявлений и средняя цена < 1 млн — подозрительно для BMW X5: дамп HTML."""
+    patcher, _, _ = make_browser_mock(LISTING_HTML, cards=cheap_cards(6, 900_000))
+    with patcher, caplog.at_level("WARNING", logger="aprice.server.parsers.drom"):
+        assert len(parser.fetch_page(SPEC, {}, 3, threading.Event())) == 6
+    assert (debug_dir / "drom_page_3_suspicious.html").read_text(encoding="utf-8") == LISTING_HTML
+    assert "подозрительно" in caplog.text
+
+
+def test_normal_price_page_is_not_suspicious(parser, debug_dir):
+    patcher, _, _ = make_browser_mock(cards=cheap_cards(6, 8_500_000))
+    with patcher:
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert not debug_dir.exists()
+
+
+def test_five_cheap_ads_are_not_suspicious(parser, debug_dir):
+    """Порог «больше 5»: на 5 объявлениях проверка цены не срабатывает."""
+    patcher, _, _ = make_browser_mock(cards=cheap_cards(5, 900_000))
+    with patcher:
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert not debug_dir.exists()
+
+
 def test_exactly_five_ads_is_not_incomplete(parser, debug_dir):
     patcher, _, _ = make_browser_mock(cards=twenty_cards(5))
     with patcher:
@@ -376,7 +405,7 @@ def test_parse_listings_dom_two_cards(parser):
     assert [a.price for a in ads] == [4_190_000, 3_850_000]  # дубли двух источников склеены
     assert [c.args[0] for c in tab.locator.call_args_list] == [
         '[data-ftid="bulls-list_bull"]',
-        '[data-ftid="bull_title"], a[href*=".html"]',
+        '[data-ftid="bull_title"]',
     ]
 
 
@@ -390,7 +419,7 @@ def locator_results(**by_selector):
 
 
 CONTAINERS = '[data-ftid="bulls-list_bull"]'
-LINKS = '[data-ftid="bull_title"], a[href*=".html"]'
+LINKS = '[data-ftid="bull_title"]'
 
 
 def test_parse_all_twenty_cards(parser):
@@ -403,28 +432,66 @@ def test_parse_all_twenty_cards(parser):
 def test_parse_one_marked_link_does_not_hide_other_cards(parser):
     """Регрессия «1 из 20»: ``bull_title`` у одной карточки, остальные 19 — в контейнерах."""
     cards = twenty_cards()
-    marked = dict(cards[0], source="link", marked=True)
+    marked = dict(cards[0], source="link")
     tab = locator_results(**{CONTAINERS: cards, LINKS: [marked]})
     assert len(parser._parse_listings_from_page(tab, SPEC)) == 20
 
 
 def test_parse_links_only_without_containers(parser):
-    links = [dict(c, source="link", marked=False) for c in twenty_cards()]
+    links = [dict(c, source="link") for c in twenty_cards()]
     tab = locator_results(**{LINKS: links})
     assert len(parser._parse_listings_from_page(tab, SPEC)) == 20
 
 
-def test_parse_link_filter_drops_navigation_html_links(parser):
+@pytest.mark.parametrize("href", [
+    "https://drom.ru/cars/0-4839034",                 # формат заглушки / каталог
+    "https://www.drom.ru/about.html",                 # навигация без номера
+    "https://auto.drom.ru/bmw/x5/",                   # выдача, не объявление
+    "https://evil.example/bmw/x5/1234567.html",       # чужой хост
+    "https://drom.ru.evil.example/bmw/x5/1234567.html",  # подмена хоста
+    "https://notdrom.ru/bmw/x5/1234567.html",         # похожее имя
+    "javascript:void(0)",
+])
+def test_non_listing_urls_are_dropped(parser, href):
+    card = {"source": "card", "href": href, "text": "BMW X5, 2019\n4 000 000 ₽"}
+    tab = locator_results(**{CONTAINERS: [card]})
+    assert parser._parse_listings_from_page(tab, SPEC) == []
+
+
+@pytest.mark.parametrize("href", [
+    "https://auto.drom.ru/region77/bmw/x5/476945704.html",
+    "https://moscow.drom.ru/bmw/x5/476945704.html",
+    "https://www.drom.ru/bmw/x5/476945704.html?from=list",
+    "/bmw/x5/476945704.html",                         # относительный
+])
+def test_listing_urls_are_accepted(parser, href):
+    card = {"source": "card", "href": href, "text": "BMW X5, 2019\n8 500 000 ₽"}
+    ads = parser._parse_listings_from_page(locator_results(**{CONTAINERS: [card]}), SPEC)
+    assert len(ads) == 1 and ads[0].url.startswith("https://")
+
+
+def test_urls_filter_applies_to_title_links_too(parser):
     links = [
-        {"source": "link", "marked": False, "href": "https://www.drom.ru/about.html",
-         "text": "О проекте 2019"},                       # навигация
-        {"source": "link", "marked": False, "href": "https://moscow.drom.ru/bmw/x5/1234567.html",
-         "text": "BMW X5\n4 000 000 ₽"},                  # объявление без маркера
-        {"source": "link", "marked": True, "href": "https://x.drom.ru/promo",
-         "text": "BMW X5\n5 000 000 ₽"},                  # маркер заголовка
+        {"source": "link", "href": "https://drom.ru/cars/0-1", "text": "BMW\n1 000 000 ₽"},
+        {"source": "link", "href": "https://x.drom.ru/bmw/5555555.html", "text": "BMW\n9 000 000 ₽"},
     ]
     ads = parser._parse_listings_from_page(locator_results(**{LINKS: links}), SPEC)
-    assert [a.price for a in ads] == [4_000_000, 5_000_000]
+    assert [a.price for a in ads] == [9_000_000]
+
+
+def test_generic_html_link_selector_is_not_used():
+    assert ".html" not in drom_module.LINKS_SELECTOR
+    assert ".html" not in drom_module.LISTINGS_SELECTOR
+
+
+def test_every_ad_has_nonempty_text_and_listing_url(parser):
+    tab = locator_results(**{CONTAINERS: twenty_cards() + [
+        {"source": "card", "href": "https://x.drom.ru/7777777.html", "text": ""},
+    ]})
+    ads = parser._parse_listings_from_page(tab, SPEC)
+    assert len(ads) == 20
+    assert all(a.raw_json["text"].strip() for a in ads)
+    assert all(drom_module.DromParser._is_listing_url(a.url) for a in ads)
 
 
 def test_card_with_url_and_price_is_kept_without_year_and_mileage(parser):
@@ -448,7 +515,7 @@ def test_container_wins_over_link_for_same_url(parser):
     url = "https://x.drom.ru/3000000.html"
     tab = locator_results(**{
         CONTAINERS: [{"source": "card", "href": url, "text": "BMW X5, 2019\n5 000 000 ₽"}],
-        LINKS: [{"source": "link", "marked": True, "href": url, "text": "BMW X5, 2019"}],
+        LINKS: [{"source": "link", "href": url, "text": "BMW X5, 2019"}],
     })
     ads = parser._parse_listings_from_page(tab, SPEC)
     assert len(ads) == 1 and ads[0].price == 5_000_000
@@ -585,7 +652,9 @@ def test_scripts_return_every_element_in_real_browser(chromium_page):
     )
     assert len(cards) == 20
     assert all(c["href"] and "₽" in c["text"] for c in cards)
-    assert len(links) >= 21  # заголовок + 19 ссылок + 1 вне контейнера (+ навигация)
+    # только заголовки с маркером: первая карточка и заголовок вне контейнера;
+    # обычные ссылки ``N.html`` и навигация не выбираются
+    assert [l["href"].rsplit("/", 1)[-1] for l in links] == ["1000000.html", "2000000.html"]
     cards_text = {c["href"]: c["text"] for c in cards}
     assert len(cards_text) == 20
 
