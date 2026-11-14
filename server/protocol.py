@@ -42,6 +42,11 @@ DEFAULT_MAX_ADS_PER_SITE: int = 500
 DEFAULT_MAX_PAGES_PER_SITE: int = 10
 
 
+#: Верхняя граница ``spec.region_id``: коды регионов РФ бывают трёхзначными
+#: (102, 116, 154, 177, 799...), поэтому «99» из промпта 3.8-fix3 слишком мало.
+MAX_REGION_ID = 999
+
+
 # ---------------------------------------------------------------------------
 # Исключение
 # ---------------------------------------------------------------------------
@@ -54,7 +59,8 @@ class InvalidMessageError(ValueError):
     * ``unknown_type`` — неизвестный/отсутствующий ``type`` (PR-02);
     * ``missing_field`` — отсутствует обязательное поле (PR-03);
     * ``invalid_field`` — неверный тип или значение поля (PR-04);
-    * конкретные коды валидации spec/options, напр. ``invalid_year_range``.
+    * конкретные коды валидации spec/options, напр. ``invalid_year_range``,
+      ``invalid_region_id``, ``invalid_region_slug``.
     """
 
 
@@ -344,6 +350,25 @@ def validate_spec(spec: Any) -> None:
         raise InvalidMessageError(
             "invalid_field: spec.region должен быть slug региона "
             "(латиница, цифры, «_», «-»), например 'moskva'"
+        )
+
+    region_id = spec.get("region_id")
+    if region_id is not None and (
+        isinstance(region_id, bool)
+        or not isinstance(region_id, int)
+        or not 1 <= region_id <= MAX_REGION_ID
+    ):
+        raise InvalidMessageError(
+            f"invalid_region_id: spec.region_id должен быть целым числом "
+            f"от 1 до {MAX_REGION_ID} (код региона, например 77)"
+        )
+    region_slug = spec.get("region_slug")
+    if region_slug is not None and (
+        not isinstance(region_slug, str) or not re.fullmatch(r"[a-z0-9_-]+", region_slug)
+    ):
+        raise InvalidMessageError(
+            "invalid_region_slug: spec.region_slug должен быть slug региона "
+            "(латиница, цифры, «_», «-»)"
         )
 
     vol_from = spec.get("engine_volume_from")

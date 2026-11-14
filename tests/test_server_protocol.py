@@ -122,6 +122,18 @@ def test_spec_region_optional_and_validated() -> None:
             validate_spec(dict(VALID_SPEC_RANGE, region=bad))
 
 
+def test_spec_region_id_and_slug_validated() -> None:
+    """3.8-fix3: region_id — код региона drom.ru (целое), region_slug — slug."""
+    validate_spec(dict(VALID_SPEC_RANGE, region_id=77))
+    validate_spec(dict(VALID_SPEC_RANGE, region_id=116, region_slug="kazan"))
+    for bad in ("77", 77.0, True, 0, -1, 1000, [77]):
+        with pytest.raises(InvalidMessageError, match="invalid_region_id"):
+            validate_spec(dict(VALID_SPEC_RANGE, region_id=bad))
+    for bad in ("Москва", "", "mos kva", 5):
+        with pytest.raises(InvalidMessageError, match="invalid_region_slug"):
+            validate_spec(dict(VALID_SPEC_RANGE, region_slug=bad))
+
+
 # ---------------------------------------------------------------------------
 # 3. Неверный mode
 # ---------------------------------------------------------------------------

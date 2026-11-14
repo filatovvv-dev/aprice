@@ -14,13 +14,14 @@
 **НЕ ПРОВЕРЕНО В СЕТИ, реализовано по гипотезе** (из среды разработки drom.ru
 недоступен); подтвердит или опровергнет смоук-тест на Windows.
 
-* **URL:** ``https://auto.drom.ru/{регион}/{марка}/{модель}/?min_year=..&max_year=..&page=N``
-  (:data:`URL_TEMPLATE`, :data:`QUERY_PARAMS`). Регион — ``spec.region``, по
-  умолчанию ``all`` (вся Россия). Путь ``/catalog/`` из первой версии вёл в
-  каталог моделей — смоук 3.8 вернул ``no_listings_selector``. Имена параметров
-  года и формат пагинации **не проверены**: если фильтр по году не
-  применяется или страницы не листаются, менять :data:`QUERY_PARAMS`. Параметры
-  коробки, топлива и объёма **не передаются** (фильтрация — на стороне Client).
+* **URL (проверено вручную Заказчиком):** ``https://auto.drom.ru/{марка}/{модель}/``
+  — вся Россия; ``https://auto.drom.ru/region77/{марка}/{модель}/?minyear=..&maxyear=..``
+  — регион по коду (77 — Москва, 78 — Санкт-Петербург); ``/all/`` и ``/moskva/``
+  дают 404. Регион задают ``spec.region_id`` (код) или ``spec.region_slug``;
+  не заданы — вся Россия. ``page=N`` добавляется со 2-й страницы; формат
+  пагинации **не проверен** (:data:`QUERY_PARAMS`). Путь ``/catalog/`` из первой
+  версии вёл в каталог моделей. Параметры коробки, топлива и объёма **не
+  передаются** (фильтрация — на стороне Client).
 * **Выдача:** маркеры ``data-ftid`` (стабильнее CSS-классов): карточка —
   ``[data-ftid="bulls-list_bull"]``, заголовок/ссылка —
   ``[data-ftid="bull_title"]`` (:data:`LISTINGS_SELECTOR`; ``a`` не требуется:
@@ -76,11 +77,12 @@ BASE_URL = "https://www.drom.ru"
 #: Выдача объявлений живёт на поддомене ``auto.drom.ru`` (``/catalog/`` — каталог моделей).
 AUTO_URL = "https://auto.drom.ru"
 #: Путь выдачи (не подтверждён, см. docstring модуля).
-URL_TEMPLATE = AUTO_URL + "/{region}/{brand}/{model}/"
-#: Регион по умолчанию: ``all`` — вся Россия.
-DEFAULT_REGION = "all"
-#: Имена параметров года и страницы в query (по промпту 3.8-fix, не проверены).
-QUERY_PARAMS = {"year_from": "min_year", "year_to": "max_year", "page": "page"}
+URL_TEMPLATE = AUTO_URL + "/{region}{brand}/{model}/"
+#: Сегмент пути для кода региона drom.ru: ``region77`` — Москва.
+REGION_ID_SEGMENT = "region{region_id}/"
+#: Имена параметров года и страницы в query (``minyear``/``maxyear`` подтверждены
+#: ручной проверкой; ``page`` — нет).
+QUERY_PARAMS = {"year_from": "minyear", "year_to": "maxyear", "page": "page"}
 
 GOTO_TIMEOUT_MS = 30_000
 LISTINGS_TIMEOUT_MS = 10_000
@@ -231,6 +233,8 @@ class DromParser(BaseSiteParser):
                 if any(m in html.lower() for m in EMPTY_MARKERS):
                     self._report_empty(html, current_url, page)
                     return []
+                # Дамп ДО исключения: по HTML подбираются селекторы.
+                self._report_empty(html, current_url, page)
                 raise BlockedError(self.site_name, NO_LISTINGS_REASON)
             if stop_event.is_set():
                 return []
@@ -294,16 +298,16 @@ class DromParser(BaseSiteParser):
         """Строит URL выдачи (без фильтров коробки/топлива/объёма).
 
         Args:
-            spec: спецификация (``region`` — slug региона, по умолчанию
-                ``all``; ``manufacturer``, ``model``, ``year_from``,
-                ``year_to``; необязательные ``manufacturer_slug`` /
-                ``model_slug`` переопределяют slug).
-            page: номер страницы, с 1.
+            spec: спецификация (``region_id`` — код региона drom.ru, либо
+                ``region_slug``; без них — вся Россия; ``manufacturer``,
+                ``model``, ``year_from``, ``year_to``; необязательные
+                ``manufacturer_slug`` / ``model_slug`` переопределяют slug).
+            page: номер страницы, с 1 (при 1 параметр ``page`` не добавляется).
 
         Returns:
             str: готовый URL.
         """
-        region = _slug(str(spec.get("region") or DEFAULT_REGION))
+        region = self._region_segment(spec)
         brand = spec.get("manufacturer_slug") or _slug(str(spec.get("manufacturer", "")))
         model = spec.get("model_slug") or _slug(str(spec.get("model", "")))
         params: list[tuple[str, Any]] = []
@@ -311,8 +315,29 @@ class DromParser(BaseSiteParser):
             params.append((QUERY_PARAMS["year_from"], spec["year_from"]))
         if spec.get("year_to"):
             params.append((QUERY_PARAMS["year_to"], spec["year_to"]))
-        params.append((QUERY_PARAMS["page"], page))
-        return URL_TEMPLATE.format(region=region, brand=brand, model=model) + "?" + urlencode(params)
+        if page > 1:  # первая страница — без параметра, как в обычной ссылке
+            params.append((QUERY_PARAMS["page"], page))
+        url = URL_TEMPLATE.format(region=region, brand=brand, model=model)
+        return url + "?" + urlencode(params) if params else url
+
+    @staticmethod
+    def _region_segment(spec: dict) -> str:
+        """Сегмент пути региона: ``region{ID}/``, ``{slug}/`` или ``""`` (вся Россия).
+
+        ``region_id`` приоритетнее ``region_slug``. Общее для площадок поле
+        ``spec.region`` здесь **не** используется: slug вида ``moskva`` у drom.ru
+        даёт 404.
+
+        Args:
+            spec: спецификация задания.
+        """
+        region_id = spec.get("region_id")
+        if region_id:
+            return REGION_ID_SEGMENT.format(region_id=int(region_id))
+        region_slug = spec.get("region_slug")
+        if region_slug:
+            return _slug(str(region_slug)) + "/"
+        return ""
 
     # ------------------------------------------------------------------
     # Диагностика

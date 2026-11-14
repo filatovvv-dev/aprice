@@ -39,7 +39,7 @@ CARDS = [
     {"href": "https://spb.drom.ru/bmw/x5/222.html", "text": CARD_2},
 ]
 LISTING_HTML = '<html><div data-ftid="bulls-list_bull">…</div></html>'
-LISTING_URL = "https://auto.drom.ru/all/bmw/x5/?min_year=2018&page=1"
+LISTING_URL = "https://auto.drom.ru/region77/bmw/x5/?minyear=2018"
 
 
 @pytest.fixture(autouse=True)
@@ -81,40 +81,56 @@ def make_browser_mock(
 # ----------------------------------------------------------------------
 # URL
 # ----------------------------------------------------------------------
-def test_build_url_exact(parser):
+def test_build_url_without_region_is_all_russia(parser):
     assert parser._build_url(SPEC, 1) == (
-        "https://auto.drom.ru/all/bmw/x5/?min_year=2018&max_year=2021&page=1"
+        "https://auto.drom.ru/bmw/x5/?minyear=2018&maxyear=2021"
     )
 
 
-def test_build_url_slug_override_and_page(parser):
+def test_build_url_with_region_id(parser):
+    assert parser._build_url(dict(SPEC, region_id=77), 1) == (
+        "https://auto.drom.ru/region77/bmw/x5/?minyear=2018&maxyear=2021"
+    )
+
+
+def test_build_url_with_region_slug(parser):
+    assert parser._build_url(dict(SPEC, region_slug="moscow"), 1) == (
+        "https://auto.drom.ru/moscow/bmw/x5/?minyear=2018&maxyear=2021"
+    )
+
+
+def test_build_url_region_id_wins_over_slug(parser):
+    url = parser._build_url(dict(SPEC, region_id=78, region_slug="moscow"), 1)
+    assert urlparse(url).path == "/region78/bmw/x5/"
+
+
+def test_build_url_ignores_shared_region_field(parser):
+    """``spec.region`` (slug для auto.ru) drom.ru не понимает (``/moskva/`` -> 404)."""
+    assert urlparse(parser._build_url(dict(SPEC, region="moskva"), 1)).path == "/bmw/x5/"
+
+
+def test_build_url_page_param_only_from_second_page(parser):
+    assert "page" not in parse_qs(urlparse(parser._build_url(SPEC, 1)).query)
+    url = parser._build_url(SPEC, 3)
+    assert parse_qs(urlparse(url).query) == {
+        "minyear": ["2018"], "maxyear": ["2021"], "page": ["3"]
+    }
+
+
+def test_build_url_slug_override(parser):
     spec = dict(SPEC, manufacturer_slug="land_rover", model_slug="range-rover")
-    url = parser._build_url(spec, 4)
-    parsed = urlparse(url)
-    assert parsed.path == "/all/land_rover/range-rover/"
-    assert parse_qs(parsed.query)["page"] == ["4"]
-
-
-def test_build_url_uses_spec_region(parser):
-    url = parser._build_url(dict(SPEC, region="moskva"), 2)
-    parsed = urlparse(url)
-    assert parsed.netloc == "auto.drom.ru" and parsed.path == "/moskva/bmw/x5/"
-
-
-def test_build_url_empty_region_falls_back_to_all(parser):
-    assert urlparse(parser._build_url(dict(SPEC, region=""), 1)).path == "/all/bmw/x5/"
+    assert urlparse(parser._build_url(spec, 1)).path == "/land_rover/range-rover/"
 
 
 def test_build_url_has_no_unverified_filters(parser):
     spec = dict(SPEC, transmissions=["АКПП"], fuels=["Бензин"], engine_volume_from=2.0)
-    query = parse_qs(urlparse(parser._build_url(spec, 1)).query)
-    assert set(query) == {"min_year", "max_year", "page"}
-    assert query["min_year"] == ["2018"] and query["max_year"] == ["2021"]
+    assert set(parse_qs(urlparse(parser._build_url(spec, 1)).query)) == {"minyear", "maxyear"}
 
 
-def test_build_url_without_years(parser):
+def test_build_url_without_years_has_no_query(parser):
     spec = {"manufacturer": "BMW", "model": "X5"}
-    assert parser._build_url(spec, 1) == "https://auto.drom.ru/all/bmw/x5/?page=1"
+    assert parser._build_url(spec, 1) == "https://auto.drom.ru/bmw/x5/"
+    assert parser._build_url(spec, 2) == "https://auto.drom.ru/bmw/x5/?page=2"
 
 
 # ----------------------------------------------------------------------
@@ -186,12 +202,24 @@ def test_fetch_page_empty_results(parser):
         assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
 
 
-def test_fetch_page_no_selector_is_blocked(parser):
-    patcher, _, tab = make_browser_mock("<html><body>заглушка</body></html>")
+def test_fetch_page_no_selector_is_blocked_and_html_is_dumped(parser, debug_dir):
+    """Таймаут ожидания выдачи: HTML сохраняется ДО исключения (для подбора селекторов)."""
+    html = "<html><body>заглушка</body></html>"
+    patcher, _, tab = make_browser_mock(html)
     tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 10000ms")
     with patcher, pytest.raises(BlockedError) as exc:
-        parser.fetch_page(SPEC, {}, 1, threading.Event())
+        parser.fetch_page(SPEC, {}, 2, threading.Event())
     assert exc.value.detail == "no_listings_selector"
+    dumps = list(debug_dir.glob("drom_page_2_*.html"))
+    assert len(dumps) == 1 and dumps[0].read_text(encoding="utf-8") == html
+
+
+def test_captcha_after_selector_timeout_is_not_dumped(parser, debug_dir):
+    patcher, _, tab = make_browser_mock("<html>captcha</html>")
+    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 10000ms")
+    with patcher, pytest.raises(CaptchaDetectedError):
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert not debug_dir.exists()
 
 
 def test_fetch_page_no_selector_but_captcha_html(parser):
