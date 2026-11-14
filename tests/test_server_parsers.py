@@ -333,7 +333,7 @@ class TestFastMode:
         start = time.monotonic()
         ads = parser.collect(
             spec,
-            {"max_pages_per_site": 3, "max_ads_per_site": 500},
+            {"max_pages_per_site": 3, "max_ads_per_site": 500, "use_stub_data": True},
             stop,
         )
         elapsed = time.monotonic() - start
