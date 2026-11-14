@@ -497,6 +497,98 @@ def test_every_ad_has_nonempty_text(parser):
 
 
 # ----------------------------------------------------------------------
+# 3.9-fix1: пост-фильтр по годам, год только из текста, пробег
+# ----------------------------------------------------------------------
+def card_2026():
+    return {"href": "/moskva/avtomobili/bmw_x5_2026_9234567890", "price": "20900000",
+            "text": "BMW X5, 2026\n20 900 000 ₽\n3.0 л, бензин, автомат"}
+
+
+def test_year_outside_range_is_dropped(parser):
+    ads = parser._parse_listings_from_page(locator_for(CARDS + [card_2026()]), SPEC)
+    assert [a.year for a in ads] == [2020, 2018]  # 2026 при year_to=2021 отброшен
+
+
+@pytest.mark.parametrize("year, kept", [(2017, False), (2018, True), (2021, True), (2022, False)])
+def test_year_range_boundaries_are_inclusive(parser, year, kept):
+    card = dict(CARDS[0], text=f"BMW X5, {year}\n7 690 000 ₽")
+    ads = parser._parse_listings_from_page(locator_for([card]), SPEC)
+    assert bool(ads) is kept
+
+
+def test_card_without_year_passes_year_filter(parser):
+    card = dict(CARDS[0], text="BMW X5\n7 690 000 ₽\n103 583 км")
+    ads = parser._parse_listings_from_page(locator_for([card]), SPEC)
+    assert len(ads) == 1 and ads[0].year is None
+
+
+@pytest.mark.parametrize("spec_years", [
+    {}, {"year_from": None, "year_to": None}, {"year_from": 0, "year_to": 0},
+    {"year_from": "abc", "year_to": ""},
+])
+def test_missing_or_bad_bounds_do_not_filter(parser, spec_years):
+    spec = {**{k: v for k, v in SPEC.items() if not k.startswith("year_")}, **spec_years}
+    assert len(parser._parse_listings_from_page(locator_for(CARDS + [card_2026()]), spec)) == 3
+
+
+def test_only_one_bound_filters_that_side(parser):
+    spec = dict(SPEC, year_from=2019, year_to=None)
+    years = [a.year for a in parser._parse_listings_from_page(
+        locator_for(CARDS + [card_2026()]), spec)]
+    assert years == [2020, 2026]
+
+
+def test_all_out_of_range_warns_and_dumps_incomplete_html(parser, debug_dir, caplog):
+    cards = [dict(card_2026(), href=f"/m/avtomobili/bmw_x5_2026_{9000000 + i}") for i in range(6)]
+    patcher, _, _ = make_browser_mock(cards=cards)
+    with patcher, caplog.at_level("WARNING", logger="aprice.server.parsers.avito"):
+        assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
+    assert "игнорирует фильтр" in caplog.text
+    assert list(debug_dir.glob("avito_page_1_*.html"))  # 0 объявлений -> дамп
+
+
+def test_year_comes_from_text_not_from_url(parser):
+    """В slug ссылки 2026, в тексте 2020: год — из текста."""
+    card = {"href": "/m/avtomobili/bmw_x5_2026_1234567890", "price": "7690000",
+            "text": "BMW X5, 2020\n7 690 000 ₽"}
+    assert parser._parse_listings_from_page(locator_for([card]), SPEC)[0].year == 2020
+
+
+def test_year_in_url_only_is_not_used(parser):
+    card = {"href": "/m/avtomobili/bmw_x5_2019_1234567890", "price": "7690000",
+            "text": "BMW X5\n7 690 000 ₽"}
+    assert parser._parse_listings_from_page(locator_for([card]), SPEC)[0].year is None
+
+
+def test_year_as_separate_url_segment_is_not_used(parser):
+    """Год отдельным сегментом пути (``/2019/``) регуляркой по URL нашёлся бы — не берём."""
+    card = {"href": "/m/avtomobili/2019/bmw_x5_1234567890", "price": "7690000",
+            "text": "BMW X5\n7 690 000 ₽"}
+    assert parser._parse_listings_from_page(locator_for([card]), SPEC)[0].year is None
+
+
+def test_year_from_text_in_card(parser):
+    ad = parser._parse_listings_from_page(locator_for([CARDS[0]]), SPEC)[0]
+    assert ad.year == 2020
+
+
+def test_mileage_from_card_text(parser):
+    ad = parser._parse_listings_from_page(locator_for([CARDS[0]]), SPEC)[0]
+    assert ad.mileage == 103_583
+
+
+def test_mileage_from_specific_param_when_not_in_text(parser):
+    card = dict(CARDS[0], text="BMW X5, 2020\n7 690 000 ₽", params="103 583 км, 3.0 л, дизель")
+    ad = parser._parse_listings_from_page(locator_for([card]), SPEC)[0]
+    assert (ad.mileage, ad.engine_volume, ad.fuel) == (103_583, 3.0, "Дизель")
+
+
+def test_new_car_without_mileage_keeps_none(parser):
+    ad = parser._parse_listings_from_page(locator_for([card_2026()]), dict(SPEC, year_to=2030))[0]
+    assert ad.year == 2026 and ad.mileage is None
+
+
+# ----------------------------------------------------------------------
 # Регулярки
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("text, expected", [
@@ -641,6 +733,18 @@ setTimeout(() => {
 }, 700);
 </script>
 """
+
+
+def test_specific_param_is_returned_by_script_in_real_browser(chromium_page):
+    chromium_page.set_content(
+        '<div data-marker="item"><a data-marker="item-title" href="/a/b_1234567890">T</a>'
+        '<span data-marker="item-price">1 ₽</span>'
+        '<p data-marker="item-specific-param">103 583 км</p>'
+        '<p data-marker="item-specific-param">2020</p></div>'
+    )
+    card = chromium_page.locator(avito_module.CARD_SELECTOR).evaluate_all(
+        avito_module.CARDS_SCRIPT)[0]
+    assert card["params"] == "103 583 км, 2020"
 
 
 def test_delayed_render_collects_all_twenty_in_real_browser(chromium_page, parser):
