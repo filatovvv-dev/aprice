@@ -438,7 +438,7 @@ def test_fetch_page_single_page_no_pause_and_simulation(config):
     """fetch_page отдаёт одну страницу без пауз и поддерживает эмуляцию ошибок."""
     parser = DromParser(config)
     started = time.monotonic()
-    ads = parser.fetch_page(SPEC, {}, 1, threading.Event())
+    ads = parser.fetch_page(SPEC, {"test_fast_mode": True}, 1, threading.Event())
     assert time.monotonic() - started < 0.5
     assert 20 <= len(ads) <= 50
 
