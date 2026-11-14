@@ -110,6 +110,14 @@ DROM_HOST_RE = re.compile(r"^https?://(?:[a-z0-9-]+\.)*drom\.ru(?:[:/?#]|$)", re
 SUSPICIOUS_AVG_PRICE = 1_000_000
 #: Меньше стольких объявлений на странице — аномалия: HTML сохраняется для разбора.
 INCOMPLETE_THRESHOLD = 5
+#: Выдача — React SPA: SSR отдаёт первую карточку, остальные дорисовывает JS.
+#: Ждём не менее ``FULL_LIST_MIN_CARDS`` контейнеров (3.8-fix6), затем страхуемся паузой.
+FULL_LIST_MIN_CARDS = 10
+FULL_LIST_TIMEOUT_MS = 5_000
+FULL_LIST_SETTLE_MS = 1_500
+FULL_LIST_JS = (
+    f"document.querySelectorAll('{CARD_SELECTOR}').length >= {FULL_LIST_MIN_CARDS}"
+)
 
 CAPTCHA_MARKER = "captcha"
 EMPTY_MARKERS = ("не найдено", "ничего не найдено")
@@ -262,6 +270,7 @@ class DromParser(BaseSiteParser):
                 raise BlockedError(self.site_name, NO_LISTINGS_REASON)
             if stop_event.is_set():
                 return []
+            self._wait_full_list(tab)
             html = tab.content()
             logger.info("[drom.ru] финальный URL: %s, html_len=%d", current_url, len(html))
             ads = self._parse_listings_from_page(tab, spec)  # пока вкладка открыта
@@ -422,6 +431,21 @@ class DromParser(BaseSiteParser):
     # ------------------------------------------------------------------
     # Разбор выдачи
     # ------------------------------------------------------------------
+    @staticmethod
+    def _wait_full_list(tab: Any) -> None:
+        """Ждёт, пока React дорисует карточки выдачи (обычно 20 на страницу).
+
+        ``wait_for_function`` завершается сразу, как контейнеров станет не меньше
+        :data:`FULL_LIST_MIN_CARDS`; таймаут — не ошибка (на странице их может быть
+        меньше). Затем короткая пауза: React может досылать карточки порциями.
+        """
+        try:
+            tab.wait_for_function(FULL_LIST_JS, timeout=FULL_LIST_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            logger.info("[drom.ru] карточек меньше %d или React не успел — парсим как есть",
+                        FULL_LIST_MIN_CARDS)
+        tab.wait_for_timeout(FULL_LIST_SETTLE_MS)
+
     def _parse_listings_from_page(self, tab: Any, spec: dict) -> list[Ad]:
         """Извлекает **все** объявления страницы через ``Locator.evaluate_all``.
 
