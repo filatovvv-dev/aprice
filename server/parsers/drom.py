@@ -18,8 +18,9 @@
   — вся Россия; ``https://auto.drom.ru/region77/{марка}/{модель}/?minyear=..&maxyear=..``
   — регион по коду (77 — Москва, 78 — Санкт-Петербург); ``/all/`` и ``/moskva/``
   дают 404. Регион задают ``spec.region_id`` (код) или ``spec.region_slug``;
-  не заданы — вся Россия. ``page=N`` добавляется со 2-й страницы; формат
-  пагинации **не проверен** (:data:`QUERY_PARAMS`). Путь ``/catalog/`` из первой
+  не заданы — вся Россия. Страницы листаются через путь:
+  ``.../region77/bmw/x5/page2/?minyear=..`` (``?page=2`` не работает; на странице
+  ровно 20 объявлений, бесконечной прокрутки нет). Путь ``/catalog/`` из первой
   версии вёл в каталог моделей. Параметры коробки, топлива и объёма **не
   передаются** (фильтрация — на стороне Client).
 * **Выдача:** маркеры ``data-ftid`` (стабильнее CSS-классов): карточка —
@@ -77,12 +78,13 @@ BASE_URL = "https://www.drom.ru"
 #: Выдача объявлений живёт на поддомене ``auto.drom.ru`` (``/catalog/`` — каталог моделей).
 AUTO_URL = "https://auto.drom.ru"
 #: Путь выдачи (не подтверждён, см. docstring модуля).
-URL_TEMPLATE = AUTO_URL + "/{region}{brand}/{model}/"
+URL_TEMPLATE = AUTO_URL + "/{region}{brand}/{model}/{pager}"
+#: Сегмент пагинации для страниц со 2-й: ``page2/`` (``?page=2`` не работает).
+PAGE_SEGMENT = "page{page}/"
 #: Сегмент пути для кода региона drom.ru: ``region77`` — Москва.
 REGION_ID_SEGMENT = "region{region_id}/"
-#: Имена параметров года и страницы в query (``minyear``/``maxyear`` подтверждены
-#: ручной проверкой; ``page`` — нет).
-QUERY_PARAMS = {"year_from": "minyear", "year_to": "maxyear", "page": "page"}
+#: Имена параметров года в query (подтверждены ручной проверкой Заказчика).
+QUERY_PARAMS = {"year_from": "minyear", "year_to": "maxyear"}
 
 GOTO_TIMEOUT_MS = 30_000
 LISTINGS_TIMEOUT_MS = 10_000
@@ -91,33 +93,50 @@ NO_LISTINGS_REASON = "no_listings_selector"
 #: Каталог дампов HTML пустых страниц (в ``.gitignore``).
 DEBUG_DIR: Path = constants.DATA_DIR / "debug"
 
-#: Ссылка на объявление и карточка (атрибуты ``data-ftid``).
-#: Без ``a``: на ``auto.drom.ru`` маркер может стоять и на обёртке заголовка.
-TITLE_SELECTOR = '[data-ftid="bull_title"]'
+#: Контейнер объявления и заголовок со ссылкой (атрибуты ``data-ftid``).
 CARD_SELECTOR = '[data-ftid="bulls-list_bull"]'
-#: Признак готовности выдачи: карточка или ссылка на объявление.
+TITLE_SELECTOR = '[data-ftid="bull_title"]'
+#: Все ссылки, которые могут вести на объявление (заголовок или ``*.html``).
+LINKS_SELECTOR = f'{TITLE_SELECTOR}, a[href*=".html"]'
+#: Признак готовности выдачи: карточка или заголовок объявления.
 LISTINGS_SELECTOR = f"{CARD_SELECTOR}, {TITLE_SELECTOR}"
+#: Ссылка на объявление: ``.../1234567890.html``; навигационные ``*.html`` отсекаются.
+LISTING_HREF_RE = re.compile(r"/\d{5,}\.html(?:[?#]|$)")
+#: Меньше стольких объявлений на странице — аномалия: HTML сохраняется для разбора.
+INCOMPLETE_THRESHOLD = 5
 
 CAPTCHA_MARKER = "captcha"
 EMPTY_MARKERS = ("не найдено", "ничего не найдено")
 BLOCKED_STATUSES = (403, 429)
 
-#: JS для ``evaluate_all`` по ссылкам: ``href`` и текст ближайшего предка,
-#: в котором уже есть цена (иначе — до 5 уровней вверх).
-TITLES_SCRIPT = (
-    "els => els.map(a => {"
+#: JS-функция ``tx``: видимый текст элемента; если ``innerText`` пуст (содержимое
+#: пропущено рендером), текстовые узлы собираются обходом через перевод строки.
+_JS_TEXT = (
+    "const tx = el => { if (el.innerText) return el.innerText;"
+    " const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT); const p = [];"
+    " while (w.nextNode()) { const t = w.currentNode.nodeValue.trim(); if (t) p.push(t); }"
+    " return p.join('\\n'); };"
+)
+#: JS для ``evaluate_all`` по контейнерам: ``href`` первой ссылки на объявление
+#: и текст карточки. Обрабатываются **все** элементы (``map`` по ``els``).
+CARDS_SCRIPT = (
+    "els => { " + _JS_TEXT +
+    " return els.map(e => { const l = e.querySelector('a[data-ftid=\"bull_title\"]')"
+    " || e.querySelector('a[href*=\".html\"]') || e.querySelector('a');"
+    " return {source: 'card', href: (l && l.href) || null, text: tx(e)}; }); }"
+)
+#: JS для ``evaluate_all`` по ссылкам: ``href``, признак заголовка (``marked``) и текст
+#: ближайшего предка, в котором уже есть цена (иначе — до 5 уровней вверх).
+LINKS_SCRIPT = (
+    "els => { " + _JS_TEXT +
+    " return els.map(a => {"
     " let c = a.closest('[data-ftid=\"bulls-list_bull\"]');"
     " if (!c) { c = a;"
-    "  for (let i = 0; i < 5 && c.parentElement && !/₽|руб/.test(c.innerText || ''); i++)"
+    "  for (let i = 0; i < 5 && c.parentElement && !/₽|руб/.test(tx(c)); i++)"
     "   c = c.parentElement; }"
     " const l = a.matches('a') ? a : (a.closest('a') || a.querySelector('a'));"
-    " return {href: (l && l.href) || null, text: c.innerText || ''}; })"
-)
-#: JS для ``evaluate_all`` по карточкам (запасной путь).
-CARDS_SCRIPT = (
-    "els => els.map(e => ({"
-    "href: (e.querySelector('a[data-ftid=\"bull_title\"]') || e.querySelector('a') || {}).href"
-    " || null, text: e.innerText || ''}))"
+    " const marked = !!a.closest('[data-ftid=\"bull_title\"]');"
+    " return {source: 'link', marked: marked, href: (l && l.href) || null, text: tx(c)}; }); }"
 )
 
 #: Число с группами тысяч по 3 цифры: соседнее число (год) не «слипается» с суммой.
@@ -244,6 +263,12 @@ class DromParser(BaseSiteParser):
 
         if not ads:
             self._report_empty(html, current_url, page)
+        elif len(ads) < INCOMPLETE_THRESHOLD:
+            logger.warning(
+                "[drom.ru] собрано только %d объявлений (url=%s) — сохраняю HTML",
+                len(ads), current_url,
+            )
+            self._save_debug_html(html, f"drom_page_{page}_incomplete.html")
         return ads
 
     def collect(
@@ -302,7 +327,7 @@ class DromParser(BaseSiteParser):
                 ``region_slug``; без них — вся Россия; ``manufacturer``,
                 ``model``, ``year_from``, ``year_to``; необязательные
                 ``manufacturer_slug`` / ``model_slug`` переопределяют slug).
-            page: номер страницы, с 1 (при 1 параметр ``page`` не добавляется).
+            page: номер страницы, с 1; со 2-й путь получает ``page{N}/``.
 
         Returns:
             str: готовый URL.
@@ -315,9 +340,8 @@ class DromParser(BaseSiteParser):
             params.append((QUERY_PARAMS["year_from"], spec["year_from"]))
         if spec.get("year_to"):
             params.append((QUERY_PARAMS["year_to"], spec["year_to"]))
-        if page > 1:  # первая страница — без параметра, как в обычной ссылке
-            params.append((QUERY_PARAMS["page"], page))
-        url = URL_TEMPLATE.format(region=region, brand=brand, model=model)
+        pager = PAGE_SEGMENT.format(page=page) if page > 1 else ""
+        url = URL_TEMPLATE.format(region=region, brand=brand, model=model, pager=pager)
         return url + "?" + urlencode(params) if params else url
 
     @staticmethod
@@ -357,9 +381,19 @@ class DromParser(BaseSiteParser):
             "has_bulls_list=%s, has_bull_title=%s",
             url, len(html), "bulls-list_bull" in html, "bull_title" in html,
         )
+        self._save_debug_html(html, f"drom_page_{page}_{int(time.time())}.html")
+
+    @staticmethod
+    def _save_debug_html(html: str, filename: str) -> None:
+        """Сохраняет HTML в :data:`DEBUG_DIR`; сбой записи только логируется.
+
+        Args:
+            html: содержимое страницы.
+            filename: имя файла внутри каталога дампов.
+        """
         try:
             DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-            path = DEBUG_DIR / f"drom_page_{page}_{int(time.time())}.html"
+            path = DEBUG_DIR / filename
             path.write_text(html, encoding="utf-8")
             logger.warning("[drom.ru] HTML сохранён: %s", path)
         except OSError:
@@ -374,11 +408,16 @@ class DromParser(BaseSiteParser):
     # Разбор выдачи
     # ------------------------------------------------------------------
     def _parse_listings_from_page(self, tab: Any, spec: dict) -> list[Ad]:
-        """Извлекает объявления из DOM через ``Locator.evaluate_all``.
+        """Извлекает **все** объявления страницы через ``Locator.evaluate_all``.
 
-        Сначала по ссылкам ``a[data-ftid="bull_title"]`` (текст — у ближайшего
-        предка-карточки), при их отсутствии — по карточкам ``bulls-list_bull``.
-        Карточки без ссылки и без цены, года и пробега (реклама) пропускаются.
+        Два источника объединяются (дубли по ``url`` отбрасываются, контейнеры
+        приоритетнее): контейнеры ``bulls-list_bull`` и ссылки
+        (``bull_title`` / ``*.html``). Раньше ссылки по ``bull_title`` имели
+        приоритет, и если маркер встречался у одной карточки из двадцати,
+        остальные не собирались. Ссылки без маркера принимаются, только если
+        похожи на объявление (``/<цифры>.html``). Карточки без ссылки и без
+        цены, года и пробега (реклама) пропускаются; карточка с ``url`` и
+        ``price`` сохраняется, даже если года или пробега нет.
 
         Args:
             tab: открытая страница Playwright.
@@ -387,14 +426,30 @@ class DromParser(BaseSiteParser):
         Returns:
             list[Ad]: объявления без дублей по ``url``; ``[]`` — карточек нет.
         """
-        cards = tab.locator(TITLE_SELECTOR).evaluate_all(TITLES_SCRIPT) or []
-        if not cards:
-            cards = tab.locator(CARD_SELECTOR).evaluate_all(CARDS_SCRIPT) or []
+        containers = tab.locator(CARD_SELECTOR).evaluate_all(CARDS_SCRIPT) or []
+        links = tab.locator(LINKS_SELECTOR).evaluate_all(LINKS_SCRIPT) or []
         unique: dict[str, Ad] = {}
-        for card in cards:
-            ad = self._card_to_ad(card.get("href"), card.get("text") or "", spec)
-            if ad is not None:
-                unique.setdefault(ad.url, ad)
+        skipped = {"no_href": 0, "not_listing": 0, "no_fields": 0, "duplicate": 0}
+        for card in [*containers, *links]:
+            href = card.get("href")
+            if href and card.get("source") == "link" and not card.get("marked") \
+                    and not LISTING_HREF_RE.search(href):
+                skipped["not_listing"] += 1
+                continue
+            if not href:
+                skipped["no_href"] += 1
+                continue
+            ad = self._card_to_ad(href, card.get("text") or "", spec)
+            if ad is None:
+                skipped["no_fields"] += 1
+            elif ad.url in unique:
+                skipped["duplicate"] += 1
+            else:
+                unique[ad.url] = ad
+        logger.info(
+            "[drom.ru] контейнеров=%d, ссылок=%d, принято=%d, пропущено: %s",
+            len(containers), len(links), len(unique), skipped,
+        )
         return list(unique.values())
 
     def _card_to_ad(self, href: Optional[str], text: str, spec: dict) -> Optional[Ad]:

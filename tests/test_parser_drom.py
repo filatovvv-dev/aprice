@@ -34,6 +34,19 @@ CARD_1 = (
     "BMW X5, 2019\n4 190 000 ₽\n3.0 л (249 л.с.), дизель, автомат, 4WD, 160 661 км\nМосква"
 )
 CARD_2 = "BMW X5, 2018\n3 850 000 руб.\n3.0 л, бензин, механика, 95 000 км"
+def twenty_cards(n: int = 20, source: str = "card") -> list[dict]:
+    """``n`` разных карточек в формате ``evaluate_all`` (``/N.html``)."""
+    return [
+        {
+            "source": source,
+            "href": f"https://moscow.drom.ru/bmw/x5/{1000000 + i}.html",
+            "text": f"BMW X5, {2018 + i % 4}\n{3_000_000 + i * 10_000:,} ₽".replace(",", " ")
+            + f"\n3.0 л, дизель, автомат, {50_000 + i} км",
+        }
+        for i in range(n)
+    ]
+
+
 CARDS = [
     {"href": "https://moscow.drom.ru/bmw/x5/111.html", "text": CARD_1},
     {"href": "https://spb.drom.ru/bmw/x5/222.html", "text": CARD_2},
@@ -109,12 +122,15 @@ def test_build_url_ignores_shared_region_field(parser):
     assert urlparse(parser._build_url(dict(SPEC, region="moskva"), 1)).path == "/bmw/x5/"
 
 
-def test_build_url_page_param_only_from_second_page(parser):
-    assert "page" not in parse_qs(urlparse(parser._build_url(SPEC, 1)).query)
+def test_build_url_pagination_is_path_segment(parser):
+    """Страница N>1 — ``/pageN/`` в пути, а не ``?page=N``."""
+    assert parser._build_url(dict(SPEC, region_id=77), 2) == (
+        "https://auto.drom.ru/region77/bmw/x5/page2/?minyear=2018&maxyear=2021"
+    )
     url = parser._build_url(SPEC, 3)
-    assert parse_qs(urlparse(url).query) == {
-        "minyear": ["2018"], "maxyear": ["2021"], "page": ["3"]
-    }
+    assert urlparse(url).path == "/bmw/x5/page3/"
+    assert parse_qs(urlparse(url).query) == {"minyear": ["2018"], "maxyear": ["2021"]}
+    assert "page" not in parser._build_url(SPEC, 1)
 
 
 def test_build_url_slug_override(parser):
@@ -130,7 +146,7 @@ def test_build_url_has_no_unverified_filters(parser):
 def test_build_url_without_years_has_no_query(parser):
     spec = {"manufacturer": "BMW", "model": "X5"}
     assert parser._build_url(spec, 1) == "https://auto.drom.ru/bmw/x5/"
-    assert parser._build_url(spec, 2) == "https://auto.drom.ru/bmw/x5/?page=2"
+    assert parser._build_url(spec, 2) == "https://auto.drom.ru/bmw/x5/page2/"
 
 
 # ----------------------------------------------------------------------
@@ -320,9 +336,33 @@ def test_dump_failure_does_not_break_fetch(parser, debug_dir):
 
 
 def test_ads_found_writes_no_dump(parser, debug_dir):
-    patcher, _, _ = make_browser_mock(cards=CARDS)
+    patcher, _, _ = make_browser_mock(cards=twenty_cards())
     with patcher:
-        parser.fetch_page(SPEC, {}, 1, threading.Event())
+        assert len(parser.fetch_page(SPEC, {}, 1, threading.Event())) == 20
+    assert not debug_dir.exists()
+
+
+def test_fewer_than_five_ads_saves_incomplete_html(parser, debug_dir, caplog):
+    """Меньше 5 объявлений — аномалия: HTML в ``drom_page_{N}_incomplete.html``."""
+    patcher, _, _ = make_browser_mock(LISTING_HTML, cards=CARDS)
+    with patcher, caplog.at_level("WARNING", logger="aprice.server.parsers.drom"):
+        assert len(parser.fetch_page(SPEC, {}, 2, threading.Event())) == 2
+    dump = debug_dir / "drom_page_2_incomplete.html"
+    assert dump.read_text(encoding="utf-8") == LISTING_HTML
+    assert "только 2" in caplog.text
+
+
+def test_four_ads_is_incomplete(parser, debug_dir):
+    patcher, _, _ = make_browser_mock(cards=twenty_cards(4))
+    with patcher:
+        assert len(parser.fetch_page(SPEC, {}, 1, threading.Event())) == 4
+    assert (debug_dir / "drom_page_1_incomplete.html").exists()
+
+
+def test_exactly_five_ads_is_not_incomplete(parser, debug_dir):
+    patcher, _, _ = make_browser_mock(cards=twenty_cards(5))
+    with patcher:
+        assert len(parser.fetch_page(SPEC, {}, 1, threading.Event())) == 5
     assert not debug_dir.exists()
 
 
@@ -333,21 +373,85 @@ def test_parse_listings_dom_two_cards(parser):
     tab = MagicMock()
     tab.locator.return_value.evaluate_all.return_value = CARDS
     ads = parser._parse_listings_from_page(tab, SPEC)
-    assert [a.price for a in ads] == [4_190_000, 3_850_000]
-    tab.locator.assert_called_once_with('[data-ftid="bull_title"]')
+    assert [a.price for a in ads] == [4_190_000, 3_850_000]  # дубли двух источников склеены
+    assert [c.args[0] for c in tab.locator.call_args_list] == [
+        '[data-ftid="bulls-list_bull"]',
+        '[data-ftid="bull_title"], a[href*=".html"]',
+    ]
 
 
-def test_parse_listings_falls_back_to_card_containers(parser):
+def locator_results(**by_selector):
+    """Фейковый ``tab.locator``: у каждого селектора свой ответ ``evaluate_all``."""
     tab = MagicMock()
-    results = {
-        '[data-ftid="bull_title"]': [],
-        '[data-ftid="bulls-list_bull"]': CARDS[:1],
-    }
     tab.locator.side_effect = lambda sel: MagicMock(
-        evaluate_all=MagicMock(return_value=results[sel])
+        evaluate_all=MagicMock(return_value=by_selector.get(sel, []))
     )
+    return tab
+
+
+CONTAINERS = '[data-ftid="bulls-list_bull"]'
+LINKS = '[data-ftid="bull_title"], a[href*=".html"]'
+
+
+def test_parse_all_twenty_cards(parser):
+    tab = locator_results(**{CONTAINERS: twenty_cards()})
     ads = parser._parse_listings_from_page(tab, SPEC)
-    assert len(ads) == 1 and ads[0].price == 4_190_000
+    assert len(ads) == 20 and len({a.url for a in ads}) == 20
+    assert all(a.price and a.year and a.mileage for a in ads)
+
+
+def test_parse_one_marked_link_does_not_hide_other_cards(parser):
+    """Регрессия «1 из 20»: ``bull_title`` у одной карточки, остальные 19 — в контейнерах."""
+    cards = twenty_cards()
+    marked = dict(cards[0], source="link", marked=True)
+    tab = locator_results(**{CONTAINERS: cards, LINKS: [marked]})
+    assert len(parser._parse_listings_from_page(tab, SPEC)) == 20
+
+
+def test_parse_links_only_without_containers(parser):
+    links = [dict(c, source="link", marked=False) for c in twenty_cards()]
+    tab = locator_results(**{LINKS: links})
+    assert len(parser._parse_listings_from_page(tab, SPEC)) == 20
+
+
+def test_parse_link_filter_drops_navigation_html_links(parser):
+    links = [
+        {"source": "link", "marked": False, "href": "https://www.drom.ru/about.html",
+         "text": "О проекте 2019"},                       # навигация
+        {"source": "link", "marked": False, "href": "https://moscow.drom.ru/bmw/x5/1234567.html",
+         "text": "BMW X5\n4 000 000 ₽"},                  # объявление без маркера
+        {"source": "link", "marked": True, "href": "https://x.drom.ru/promo",
+         "text": "BMW X5\n5 000 000 ₽"},                  # маркер заголовка
+    ]
+    ads = parser._parse_listings_from_page(locator_results(**{LINKS: links}), SPEC)
+    assert [a.price for a in ads] == [4_000_000, 5_000_000]
+
+
+def test_card_with_url_and_price_is_kept_without_year_and_mileage(parser):
+    tab = locator_results(**{CONTAINERS: [
+        {"source": "card", "href": "https://x.drom.ru/1.html", "text": "BMW X5\n4 000 000 ₽"},
+    ]})
+    ads = parser._parse_listings_from_page(tab, SPEC)
+    assert len(ads) == 1 and ads[0].year is None and ads[0].mileage is None
+
+
+def test_card_with_only_year_is_kept(parser):
+    tab = locator_results(**{CONTAINERS: [
+        {"source": "card", "href": "https://x.drom.ru/2.html", "text": "BMW X5, 2019"},
+    ]})
+    ads = parser._parse_listings_from_page(tab, SPEC)
+    assert len(ads) == 1 and ads[0].year == 2019 and ads[0].price is None
+
+
+def test_container_wins_over_link_for_same_url(parser):
+    """Одно объявление найдено и контейнером (полный текст), и ссылкой (короткий)."""
+    url = "https://x.drom.ru/3000000.html"
+    tab = locator_results(**{
+        CONTAINERS: [{"source": "card", "href": url, "text": "BMW X5, 2019\n5 000 000 ₽"}],
+        LINKS: [{"source": "link", "marked": True, "href": url, "text": "BMW X5, 2019"}],
+    })
+    ads = parser._parse_listings_from_page(tab, SPEC)
+    assert len(ads) == 1 and ads[0].price == 5_000_000
 
 
 def test_parse_listings_skips_banners_and_dedups(parser):
@@ -433,12 +537,25 @@ def test_close_is_noop(parser):
 # ----------------------------------------------------------------------
 # JS-сценарии в настоящем Chromium (офлайн: set_content, без сети)
 # ----------------------------------------------------------------------
-BROWSER_HTML = """
-<div data-ftid="bulls-list_bull"><div><a data-ftid="bull_title" href="/bmw/x5/1.html">BMW X5, 2019</a></div>
-<div>4 190 000 ₽</div><div>160 661 км</div></div>
-<div class="wrap"><div class="inner"><span data-ftid="bull_title"><a href="https://spb.drom.ru/bmw/x5/2.html">BMW X5, 2018</a></span>
-<div>3 850 000 ₽</div></div></div>
-"""
+def _browser_html() -> str:
+    """20 карточек: ``bull_title`` только у первой, у остальных — просто ссылка ``N.html``."""
+    cards = []
+    for i in range(20):
+        title = (
+            f'<a data-ftid="bull_title" href="/bmw/x5/{1000000 + i}.html">BMW X5, 2019</a>'
+            if i == 0 else f'<a href="/bmw/x5/{1000000 + i}.html">BMW X5, 2019</a>'
+        )
+        cards.append(
+            f'<div data-ftid="bulls-list_bull"><div>{title}</div>'
+            f"<div>{3_000_000 + i} ₽</div><div>{80_000 + i} км</div></div>"
+        )
+    return (
+        '<nav><a href="/about.html">О проекте</a></nav>'
+        + "".join(cards)
+        + '<div class="wrap"><div class="inner"><span data-ftid="bull_title">'
+        '<a href="https://spb.drom.ru/bmw/x5/2000000.html">BMW X5, 2018</a></span>'
+        "<div>3 850 000 ₽</div></div></div>"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -452,28 +569,52 @@ def chromium_page():
     except Exception as exc:  # noqa: BLE001 - браузер может быть не установлен
         pytest.skip(f"Chromium недоступен: {exc}")
     page = browser.new_page()
-    page.set_content(BROWSER_HTML)
+    page.set_content(_browser_html())
     yield page
     browser.close()
     pw.stop()
 
 
-def test_titles_script_in_real_browser(chromium_page):
-    """Заголовок-ссылка и заголовок-обёртка: href и текст всей карточки."""
-    result = chromium_page.locator(drom_module.TITLE_SELECTOR).evaluate_all(
-        drom_module.TITLES_SCRIPT
-    )
-    assert len(result) == 2
-    assert result[0]["href"].endswith("/bmw/x5/1.html")
-    assert result[1]["href"] == "https://spb.drom.ru/bmw/x5/2.html"
-    assert "4 190 000 ₽" in result[0]["text"] and "160 661 км" in result[0]["text"]
-    assert "3 850 000 ₽" in result[1]["text"]
-    assert "4 190 000" not in result[1]["text"]  # предок не «захватил» соседнюю карточку
-
-
-def test_cards_script_in_real_browser(chromium_page):
-    result = chromium_page.locator(drom_module.CARD_SELECTOR).evaluate_all(
+def test_scripts_return_every_element_in_real_browser(chromium_page):
+    """Оба JS-сценария отдают по записи на КАЖДЫЙ элемент, а не только на первый."""
+    cards = chromium_page.locator(drom_module.CARD_SELECTOR).evaluate_all(
         drom_module.CARDS_SCRIPT
     )
-    assert len(result) == 1 and result[0]["href"].endswith("/bmw/x5/1.html")
-    assert "160 661 км" in result[0]["text"]
+    links = chromium_page.locator(drom_module.LINKS_SELECTOR).evaluate_all(
+        drom_module.LINKS_SCRIPT
+    )
+    assert len(cards) == 20
+    assert all(c["href"] and "₽" in c["text"] for c in cards)
+    assert len(links) >= 21  # заголовок + 19 ссылок + 1 вне контейнера (+ навигация)
+    cards_text = {c["href"]: c["text"] for c in cards}
+    assert len(cards_text) == 20
+
+
+def test_parser_collects_all_twenty_plus_one_in_real_browser(chromium_page, tmp_path):
+    """Сквозная проверка на настоящем DOM: 20 карточек + заголовок вне контейнера."""
+    parser = DromParser(Config(tmp_path / "s.json"))
+    ads = parser._parse_listings_from_page(chromium_page, SPEC)
+    urls = {a.url.rsplit("/", 1)[-1] for a in ads}
+    assert len(ads) == 21
+    assert "about.html" not in urls  # навигационная ссылка отсечена
+    assert "2000000.html" in urls
+    by_url = {a.url.rsplit("/", 1)[-1]: a for a in ads}
+    assert by_url["1000007.html"].price == 3_000_007
+    assert by_url["1000007.html"].mileage == 80_007
+    assert by_url["2000000.html"].price == 3_850_000
+
+
+def test_text_fallback_when_inner_text_is_empty_in_real_browser(chromium_page):
+    """``content-visibility:hidden`` даёт пустой innerText — текст берётся из узлов."""
+    chromium_page.evaluate(
+        """() => { const d = document.createElement('div');
+        d.setAttribute('data-ftid', 'bulls-list_bull'); d.id = 'hidden-card';
+        d.style.cssText = 'content-visibility:hidden;contain-intrinsic-size:100px';
+        d.innerHTML = '<a href="/bmw/x5/9999999.html">BMW X5</a><div>2 222 222 ₽</div>';
+        document.body.appendChild(d); }"""
+    )
+    try:
+        cards = chromium_page.locator("#hidden-card").evaluate_all(drom_module.CARDS_SCRIPT)
+    finally:
+        chromium_page.evaluate("document.getElementById('hidden-card').remove()")
+    assert len(cards) == 1 and "2 222 222 ₽" in cards[0]["text"]
