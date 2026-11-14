@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from common.config import Config
 from server.parsers import autoru as autoru_module
@@ -150,7 +151,8 @@ def test_fetch_page_parses_next_data(parser):
     assert (first.transmission, first.fuel, first.engine_volume) == ("АКПП", "Бензин", 3.0)
     assert first.raw_json["id"] == "100-abc"
     tab.goto.assert_called_once()
-    assert tab.goto.call_args.kwargs["wait_until"] == "domcontentloaded"
+    assert tab.goto.call_args.kwargs["wait_until"] == "commit"
+    assert tab.goto.call_args.kwargs["timeout"] == 30_000
 
 
 def test_fetch_page_dedups_and_tolerates_missing_fields(parser):
@@ -201,6 +203,82 @@ def test_fetch_page_blocked(parser, status):
     with patcher, pytest.raises(BlockedError) as exc:
         parser.fetch_page(SPEC, {}, 1, threading.Event())
     assert exc.value.site == "auto.ru" and str(status) in exc.value.detail
+
+
+def test_fetch_page_captcha_via_commit_url(parser):
+    """FX-06: goto вернулся, но page.url уже на капче — селектор не ждём."""
+    patcher, _, tab = make_browser_mock(
+        page_url="https://auto.ru/showcaptcha?cc=1&retpath=x"
+    )
+    with patcher, pytest.raises(CaptchaDetectedError) as exc:
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert "showcaptcha" in exc.value.url
+    tab.wait_for_selector.assert_not_called()
+
+
+def test_fetch_page_smartcaptcha_in_url(parser):
+    patcher, _, _ = make_browser_mock(page_url="https://smartcaptcha.yandexcloud.net/x")
+    with patcher, pytest.raises(CaptchaDetectedError):
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+
+
+def test_fetch_page_timeout_then_captcha_url(parser):
+    """FX-02: таймаут навигации, но URL уже капча -> CAPTCHA, не Blocked."""
+    patcher, _, tab = make_browser_mock(page_url="https://auto.ru/showcaptcha?cc=1")
+    tab.goto.side_effect = PlaywrightTimeoutError("Timeout 30000ms exceeded")
+    with patcher, pytest.raises(CaptchaDetectedError):
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+
+
+def test_fetch_page_timeout_no_captcha(parser):
+    """FX-03: таймаут и обычный URL -> BlockedError(goto_timeout)."""
+    patcher, _, tab = make_browser_mock(
+        page_url="https://auto.ru/cars/bmw/x5/all/?year_from=2018&page=1"
+    )
+    tab.goto.side_effect = PlaywrightTimeoutError("Timeout 30000ms exceeded")
+    with patcher, pytest.raises(BlockedError) as exc:
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert exc.value.detail == "goto_timeout" and exc.value.site == "auto.ru"
+
+
+def test_fetch_page_selector_timeout_blocked(parser):
+    """FX-04: выдачи нет, капчи и «ничего не найдено» нет -> no_listings_selector."""
+    patcher, _, tab = make_browser_mock("<html><body>заглушка</body></html>")
+    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 5000ms")
+    with patcher, pytest.raises(BlockedError) as exc:
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert exc.value.detail == "no_listings_selector"
+    kwargs = tab.wait_for_selector.call_args.kwargs
+    assert kwargs["timeout"] == 5_000 and kwargs["state"] == "attached"
+    assert 'div[class*="ListingItem"]' in tab.wait_for_selector.call_args.args[0]
+
+
+def test_fetch_page_selector_timeout_but_captcha_html(parser):
+    patcher, _, tab = make_browser_mock('<html><div id="smartcaptcha"></div></html>')
+    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 5000ms")
+    with patcher, pytest.raises(CaptchaDetectedError):
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+
+
+def test_fetch_page_selector_timeout_empty_results(parser):
+    patcher, _, tab = make_browser_mock("<html>Объявления не найдены</html>")
+    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 5000ms")
+    with patcher:
+        assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
+
+
+def test_fetch_page_blocked_status_with_captcha_html_is_captcha(parser):
+    """403 со страницей SmartCaptcha — это CAPTCHA (её можно пройти вручную)."""
+    patcher, _, _ = make_browser_mock("<html>smartcaptcha</html>", status=403)
+    with patcher, pytest.raises(CaptchaDetectedError):
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+
+
+def test_fetch_page_non_timeout_goto_error_propagates(parser):
+    patcher, _, tab = make_browser_mock()
+    tab.goto.side_effect = RuntimeError("net::ERR_CERT_AUTHORITY_INVALID")
+    with patcher, pytest.raises(RuntimeError, match="ERR_CERT"):
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
 
 
 def test_fetch_page_empty_results(parser):
