@@ -109,12 +109,15 @@ def test_build_url_ignores_shared_region_field(parser):
     assert urlparse(parser._build_url(dict(SPEC, region="moskva"), 1)).path == "/bmw/x5/"
 
 
-def test_build_url_page_param_only_from_second_page(parser):
-    assert "page" not in parse_qs(urlparse(parser._build_url(SPEC, 1)).query)
+def test_build_url_pagination_is_path_segment(parser):
+    """Страница N>1 — ``/pageN/`` в пути, а не ``?page=N``."""
+    assert parser._build_url(dict(SPEC, region_id=77), 2) == (
+        "https://auto.drom.ru/region77/bmw/x5/page2/?minyear=2018&maxyear=2021"
+    )
     url = parser._build_url(SPEC, 3)
-    assert parse_qs(urlparse(url).query) == {
-        "minyear": ["2018"], "maxyear": ["2021"], "page": ["3"]
-    }
+    assert urlparse(url).path == "/bmw/x5/page3/"
+    assert parse_qs(urlparse(url).query) == {"minyear": ["2018"], "maxyear": ["2021"]}
+    assert "page" not in parser._build_url(SPEC, 1)
 
 
 def test_build_url_slug_override(parser):
@@ -130,7 +133,7 @@ def test_build_url_has_no_unverified_filters(parser):
 def test_build_url_without_years_has_no_query(parser):
     spec = {"manufacturer": "BMW", "model": "X5"}
     assert parser._build_url(spec, 1) == "https://auto.drom.ru/bmw/x5/"
-    assert parser._build_url(spec, 2) == "https://auto.drom.ru/bmw/x5/?page=2"
+    assert parser._build_url(spec, 2) == "https://auto.drom.ru/bmw/x5/page2/"
 
 
 # ----------------------------------------------------------------------

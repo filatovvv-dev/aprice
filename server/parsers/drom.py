@@ -18,8 +18,9 @@
   — вся Россия; ``https://auto.drom.ru/region77/{марка}/{модель}/?minyear=..&maxyear=..``
   — регион по коду (77 — Москва, 78 — Санкт-Петербург); ``/all/`` и ``/moskva/``
   дают 404. Регион задают ``spec.region_id`` (код) или ``spec.region_slug``;
-  не заданы — вся Россия. ``page=N`` добавляется со 2-й страницы; формат
-  пагинации **не проверен** (:data:`QUERY_PARAMS`). Путь ``/catalog/`` из первой
+  не заданы — вся Россия. Страницы листаются через путь:
+  ``.../region77/bmw/x5/page2/?minyear=..`` (``?page=2`` не работает; на странице
+  ровно 20 объявлений, бесконечной прокрутки нет). Путь ``/catalog/`` из первой
   версии вёл в каталог моделей. Параметры коробки, топлива и объёма **не
   передаются** (фильтрация — на стороне Client).
 * **Выдача:** маркеры ``data-ftid`` (стабильнее CSS-классов): карточка —
@@ -77,12 +78,13 @@ BASE_URL = "https://www.drom.ru"
 #: Выдача объявлений живёт на поддомене ``auto.drom.ru`` (``/catalog/`` — каталог моделей).
 AUTO_URL = "https://auto.drom.ru"
 #: Путь выдачи (не подтверждён, см. docstring модуля).
-URL_TEMPLATE = AUTO_URL + "/{region}{brand}/{model}/"
+URL_TEMPLATE = AUTO_URL + "/{region}{brand}/{model}/{pager}"
+#: Сегмент пагинации для страниц со 2-й: ``page2/`` (``?page=2`` не работает).
+PAGE_SEGMENT = "page{page}/"
 #: Сегмент пути для кода региона drom.ru: ``region77`` — Москва.
 REGION_ID_SEGMENT = "region{region_id}/"
-#: Имена параметров года и страницы в query (``minyear``/``maxyear`` подтверждены
-#: ручной проверкой; ``page`` — нет).
-QUERY_PARAMS = {"year_from": "minyear", "year_to": "maxyear", "page": "page"}
+#: Имена параметров года в query (подтверждены ручной проверкой Заказчика).
+QUERY_PARAMS = {"year_from": "minyear", "year_to": "maxyear"}
 
 GOTO_TIMEOUT_MS = 30_000
 LISTINGS_TIMEOUT_MS = 10_000
@@ -302,7 +304,7 @@ class DromParser(BaseSiteParser):
                 ``region_slug``; без них — вся Россия; ``manufacturer``,
                 ``model``, ``year_from``, ``year_to``; необязательные
                 ``manufacturer_slug`` / ``model_slug`` переопределяют slug).
-            page: номер страницы, с 1 (при 1 параметр ``page`` не добавляется).
+            page: номер страницы, с 1; со 2-й путь получает ``page{N}/``.
 
         Returns:
             str: готовый URL.
@@ -315,9 +317,8 @@ class DromParser(BaseSiteParser):
             params.append((QUERY_PARAMS["year_from"], spec["year_from"]))
         if spec.get("year_to"):
             params.append((QUERY_PARAMS["year_to"], spec["year_to"]))
-        if page > 1:  # первая страница — без параметра, как в обычной ссылке
-            params.append((QUERY_PARAMS["page"], page))
-        url = URL_TEMPLATE.format(region=region, brand=brand, model=model)
+        pager = PAGE_SEGMENT.format(page=page) if page > 1 else ""
+        url = URL_TEMPLATE.format(region=region, brand=brand, model=model, pager=pager)
         return url + "?" + urlencode(params) if params else url
 
     @staticmethod
