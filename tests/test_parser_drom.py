@@ -687,3 +687,69 @@ def test_text_fallback_when_inner_text_is_empty_in_real_browser(chromium_page):
     finally:
         chromium_page.evaluate("document.getElementById('hidden-card').remove()")
     assert len(cards) == 1 and "2 222 222 ₽" in cards[0]["text"]
+
+
+# ----------------------------------------------------------------------
+# 3.8-fix6: ожидание дорисовки карточек (React SPA)
+# ----------------------------------------------------------------------
+def test_waits_for_ten_cards_after_first_selector(parser):
+    patcher, _, tab = make_browser_mock(cards=twenty_cards())
+    with patcher:
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    js = ("document.querySelectorAll('[data-ftid=\"bulls-list_bull\"]').length >= 10")
+    tab.wait_for_function.assert_called_once_with(js, timeout=5_000)
+    tab.wait_for_timeout.assert_called_once_with(1_500)
+    names = [c[0] for c in tab.method_calls
+             if c[0] in ("wait_for_selector", "wait_for_function", "wait_for_timeout",
+                         "content")]
+    assert names.index("wait_for_selector") < names.index("wait_for_function") \
+        < names.index("wait_for_timeout") < names.index("content")
+
+
+def test_wait_for_function_timeout_is_not_an_error(parser):
+    patcher, _, tab = make_browser_mock(cards=twenty_cards(8))
+    tab.wait_for_function.side_effect = drom_module.PlaywrightTimeoutError("t")
+    with patcher:
+        ads = parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert len(ads) == 8
+    tab.wait_for_timeout.assert_called_once_with(1_500)  # пауза и после таймаута
+
+
+def test_no_full_list_wait_when_listings_selector_times_out(parser):
+    patcher, _, tab = make_browser_mock("<html>пусто</html>")
+    tab.wait_for_selector.side_effect = drom_module.PlaywrightTimeoutError("t")
+    with patcher, pytest.raises(BlockedError):
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    tab.wait_for_function.assert_not_called()
+
+
+DELAYED_HTML = """
+<div id="list"><div data-ftid="bulls-list_bull"><a data-ftid="bull_title"
+ href="/bmw/x5/1000000.html">BMW X5, 2019</a><div>3 000 000 ₽</div><div>80 000 км</div></div></div>
+<script>
+setTimeout(() => {
+  for (let i = 1; i < 20; i++) {
+    const d = document.createElement('div');
+    d.setAttribute('data-ftid', 'bulls-list_bull');
+    d.innerHTML = '<a href="/bmw/x5/' + (1000000 + i) + '.html">BMW X5, 2019</a>' +
+                  '<div>' + (3000000 + i) + ' ₽</div><div>80 000 км</div>';
+    document.getElementById('list').appendChild(d);
+  }
+}, 700);
+</script>
+"""
+
+
+def test_delayed_react_render_collects_all_twenty_in_real_browser(chromium_page, parser):
+    chromium_page.set_content(DELAYED_HTML)
+    assert chromium_page.locator(drom_module.CARD_SELECTOR).count() == 1  # как SSR
+    parser._wait_full_list(chromium_page)
+    ads = parser._parse_listings_from_page(chromium_page, SPEC)
+    assert len(ads) == 20
+
+
+def test_without_wait_delayed_page_gives_one_card_in_real_browser(chromium_page, parser):
+    """Контрольный: без ожидания видна одна карточка (то, что было в смоуке)."""
+    chromium_page.set_content(DELAYED_HTML)
+    assert len(parser._parse_listings_from_page(chromium_page, SPEC)) == 1
+    chromium_page.wait_for_timeout(1_000)  # не оставляем таймер для следующих тестов
