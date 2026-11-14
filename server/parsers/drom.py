@@ -14,14 +14,13 @@
 **НЕ ПРОВЕРЕНО В СЕТИ, реализовано по гипотезе** (из среды разработки drom.ru
 недоступен); подтвердит или опровергнет смоук-тест на Windows.
 
-* **URL:** ``https://www.drom.ru/catalog/{марка}/{модель}/?year_from=..&year_to=..&page=N``
-  — шаблон из промпта 3.8 (:data:`URL_TEMPLATE`). Региона в URL нет. Параметры
-  коробки, топлива и объёма двигателя **не передаются** (имена параметров
-  неизвестны; фильтрация — на стороне Client).
-  *Риск:* путь ``/catalog/`` у drom.ru, возможно, ведёт в каталог моделей, а не
-  в выдачу объявлений (выдача обычно живёт на ``auto.drom.ru``). Если смоук
-  покажет ``no_listings_selector`` или 0 карточек — сначала менять
-  :data:`URL_TEMPLATE` и :data:`QUERY_PARAMS`.
+* **URL:** ``https://auto.drom.ru/{регион}/{марка}/{модель}/?min_year=..&max_year=..&page=N``
+  (:data:`URL_TEMPLATE`, :data:`QUERY_PARAMS`). Регион — ``spec.region``, по
+  умолчанию ``all`` (вся Россия). Путь ``/catalog/`` из первой версии вёл в
+  каталог моделей — смоук 3.8 вернул ``no_listings_selector``. Имена параметров
+  года и формат пагинации **не проверены**: если фильтр по году не
+  применяется или страницы не листаются, менять :data:`QUERY_PARAMS`. Параметры
+  коробки, топлива и объёма **не передаются** (фильтрация — на стороне Client).
 * **Выдача:** маркеры ``data-ftid`` (стабильнее CSS-классов): карточка —
   ``[data-ftid="bulls-list_bull"]``, ссылка на объявление —
   ``a[data-ftid="bull_title"]`` (:data:`LISTINGS_SELECTOR`). Основной способ —
@@ -71,10 +70,14 @@ except ImportError:  # pragma: no cover - зависит от окружения
 logger = logging.getLogger("aprice.server.parsers.drom")
 
 BASE_URL = "https://www.drom.ru"
+#: Выдача объявлений живёт на поддомене ``auto.drom.ru`` (``/catalog/`` — каталог моделей).
+AUTO_URL = "https://auto.drom.ru"
 #: Путь выдачи (не подтверждён, см. docstring модуля).
-URL_TEMPLATE = BASE_URL + "/catalog/{brand}/{model}/"
-#: Имена параметров года и страницы в query.
-QUERY_PARAMS = {"year_from": "year_from", "year_to": "year_to", "page": "page"}
+URL_TEMPLATE = AUTO_URL + "/{region}/{brand}/{model}/"
+#: Регион по умолчанию: ``all`` — вся Россия.
+DEFAULT_REGION = "all"
+#: Имена параметров года и страницы в query (по промпту 3.8-fix, не проверены).
+QUERY_PARAMS = {"year_from": "min_year", "year_to": "max_year", "page": "page"}
 
 GOTO_TIMEOUT_MS = 30_000
 LISTINGS_TIMEOUT_MS = 10_000
@@ -283,10 +286,11 @@ class DromParser(BaseSiteParser):
     # URL
     # ------------------------------------------------------------------
     def _build_url(self, spec: dict, page: int) -> str:
-        """Строит URL выдачи (без региона и без фильтров коробки/топлива/объёма).
+        """Строит URL выдачи (без фильтров коробки/топлива/объёма).
 
         Args:
-            spec: спецификация (``manufacturer``, ``model``, ``year_from``,
+            spec: спецификация (``region`` — slug региона, по умолчанию
+                ``all``; ``manufacturer``, ``model``, ``year_from``,
                 ``year_to``; необязательные ``manufacturer_slug`` /
                 ``model_slug`` переопределяют slug).
             page: номер страницы, с 1.
@@ -294,6 +298,7 @@ class DromParser(BaseSiteParser):
         Returns:
             str: готовый URL.
         """
+        region = _slug(str(spec.get("region") or DEFAULT_REGION))
         brand = spec.get("manufacturer_slug") or _slug(str(spec.get("manufacturer", "")))
         model = spec.get("model_slug") or _slug(str(spec.get("model", "")))
         params: list[tuple[str, Any]] = []
@@ -302,7 +307,7 @@ class DromParser(BaseSiteParser):
         if spec.get("year_to"):
             params.append((QUERY_PARAMS["year_to"], spec["year_to"]))
         params.append((QUERY_PARAMS["page"], page))
-        return URL_TEMPLATE.format(brand=brand, model=model) + "?" + urlencode(params)
+        return URL_TEMPLATE.format(region=region, brand=brand, model=model) + "?" + urlencode(params)
 
     # ------------------------------------------------------------------
     # Диагностика

@@ -39,7 +39,7 @@ CARDS = [
     {"href": "https://spb.drom.ru/bmw/x5/222.html", "text": CARD_2},
 ]
 LISTING_HTML = '<html><div data-ftid="bulls-list_bull">…</div></html>'
-LISTING_URL = "https://www.drom.ru/catalog/bmw/x5/?year_from=2018&page=1"
+LISTING_URL = "https://auto.drom.ru/all/bmw/x5/?min_year=2018&page=1"
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +83,7 @@ def make_browser_mock(
 # ----------------------------------------------------------------------
 def test_build_url_exact(parser):
     assert parser._build_url(SPEC, 1) == (
-        "https://www.drom.ru/catalog/bmw/x5/?year_from=2018&year_to=2021&page=1"
+        "https://auto.drom.ru/all/bmw/x5/?min_year=2018&max_year=2021&page=1"
     )
 
 
@@ -91,16 +91,30 @@ def test_build_url_slug_override_and_page(parser):
     spec = dict(SPEC, manufacturer_slug="land_rover", model_slug="range-rover")
     url = parser._build_url(spec, 4)
     parsed = urlparse(url)
-    assert parsed.path == "/catalog/land_rover/range-rover/"
+    assert parsed.path == "/all/land_rover/range-rover/"
     assert parse_qs(parsed.query)["page"] == ["4"]
 
 
-def test_build_url_has_no_region_or_unverified_filters(parser):
-    spec = dict(SPEC, region="moskva", transmissions=["АКПП"], fuels=["Бензин"],
-                engine_volume_from=2.0)
-    url = parser._build_url(spec, 1)
-    assert "moskva" not in url
-    assert set(parse_qs(urlparse(url).query)) == {"year_from", "year_to", "page"}
+def test_build_url_uses_spec_region(parser):
+    url = parser._build_url(dict(SPEC, region="moskva"), 2)
+    parsed = urlparse(url)
+    assert parsed.netloc == "auto.drom.ru" and parsed.path == "/moskva/bmw/x5/"
+
+
+def test_build_url_empty_region_falls_back_to_all(parser):
+    assert urlparse(parser._build_url(dict(SPEC, region=""), 1)).path == "/all/bmw/x5/"
+
+
+def test_build_url_has_no_unverified_filters(parser):
+    spec = dict(SPEC, transmissions=["АКПП"], fuels=["Бензин"], engine_volume_from=2.0)
+    query = parse_qs(urlparse(parser._build_url(spec, 1)).query)
+    assert set(query) == {"min_year", "max_year", "page"}
+    assert query["min_year"] == ["2018"] and query["max_year"] == ["2021"]
+
+
+def test_build_url_without_years(parser):
+    spec = {"manufacturer": "BMW", "model": "X5"}
+    assert parser._build_url(spec, 1) == "https://auto.drom.ru/all/bmw/x5/?page=1"
 
 
 # ----------------------------------------------------------------------
