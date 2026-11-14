@@ -39,44 +39,23 @@ SPEC = {
 }
 
 
-def offer(offer_id: str, price: int, year: int, mileage: int = 50_000) -> dict:
-    """JSON-объявление в структуре auto.ru (по публичным примерам)."""
-    return {
-        "id": offer_id,
-        "price_info": {"RUR": price, "currency": "RUR"},
-        "documents": {"year": year},
-        "state": {"mileage": mileage},
-        "vehicle_info": {
-            "mark_info": {"name": "BMW", "code": "BMW"},
-            "model_info": {"name": "X5", "code": "X5"},
-            "tech_param": {
-                "transmission": "AUTOMATIC",
-                "engine_type": "GASOLINE",
-                "displacement": 2998,
-            },
-        },
-    }
+CARD_1 = (
+    "BMW X5 III (F15) Рестайлинг\n7 700 000 ₽\n3.0 л / 249 л.с. / Дизель\n"
+    "Автоматическая\n2019\n81 000 км\nМосква"
+)
+CARD_2 = "BMW X5 xDrive30d\n6 450 000 ₽\n3.0 л / 249 л.с. / Бензин\nАКПП\n2018\n120 500 км"
 
 
-def next_data_html(*offers: dict) -> str:
-    data = {"props": {"pageProps": {"listing": {"offers": list(offers)}}}}
-    return (
-        '<html><body><script id="__NEXT_DATA__" type="application/json">'
-        f"{json.dumps(data, ensure_ascii=False)}</script></body></html>"
-    )
+def card(href: str | None, text: str) -> dict:
+    """Карточка в виде, который отдаёт ``Locator.evaluate_all`` (href + текст)."""
+    return {"href": href, "text": text}
 
 
-DOM_HTML = """
-<html><body>
-<div class="ListingItem"><a class="ListingItemTitle__link" href="/cars/used/sale/bmw/x5/1-aa/">BMW X5</a>
-<div class="ListingItem__price">3 250 000 ₽</div><div class="ListingItem__year">2019</div>
-<div class="ListingItem__kmAge">45 000 км</div>
-<div class="ListingItemTechSummaryDesktop__cell">3.0 л / 249 л.с. / Дизель</div>
-<div class="ListingItemTechSummaryDesktop__cell">Автомат</div></div>
-<div class="ListingItem"><a class="ListingItemTitle__link" href="/cars/used/sale/bmw/x5/2-bb/">BMW X5</a>
-<div class="ListingItem__price">2 900 000 ₽</div><div class="ListingItem__year">2018</div></div>
-</body></html>
-"""
+CARDS = [
+    card("https://auto.ru/cars/used/sale/bmw/x5/1-aa/", CARD_1),
+    card("https://auto.ru/cars/used/sale/bmw/x5/2-bb/", CARD_2),
+]
+LISTING_HTML = "<html><div class='ListingCars__items'><div>…</div></div></html>"
 
 
 @pytest.fixture(autouse=True)
@@ -98,9 +77,11 @@ def make_browser_mock(
     page_url: str = "https://auto.ru/cars/bmw/x5/all/",
     status: int = 200,
     response_none: bool = False,
+    cards: list | None = None,
 ):
     """Подменяет ``PlaywrightBrowser`` в autoru; возвращает (patcher, класс, страница)."""
     tab = MagicMock()
+    tab.locator.return_value.evaluate_all.return_value = cards if cards is not None else []
     tab.url = page_url
     tab.content.return_value = html
     response = None if response_none else MagicMock(status=status, url=page_url)
@@ -164,46 +145,96 @@ def test_build_url_skips_unknown_filters(parser):
 # ----------------------------------------------------------------------
 # fetch_page
 # ----------------------------------------------------------------------
-def test_fetch_page_parses_next_data(parser):
-    html = next_data_html(offer("100-abc", 3_500_000, 2019), offer("101-def", 2_800_000, 2018, 90_000))
-    patcher, _, tab = make_browser_mock(html)
+def test_fetch_page_parses_dom_cards(parser):
+    patcher, _, tab = make_browser_mock(LISTING_HTML, cards=CARDS)
     with patcher:
         ads = parser.fetch_page(SPEC, {}, 1, threading.Event())
     assert len(ads) == 2 and all(isinstance(a, Ad) for a in ads)
     first = ads[0]
-    assert first.url == "https://auto.ru/cars/used/sale/bmw/x5/100-abc/"
-    assert (first.price, first.year, first.mileage) == (3_500_000, 2019, 50_000)
+    assert first.url == "https://auto.ru/cars/used/sale/bmw/x5/1-aa/"
+    assert (first.price, first.year, first.mileage) == (7_700_000, 2019, 81_000)
     assert (first.manufacturer, first.model) == ("BMW", "X5")
-    assert (first.transmission, first.fuel, first.engine_volume) == ("АКПП", "Бензин", 3.0)
-    assert first.raw_json["id"] == "100-abc"
-    tab.goto.assert_called_once()
+    assert (first.transmission, first.fuel, first.engine_volume) == ("АКПП", "Дизель", 3.0)
+    assert first.raw_json["text"] == CARD_1
+    assert (ads[1].price, ads[1].year, ads[1].mileage) == (6_450_000, 2018, 120_500)
+    assert (ads[1].transmission, ads[1].fuel) == ("АКПП", "Бензин")
+    tab.locator.assert_called_once_with("div.ListingCars__items > div")
     assert tab.goto.call_args.kwargs["wait_until"] == "commit"
     assert tab.goto.call_args.kwargs["timeout"] == 30_000
 
 
-def test_fetch_page_dedups_and_tolerates_missing_fields(parser):
-    sparse = {"id": "200-x", "price_info": {}}
-    html = next_data_html(offer("100-abc", 1_000_000, 2020), offer("100-abc", 1_000_000, 2020), sparse)
-    patcher, _, _ = make_browser_mock(html)
+def test_wait_for_listings_selector(parser):
+    patcher, _, tab = make_browser_mock(LISTING_HTML, cards=CARDS)
     with patcher:
-        ads = parser.fetch_page(SPEC, {}, 1, threading.Event())
-    assert len(ads) == 2
-    bare = [a for a in ads if "200-x" in a.url][0]
-    assert bare.price is None and bare.year is None and bare.mileage is None
-    assert bare.engine_volume is None
+        parser.fetch_page(SPEC, {}, 1, threading.Event())
+    tab.wait_for_selector.assert_called_once_with(
+        "div.ListingCars__items > div", state="attached", timeout=10_000
+    )
 
 
-def test_fetch_page_dom_fallback(parser):
-    patcher, _, _ = make_browser_mock(DOM_HTML)
+def test_parse_listings_empty(parser):
+    """Карточек нет -> [] без ошибки (с предупреждением и дампом)."""
+    patcher, _, _ = make_browser_mock(LISTING_HTML, cards=[])
     with patcher:
-        ads = parser.fetch_page(SPEC, {}, 1, threading.Event())
-    assert [a.url for a in ads] == [
-        "https://auto.ru/cars/used/sale/bmw/x5/1-aa/",
-        "https://auto.ru/cars/used/sale/bmw/x5/2-bb/",
+        assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
+
+
+def test_parse_listings_dedups_and_skips_non_listing_cards(parser):
+    cards = [
+        CARDS[0],
+        CARDS[0],  # дубль по url
+        card(None, "Реклама банка 7 700 000 ₽"),  # нет ссылки
+        card("https://auto.ru/banner/", "Скидки и акции"),  # нет цены/года/пробега
     ]
-    assert (ads[0].price, ads[0].year, ads[0].mileage) == (3_250_000, 2019, 45_000)
-    assert (ads[0].engine_volume, ads[0].fuel, ads[0].transmission) == (3.0, "Дизель", "АКПП")
-    assert ads[1].mileage is None and ads[1].fuel is None
+    patcher, _, _ = make_browser_mock(LISTING_HTML, cards=cards)
+    with patcher:
+        ads = parser.fetch_page(SPEC, {}, 1, threading.Event())
+    assert [a.url for a in ads] == [CARDS[0]["href"]]
+
+
+def test_card_fields_missing_are_none_and_relative_href(parser):
+    ad = parser._card_to_ad("/cars/used/sale/bmw/x5/3-cc/", "BMW X5\n5 100 000 ₽", SPEC)
+    assert ad.url == "https://auto.ru/cars/used/sale/bmw/x5/3-cc/"
+    assert ad.price == 5_100_000
+    assert ad.year is None and ad.mileage is None and ad.engine_volume is None
+    assert ad.transmission is None and ad.fuel is None
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("7 700 000 ₽", 7_700_000),
+    ("от 7\u00a0700\u00a0000\u00a0₽", 7_700_000),
+    ("2019\n7 700 000 ₽", 7_700_000),  # год перед ценой не «слипается»
+    ("2 450 000₽", 2_450_000),
+    ("без цены", None),
+])
+def test_regex_price(text, expected):
+    assert AutoRuParser._extract_price(text) == expected
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("81 000 км", 81_000),
+    ("2019 · 81 000 км", 81_000),
+    ("120\u00a0500 км", 120_500),
+    ("2018\n120 500 км", 120_500),  # год на предыдущей строке не «слипается»
+    ("2018 120 500 км", 120_500),  # группы тысяч не начинаются посреди числа
+    ("500 км", 500),
+    ("нет данных", None),
+])
+def test_regex_mileage(text, expected):
+    assert AutoRuParser._extract_mileage(text) == expected
+
+
+def test_regex_year_and_volume_and_labels():
+    assert AutoRuParser._extract_year("BMW X5, 2019, 81 000 км") == 2019
+    assert AutoRuParser._extract_year("Toyota Camry 1998, 250 000 км") == 1998
+    assert AutoRuParser._extract_year("7 700 000 ₽") is None
+    assert AutoRuParser._extract_volume("2.0 л / 249 л.с.") == 2.0
+    assert AutoRuParser._extract_volume("3,5 л") == 3.5
+    assert AutoRuParser._extract_volume("249 л.с.") is None
+    find = AutoRuParser._find_label
+    assert find("Механика", autoru_module.TRANSMISSION_DOM_LABELS) == "МКПП"
+    assert find("Вариатор", autoru_module.TRANSMISSION_DOM_LABELS) == "Вариатор"
+    assert find("Электро", autoru_module.FUEL_DOM_LABELS) == "Электро"
 
 
 def test_fetch_page_captcha_by_url(parser):
@@ -270,25 +301,25 @@ def test_fetch_page_timeout_no_captcha(parser):
 def test_fetch_page_selector_timeout_blocked(parser):
     """FX-04: выдачи нет, капчи и «ничего не найдено» нет -> no_listings_selector."""
     patcher, _, tab = make_browser_mock("<html><body>заглушка</body></html>")
-    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 5000ms")
+    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 10000ms")
     with patcher, pytest.raises(BlockedError) as exc:
         parser.fetch_page(SPEC, {}, 1, threading.Event())
     assert exc.value.detail == "no_listings_selector"
     kwargs = tab.wait_for_selector.call_args.kwargs
-    assert kwargs["timeout"] == 5_000 and kwargs["state"] == "attached"
-    assert 'div[class*="ListingItem"]' in tab.wait_for_selector.call_args.args[0]
+    assert kwargs["timeout"] == 10_000 and kwargs["state"] == "attached"
+    assert tab.wait_for_selector.call_args.args[0] == "div.ListingCars__items > div"
 
 
 def test_fetch_page_selector_timeout_but_captcha_html(parser):
     patcher, _, tab = make_browser_mock('<html><div id="smartcaptcha"></div></html>')
-    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 5000ms")
+    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 10000ms")
     with patcher, pytest.raises(CaptchaDetectedError):
         parser.fetch_page(SPEC, {}, 1, threading.Event())
 
 
 def test_fetch_page_selector_timeout_empty_results(parser):
     patcher, _, tab = make_browser_mock("<html>Объявления не найдены</html>")
-    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 5000ms")
+    tab.wait_for_selector.side_effect = PlaywrightTimeoutError("Timeout 10000ms")
     with patcher:
         assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
 
@@ -309,15 +340,15 @@ def test_fetch_page_non_timeout_goto_error_propagates(parser):
 
 def test_fetch_page_empty_results(parser):
     # На пустой выдаче сайт может показывать рекомендации — они не результат.
-    html = "<html><h1>Ничего не найдено</h1>" + DOM_HTML + "</html>"
-    patcher, _, _ = make_browser_mock(html)
+    html = "<html><h1>Ничего не найдено</h1>" + LISTING_HTML + "</html>"
+    patcher, _, _ = make_browser_mock(html, cards=CARDS)
     with patcher:
         assert parser.fetch_page(SPEC, {}, 1, threading.Event()) == []
 
 
 def test_fetch_page_zero_ads_dumps_html_and_warns(parser, debug_dir, caplog):
     """Парсинг дал 0 объявлений -> предупреждение и дамп HTML для анализа."""
-    html = "<html><body><script>window.__NEXT_DATA__ = {}</script>пусто</body></html>"
+    html = "<html><body><script>window.x = {}</script>пусто</body></html>"
     patcher, _, _ = make_browser_mock(html)
     with patcher, caplog.at_level("INFO", logger="aprice.server.parsers.autoru"):
         assert parser.fetch_page(SPEC, {}, 2, threading.Event()) == []
@@ -329,7 +360,7 @@ def test_fetch_page_zero_ads_dumps_html_and_warns(parser, debug_dir, caplog):
 
 
 def test_fetch_page_with_ads_writes_no_dump(parser, debug_dir):
-    patcher, _, _ = make_browser_mock(next_data_html(offer("1-a", 1, 2020)))
+    patcher, _, _ = make_browser_mock(LISTING_HTML, cards=CARDS[:1])
     with patcher:
         assert len(parser.fetch_page(SPEC, {}, 1, threading.Event())) == 1
     assert not debug_dir.exists()
@@ -360,7 +391,7 @@ def test_stop_before_start_makes_no_browser(parser):
 
 def test_stop_after_goto_returns_empty(parser):
     stop = threading.Event()
-    patcher, _, tab = make_browser_mock(next_data_html(offer("1-a", 1, 2020)))
+    patcher, _, tab = make_browser_mock(LISTING_HTML, cards=CARDS)
     tab.goto.side_effect = lambda *a, **k: (stop.set(), MagicMock(status=200, url=tab.url))[1]
     with patcher:
         assert parser.fetch_page(SPEC, {}, 1, stop) == []
@@ -371,7 +402,7 @@ def test_parser_reads_browser_settings_from_config(tmp_path):
     config.set("server", "playwright_headless", False)
     config.set("server", "ignore_https_errors", False)
     parser = AutoRuParser(config)
-    patcher, cls, _ = make_browser_mock(next_data_html())
+    patcher, cls, _ = make_browser_mock(LISTING_HTML, cards=CARDS)
     with patcher:
         parser.fetch_page(SPEC, {}, 1, threading.Event())
     cls.assert_called_once_with(headless=False, ignore_https_errors=False)
