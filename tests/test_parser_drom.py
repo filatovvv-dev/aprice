@@ -137,7 +137,7 @@ def test_fetch_page_success(parser):
     kwargs = tab.goto.call_args.kwargs
     assert kwargs["wait_until"] == "commit" and kwargs["timeout"] == 30_000
     tab.wait_for_selector.assert_called_once_with(
-        '[data-ftid="bulls-list_bull"], a[data-ftid="bull_title"]',
+        '[data-ftid="bulls-list_bull"], [data-ftid="bull_title"]',
         state="attached", timeout=10_000,
     )
 
@@ -306,13 +306,13 @@ def test_parse_listings_dom_two_cards(parser):
     tab.locator.return_value.evaluate_all.return_value = CARDS
     ads = parser._parse_listings_from_page(tab, SPEC)
     assert [a.price for a in ads] == [4_190_000, 3_850_000]
-    tab.locator.assert_called_once_with('a[data-ftid="bull_title"]')
+    tab.locator.assert_called_once_with('[data-ftid="bull_title"]')
 
 
 def test_parse_listings_falls_back_to_card_containers(parser):
     tab = MagicMock()
     results = {
-        'a[data-ftid="bull_title"]': [],
+        '[data-ftid="bull_title"]': [],
         '[data-ftid="bulls-list_bull"]': CARDS[:1],
     }
     tab.locator.side_effect = lambda sel: MagicMock(
@@ -400,3 +400,52 @@ def test_collect_real_mode_stops_on_empty_page_and_respects_limits(parser):
 
 def test_close_is_noop(parser):
     assert parser.close() is None
+
+
+# ----------------------------------------------------------------------
+# JS-сценарии в настоящем Chromium (офлайн: set_content, без сети)
+# ----------------------------------------------------------------------
+BROWSER_HTML = """
+<div data-ftid="bulls-list_bull"><div><a data-ftid="bull_title" href="/bmw/x5/1.html">BMW X5, 2019</a></div>
+<div>4 190 000 ₽</div><div>160 661 км</div></div>
+<div class="wrap"><div class="inner"><span data-ftid="bull_title"><a href="https://spb.drom.ru/bmw/x5/2.html">BMW X5, 2018</a></span>
+<div>3 850 000 ₽</div></div></div>
+"""
+
+
+@pytest.fixture(scope="module")
+def chromium_page():
+    """Настоящая страница Chromium; нет браузера -> тесты пропускаются."""
+    from playwright.sync_api import sync_playwright
+
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch()
+    except Exception as exc:  # noqa: BLE001 - браузер может быть не установлен
+        pytest.skip(f"Chromium недоступен: {exc}")
+    page = browser.new_page()
+    page.set_content(BROWSER_HTML)
+    yield page
+    browser.close()
+    pw.stop()
+
+
+def test_titles_script_in_real_browser(chromium_page):
+    """Заголовок-ссылка и заголовок-обёртка: href и текст всей карточки."""
+    result = chromium_page.locator(drom_module.TITLE_SELECTOR).evaluate_all(
+        drom_module.TITLES_SCRIPT
+    )
+    assert len(result) == 2
+    assert result[0]["href"].endswith("/bmw/x5/1.html")
+    assert result[1]["href"] == "https://spb.drom.ru/bmw/x5/2.html"
+    assert "4 190 000 ₽" in result[0]["text"] and "160 661 км" in result[0]["text"]
+    assert "3 850 000 ₽" in result[1]["text"]
+    assert "4 190 000" not in result[1]["text"]  # предок не «захватил» соседнюю карточку
+
+
+def test_cards_script_in_real_browser(chromium_page):
+    result = chromium_page.locator(drom_module.CARD_SELECTOR).evaluate_all(
+        drom_module.CARDS_SCRIPT
+    )
+    assert len(result) == 1 and result[0]["href"].endswith("/bmw/x5/1.html")
+    assert "160 661 км" in result[0]["text"]
