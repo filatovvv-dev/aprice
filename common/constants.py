@@ -103,7 +103,8 @@ DEFAULT_SERVER_ADS_PER_SITE: int = 500
 # ---------------------------------------------------------------------------
 # Server: площадки (подготовка к задаче №3)
 # ---------------------------------------------------------------------------
-SITES: list[str] = ["auto.ru", "drom.ru", "avito.ru", "sberauto.com", "bibika.ru"]
+# bibika.ru и sberauto.com отключены по решению Заказчика: активные площадки — три.
+SITES: list[str] = ["auto.ru", "drom.ru", "avito.ru"]
 SITE_SBERAUTO_DISABLED_BY_DEFAULT: bool = True
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,8 @@ DEFAULT_SETTINGS: dict = {
         "ignore_https_errors": True,
         # Chromium без окна; false — видимое окно (отладка CAPTCHA).
         "playwright_headless": True,
+        # Площадки по умолчанию, если в options.sites ничего не передано.
+        "default_sites": list(SITES),
     },
     "logging": {
         "level": "INFO",

@@ -1,7 +1,7 @@
 """Общая обёртка над Playwright Chromium для парсеров APrice-Server (3.7).
 
 :class:`PlaywrightBrowser` собирает в одном месте настройки, общие для всех
-реальных парсеров (auto.ru, drom.ru, avito.ru, bibika.ru):
+реальных парсеров (auto.ru, drom.ru, avito.ru):
 
 * BR-01 — Chromium, режим ``headless`` из ``server.playwright_headless``;
 * BR-02 — ``ignore_https_errors`` из ``server.ignore_https_errors``

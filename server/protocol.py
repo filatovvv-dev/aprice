@@ -26,12 +26,15 @@ VALID_MODES: tuple[str, ...] = ("exact", "range")
 
 #: Площадки, допустимые в ``options.sites`` (константы — из common.constants.SITES,
 #: здесь продублированы как часть контракта без зависимости от путей проекта).
+#: ``sberauto.com`` и ``bibika.ru`` отключены решением Заказчика: в запросе они
+#: принимаются (старые клиенты и сохранённые задания не ломаются), но парсера нет —
+#: площадка получает ошибку ``unsupported``, остальные площадки собираются.
 ALLOWED_SITES: frozenset[str] = frozenset(
     {"auto.ru", "drom.ru", "avito.ru", "sberauto.com", "bibika.ru"}
 )
 
-#: Площадки по умолчанию (sberauto.com выключен по умолчанию — S-15).
-DEFAULT_SITES: tuple[str, ...] = ("auto.ru", "drom.ru", "avito.ru", "bibika.ru")
+#: Площадки по умолчанию (совпадает с ``common.constants.SITES``).
+DEFAULT_SITES: tuple[str, ...] = ("auto.ru", "drom.ru", "avito.ru")
 
 #: Значения ``StatusMsg.state`` (FSM задания — TaskManager, подзадача 3.4).
 TASK_STATES: frozenset[str] = frozenset(
@@ -406,7 +409,7 @@ def validate_options(options: Any) -> dict:
 
     sites = options.get("sites")
     if sites is None:
-        # По умолчанию — все площадки, кроме sberauto.com (S-15).
+        # По умолчанию — активные площадки (без отключённых sberauto.com и bibika.ru).
         sites = list(DEFAULT_SITES)
     if not isinstance(sites, list) or not all(
         isinstance(site, str) and site in ALLOWED_SITES for site in sites
