@@ -250,6 +250,9 @@ def test_options_defaults_and_sites_validation() -> None:
     assert normalized["max_ads_per_site"] == 500
     assert normalized["max_pages_per_site"] == 10
     assert "sberauto.com" not in normalized["sites"]  # S-15
+    # по умолчанию — три активные площадки; bibika.ru и sberauto.com отключены
+    assert normalized["sites"] == ["auto.ru", "drom.ru", "avito.ru"]
+    assert "bibika.ru" not in normalized["sites"]
     assert validate_options({"sites": []})["sites"] == []  # пустой = любые
     with pytest.raises(InvalidMessageError, match="invalid_field"):
         validate_options({"sites": ["ya.ru"]})
