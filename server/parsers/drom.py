@@ -96,12 +96,18 @@ DEBUG_DIR: Path = constants.DATA_DIR / "debug"
 #: Контейнер объявления и заголовок со ссылкой (атрибуты ``data-ftid``).
 CARD_SELECTOR = '[data-ftid="bulls-list_bull"]'
 TITLE_SELECTOR = '[data-ftid="bull_title"]'
-#: Все ссылки, которые могут вести на объявление (заголовок или ``*.html``).
-LINKS_SELECTOR = f'{TITLE_SELECTOR}, a[href*=".html"]'
+#: Ссылки на объявления — только с маркером ``data-ftid`` (общий ``a[href*=".html"]``
+#: собирал рекламу и навигацию).
+LINKS_SELECTOR = TITLE_SELECTOR
 #: Признак готовности выдачи: карточка или заголовок объявления.
 LISTINGS_SELECTOR = f"{CARD_SELECTOR}, {TITLE_SELECTOR}"
-#: Ссылка на объявление: ``.../1234567890.html``; навигационные ``*.html`` отсекаются.
-LISTING_HREF_RE = re.compile(r"/\d{5,}\.html(?:[?#]|$)")
+#: Ссылка на объявление: путь ``.../476945704.html``; каталожные и рекламные ссылки
+#: (``/cars/0-123``, ``/about.html``) отсекаются.
+LISTING_PATH_RE = re.compile(r"/\d+\.html(?:[?#]|$)")
+#: Хост drom.ru или его поддомен (``auto.``, ``www.``, региональные ``moscow.``...).
+DROM_HOST_RE = re.compile(r"^https?://(?:[a-z0-9-]+\.)*drom\.ru(?:[:/?#]|$)", re.IGNORECASE)
+#: Подозрительно дешёвая выдача: средняя цена ниже (при >5 объявлений) — дамп HTML.
+SUSPICIOUS_AVG_PRICE = 1_000_000
 #: Меньше стольких объявлений на странице — аномалия: HTML сохраняется для разбора.
 INCOMPLETE_THRESHOLD = 5
 
@@ -125,7 +131,7 @@ CARDS_SCRIPT = (
     " || e.querySelector('a[href*=\".html\"]') || e.querySelector('a');"
     " return {source: 'card', href: (l && l.href) || null, text: tx(e)}; }); }"
 )
-#: JS для ``evaluate_all`` по ссылкам: ``href``, признак заголовка (``marked``) и текст
+#: JS для ``evaluate_all`` по ссылкам-заголовкам: ``href`` и текст
 #: ближайшего предка, в котором уже есть цена (иначе — до 5 уровней вверх).
 LINKS_SCRIPT = (
     "els => { " + _JS_TEXT +
@@ -135,8 +141,7 @@ LINKS_SCRIPT = (
     "  for (let i = 0; i < 5 && c.parentElement && !/₽|руб/.test(tx(c)); i++)"
     "   c = c.parentElement; }"
     " const l = a.matches('a') ? a : (a.closest('a') || a.querySelector('a'));"
-    " const marked = !!a.closest('[data-ftid=\"bull_title\"]');"
-    " return {source: 'link', marked: marked, href: (l && l.href) || null, text: tx(c)}; }); }"
+    " return {source: 'link', href: (l && l.href) || null, text: tx(c)}; }); }"
 )
 
 #: Число с группами тысяч по 3 цифры: соседнее число (год) не «слипается» с суммой.
@@ -269,6 +274,16 @@ class DromParser(BaseSiteParser):
                 len(ads), current_url,
             )
             self._save_debug_html(html, f"drom_page_{page}_incomplete.html")
+        else:
+            prices = [a.price for a in ads if a.price]
+            if len(ads) > INCOMPLETE_THRESHOLD and prices and (
+                sum(prices) / len(prices) < SUSPICIOUS_AVG_PRICE
+            ):
+                logger.warning(
+                    "[drom.ru] подозрительно низкая средняя цена %.0f ₽ (url=%s) — сохраняю HTML",
+                    sum(prices) / len(prices), current_url,
+                )
+                self._save_debug_html(html, f"drom_page_{page}_suspicious.html")
         return ads
 
     def collect(
@@ -411,13 +426,12 @@ class DromParser(BaseSiteParser):
         """Извлекает **все** объявления страницы через ``Locator.evaluate_all``.
 
         Два источника объединяются (дубли по ``url`` отбрасываются, контейнеры
-        приоритетнее): контейнеры ``bulls-list_bull`` и ссылки
-        (``bull_title`` / ``*.html``). Раньше ссылки по ``bull_title`` имели
-        приоритет, и если маркер встречался у одной карточки из двадцати,
-        остальные не собирались. Ссылки без маркера принимаются, только если
-        похожи на объявление (``/<цифры>.html``). Карточки без ссылки и без
-        цены, года и пробега (реклама) пропускаются; карточка с ``url`` и
-        ``price`` сохраняется, даже если года или пробега нет.
+        приоритетнее): контейнеры ``bulls-list_bull`` и ссылки ``bull_title``.
+        Общие ``a[href*=".html"]`` не используются. Принимаются только URL
+        ``*.drom.ru/.../<цифры>.html``; остальные отбрасываются (debug-лог).
+        Текст берётся из контейнера карточки. Карточки без цены, года и пробега
+        (реклама) пропускаются; карточка с ``url`` и ``price`` сохраняется, даже
+        если года или пробега нет.
 
         Args:
             tab: открытая страница Playwright.
@@ -432,12 +446,12 @@ class DromParser(BaseSiteParser):
         skipped = {"no_href": 0, "not_listing": 0, "no_fields": 0, "duplicate": 0}
         for card in [*containers, *links]:
             href = card.get("href")
-            if href and card.get("source") == "link" and not card.get("marked") \
-                    and not LISTING_HREF_RE.search(href):
-                skipped["not_listing"] += 1
-                continue
             if not href:
                 skipped["no_href"] += 1
+                continue
+            if not self._is_listing_url(self._absolute(href)):
+                skipped["not_listing"] += 1
+                logger.debug("[drom.ru] не объявление, пропущено: %s", href)
                 continue
             ad = self._card_to_ad(href, card.get("text") or "", spec)
             if ad is None:
@@ -465,7 +479,9 @@ class DromParser(BaseSiteParser):
         """
         if not href:
             return None
-        url = BASE_URL + href if href.startswith("/") else href
+        url = self._absolute(href)
+        if not self._is_listing_url(url):
+            return None
         price = self._extract_price(text)
         year = self._extract_year(text)
         mileage = self._extract_mileage(text)
@@ -483,6 +499,16 @@ class DromParser(BaseSiteParser):
             mileage=mileage,
             raw_json={"source": "drom.ru", "text": text},
         )
+
+    @staticmethod
+    def _absolute(href: str) -> str:
+        """Абсолютный URL: относительный ``href`` дополняется :data:`BASE_URL`."""
+        return BASE_URL + href if href.startswith("/") else href
+
+    @staticmethod
+    def _is_listing_url(url: str) -> bool:
+        """``True`` для ссылки на объявление: хост drom.ru и путь ``/<цифры>.html``."""
+        return bool(DROM_HOST_RE.match(url) and LISTING_PATH_RE.search(url))
 
     @staticmethod
     def _extract_price(text: str) -> Optional[int]:
