@@ -125,7 +125,9 @@ CARDS_SCRIPT = (
     " const pm = e.querySelector('meta[itemprop=\"price\"]');"
     " const price = (pm && pm.getAttribute('content'))"
     " || (pe && pe.getAttribute('content')) || null;"
-    " return {href: (l && l.href) || null, price: price, text: tx(e)}; }); }"
+    " const params = Array.from(e.querySelectorAll('[data-marker=\"item-specific-param\"]'))"
+    ".map(tx).filter(Boolean).join(', ');"
+    " return {href: (l && l.href) || null, price: price, text: tx(e), params: params}; }); }"
 )
 
 #: Число с группами тысяч по 3 цифры: соседнее число (год) не «слипается» с суммой.
@@ -434,7 +436,7 @@ class AvitoParser(BaseSiteParser):
         """
         cards = tab.locator(CARD_SELECTOR).evaluate_all(CARDS_SCRIPT) or []
         unique: dict[str, Ad] = {}
-        skipped = {"no_href": 0, "not_listing": 0, "no_fields": 0, "duplicate": 0}
+        skipped = {"no_href": 0, "not_listing": 0, "no_fields": 0, "out_of_range": 0, "duplicate": 0}
         for card in cards:
             href = card.get("href")
             if not href:
@@ -445,9 +447,14 @@ class AvitoParser(BaseSiteParser):
                 skipped["not_listing"] += 1
                 logger.debug("[avito.ru] не объявление, пропущено: %s", href)
                 continue
-            ad = self._card_to_ad(url, card.get("price"), card.get("text") or "", spec)
+            ad = self._card_to_ad(
+                url, card.get("price"), card.get("text") or "", spec, card.get("params") or ""
+            )
             if ad is None:
                 skipped["no_fields"] += 1
+            elif not self._year_in_range(ad.year, spec):
+                skipped["out_of_range"] += 1
+                logger.debug("[avito.ru] год %s вне диапазона, пропущено: %s", ad.year, url)
             elif ad.url in unique:
                 skipped["duplicate"] += 1
             else:
@@ -456,21 +463,32 @@ class AvitoParser(BaseSiteParser):
             "[avito.ru] карточек=%d, принято=%d, пропущено: %s",
             len(cards), len(unique), skipped,
         )
+        if skipped["out_of_range"] and not unique:
+            logger.warning(
+                "[avito.ru] все %d карточек вне диапазона лет %s–%s: площадка, "
+                "похоже, игнорирует фильтр minyear/maxyear",
+                skipped["out_of_range"], spec.get("year_from"), spec.get("year_to"),
+            )
         return list(unique.values())
 
     def _card_to_ad(
-        self, url: str, price_attr: Optional[str], text: str, spec: dict
+        self, url: str, price_attr: Optional[str], text: str, spec: dict, params: str = ""
     ) -> Optional[Ad]:
         """Собирает :class:`Ad` из ссылки, атрибута цены и текста карточки.
+
+        Год и пробег берутся **только из текста** карточки и строки параметров
+        (``item-specific-param``), но не из URL: номер года в slug ссылки
+        (``bmw_x5_2026_123``) не считается.
 
         Returns:
             Optional[Ad]: объявление или ``None``, если нет цены, года и пробега.
         """
+        facts = f"{text}\n{params}" if params else text
         price = self._price_from_attr(price_attr)
         if price is None:
             price = self._extract_price(text)
-        year = self._extract_year(text)
-        mileage = self._extract_mileage(text)
+        year = self._extract_year(facts)
+        mileage = self._extract_mileage(facts)
         if price is None and year is None and mileage is None:
             return None
         return Ad(
@@ -479,12 +497,30 @@ class AvitoParser(BaseSiteParser):
             year=year,
             manufacturer=spec.get("manufacturer"),
             model=spec.get("model"),
-            transmission=self._find_label(text, TRANSMISSION_LABELS),
-            fuel=self._find_label(text, FUEL_LABELS),
-            engine_volume=self._extract_volume(text),
+            transmission=self._find_label(facts, TRANSMISSION_LABELS),
+            fuel=self._find_label(facts, FUEL_LABELS),
+            engine_volume=self._extract_volume(facts),
             mileage=mileage,
             raw_json={"source": "avito.ru", "text": text},
         )
+
+    @staticmethod
+    def _year_in_range(year: Optional[int], spec: dict) -> bool:
+        """Страховка от игнорирования ``minyear``/``maxyear``: год в ``[year_from, year_to]``.
+
+        Год неизвестен (``None``) — карточка проходит; границы не заданы или не числа —
+        не ограничивают.
+        """
+        if year is None:
+            return True
+        for key, ok in (("year_from", lambda b: year >= b), ("year_to", lambda b: year <= b)):
+            try:
+                bound = int(spec.get(key))
+            except (TypeError, ValueError):
+                continue
+            if bound and not ok(bound):
+                return False
+        return True
 
     @staticmethod
     def _absolute(href: str) -> str:
