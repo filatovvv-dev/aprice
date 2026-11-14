@@ -454,7 +454,9 @@ class DromParser(BaseSiteParser):
         приоритетнее): контейнеры ``bulls-list_bull`` и ссылки ``bull_title``.
         Общие ``a[href*=".html"]`` не используются. Принимаются только URL
         ``*.drom.ru/.../<цифры>.html``; остальные отбрасываются (debug-лог).
-        Текст берётся из контейнера карточки. Карточки без цены, года и пробега
+        Текст берётся из контейнера карточки. Год вне ``[year_from, year_to]`` из
+        ``spec`` отбрасывается (страховка, если фильтр URL не сработал; год ``None``
+        проходит). Карточки без цены, года и пробега
         (реклама) пропускаются; карточка с ``url`` и ``price`` сохраняется, даже
         если года или пробега нет.
 
@@ -468,7 +470,7 @@ class DromParser(BaseSiteParser):
         containers = tab.locator(CARD_SELECTOR).evaluate_all(CARDS_SCRIPT) or []
         links = tab.locator(LINKS_SELECTOR).evaluate_all(LINKS_SCRIPT) or []
         unique: dict[str, Ad] = {}
-        skipped = {"no_href": 0, "not_listing": 0, "no_fields": 0, "duplicate": 0}
+        skipped = {"no_href": 0, "not_listing": 0, "no_fields": 0, "out_of_range": 0, "duplicate": 0}
         for card in [*containers, *links]:
             href = card.get("href")
             if not href:
@@ -481,6 +483,9 @@ class DromParser(BaseSiteParser):
             ad = self._card_to_ad(href, card.get("text") or "", spec)
             if ad is None:
                 skipped["no_fields"] += 1
+            elif not self._year_in_range(ad.year, spec):
+                skipped["out_of_range"] += 1
+                logger.debug("[drom.ru] год %s вне диапазона, пропущено: %s", ad.year, ad.url)
             elif ad.url in unique:
                 skipped["duplicate"] += 1
             else:
@@ -489,6 +494,8 @@ class DromParser(BaseSiteParser):
             "[drom.ru] контейнеров=%d, ссылок=%d, принято=%d, пропущено: %s",
             len(containers), len(links), len(unique), skipped,
         )
+        if skipped["out_of_range"] and not unique:
+            self._warn_all_out_of_range(skipped["out_of_range"], spec)
         return list(unique.values())
 
     def _card_to_ad(self, href: Optional[str], text: str, spec: dict) -> Optional[Ad]:

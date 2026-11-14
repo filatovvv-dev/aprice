@@ -343,7 +343,9 @@ class AutoRuParser(BaseSiteParser):
         Один вызов в браузер забирает у каждой карточки ``href`` первой ссылки
         и видимый текст; дальше разбор идёт регулярными выражениями
         (:meth:`_card_to_ad`). Карточки без ссылки и без цены, года и пробега
-        (баннеры, заглушки загрузки) пропускаются.
+        (баннеры, заглушки загрузки) пропускаются; год вне ``[year_from, year_to]`` из
+        ``spec`` отбрасывается (страховка от игнорирования фильтра URL; год ``None``
+        проходит).
 
         Args:
             tab: открытая страница Playwright.
@@ -354,10 +356,18 @@ class AutoRuParser(BaseSiteParser):
         """
         cards = tab.locator(CARDS_SELECTOR).evaluate_all(CARDS_SCRIPT) or []
         unique: dict[str, Ad] = {}
+        out_of_range = 0
         for card in cards:
             ad = self._card_to_ad(card.get("href"), card.get("text") or "", spec)
-            if ad is not None:
-                unique.setdefault(ad.url, ad)
+            if ad is None:
+                continue
+            if not self._year_in_range(ad.year, spec):
+                out_of_range += 1
+                logger.debug("[auto.ru] год %s вне диапазона, пропущено: %s", ad.year, ad.url)
+                continue
+            unique.setdefault(ad.url, ad)
+        if out_of_range and not unique:
+            self._warn_all_out_of_range(out_of_range, spec)
         return list(unique.values())
 
     def _card_to_ad(self, href: Optional[str], text: str, spec: dict) -> Optional[Ad]:

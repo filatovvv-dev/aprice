@@ -8,7 +8,7 @@
 * абстрактный базовый класс :class:`BaseSiteParser` с общим поведением
   пауз, прерывания по ``stop_event`` и вызова ``progress_cb``.
 
-Заглушки площадок (auto.ru / drom.ru / avito.ru / bibika.ru) эмулируют
+Заглушки площадок (auto.ru / drom.ru / avito.ru) эмулируют
 реальный сбор без сетевых запросов: паузы реализованы через
 ``stop_event.wait(timeout)``, поэтому остановка задания действует почти
 мгновенно (S-12).
@@ -253,6 +253,32 @@ class BaseSiteParser(ABC):
         паузы (в смоуках 3.8 оба эффекта в одном флаге вводили в заблуждение).
         """
         return bool(options.get("use_stub_data"))
+
+    @staticmethod
+    def _year_in_range(year: Optional[int], spec: dict) -> bool:
+        """Страховка от игнорирования площадкой фильтра лет: год в ``[year_from, year_to]``.
+
+        Год неизвестен (``None``) — карточка проходит; границы не заданы, нулевые или
+        не числа — не ограничивают. Границы включительные.
+        """
+        if year is None:
+            return True
+        for key, ok in (("year_from", lambda b: year >= b), ("year_to", lambda b: year <= b)):
+            try:
+                bound = int(spec.get(key))
+            except (TypeError, ValueError):
+                continue
+            if bound and not ok(bound):
+                return False
+        return True
+
+    def _warn_all_out_of_range(self, dropped: int, spec: dict) -> None:
+        """Предупреждение: все карточки страницы отброшены фильтром лет."""
+        logger.warning(
+            "[%s] все %d карточек вне диапазона лет %s–%s: площадка, похоже, "
+            "игнорирует фильтр по годам",
+            self.site_name, dropped, spec.get("year_from"), spec.get("year_to"),
+        )
 
     def _page_delays(self, options: dict) -> tuple[float, float]:
         """Возвращает диапазон паузы между страницами.
