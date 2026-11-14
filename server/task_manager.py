@@ -250,7 +250,8 @@ class TaskManager(QObject):
             spec: спецификация задания (валидируется по контракту).
             options: опции задания; помимо контрактных (``sites``,
                 ``max_ads_per_site``, ``max_pages_per_site``) допускаются
-                служебные ``test_fast_mode`` и ``test_delay``.
+                служебные ``test_fast_mode`` (только короткие паузы), ``test_delay``
+                и ``use_stub_data`` (заглушка вместо сети; для автотестов).
 
         Returns:
             str: идентификатор задания (UUID v4).

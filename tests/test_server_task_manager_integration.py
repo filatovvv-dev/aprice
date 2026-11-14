@@ -133,7 +133,7 @@ def fast(sites=None, pages=3, delay=(0.05, 0.05), **extra) -> dict:
     opts = {
         "sites": list(sites or THREE),
         "max_pages_per_site": pages,
-        "test_fast_mode": True,
+        "test_fast_mode": True, "use_stub_data": True,
         "test_delay": list(delay),
     }
     opts.update(extra)
@@ -362,7 +362,7 @@ def test_restore_without_snapshot_uses_ads_estimate(mgr, store):
     """Нет progress -> грубая оценка pages_done = ads // 50 (не с нуля)."""
     task_id = seed_task(store, "running", fast(sites=["auto.ru"], pages=5))
     ads = [AutoRuParser(Config()).fetch_page(
-        SPEC, {"test_fast_mode": True}, 1, threading.Event()
+        SPEC, {"test_fast_mode": True, "use_stub_data": True}, 1, threading.Event()
     )][0][:1]
     batch = []
     for i in range(100):
@@ -426,7 +426,7 @@ def test_collect_on_page_called_per_page_and_return_unchanged(config):
     parser = AutoRuParser(config)
     result = parser.collect(
         SPEC,
-        {"test_fast_mode": True, "max_pages_per_site": 3},
+        {"test_fast_mode": True, "use_stub_data": True, "max_pages_per_site": 3},
         threading.Event(),
         on_page=lambda ads: pages.append(list(ads)),
     )
@@ -438,7 +438,7 @@ def test_fetch_page_single_page_no_pause_and_simulation(config):
     """fetch_page отдаёт одну страницу без пауз и поддерживает эмуляцию ошибок."""
     parser = DromParser(config)
     started = time.monotonic()
-    ads = parser.fetch_page(SPEC, {"test_fast_mode": True}, 1, threading.Event())
+    ads = parser.fetch_page(SPEC, {"test_fast_mode": True, "use_stub_data": True}, 1, threading.Event())
     assert time.monotonic() - started < 0.5
     assert 20 <= len(ads) <= 50
 
