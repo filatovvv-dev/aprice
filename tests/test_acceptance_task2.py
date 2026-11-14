@@ -412,6 +412,6 @@ def test_server_constants_declared():
     assert constants.DEFAULT_SERVER_SITE_DELAY_SEC == [600, 1200]
     assert constants.DEFAULT_SERVER_PAGES_PER_SITE == 10
     assert constants.DEFAULT_SERVER_ADS_PER_SITE == 500
-    assert constants.SITES == ["auto.ru", "drom.ru", "avito.ru", "sberauto.com", "bibika.ru"]
+    assert constants.SITES == ["auto.ru", "drom.ru", "avito.ru"]  # bibika/sberauto отключены
     assert constants.SITE_SBERAUTO_DISABLED_BY_DEFAULT is True
     assert constants.SCHEMA_VERSION == "2"

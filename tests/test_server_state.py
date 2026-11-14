@@ -37,7 +37,7 @@ SAMPLE_SPEC = {
 }
 
 SAMPLE_OPTIONS = {
-    "sites": ["auto.ru", "drom.ru", "avito.ru", "bibika.ru"],
+    "sites": ["auto.ru", "drom.ru", "avito.ru"],
     "max_ads_per_site": 500,
     "max_pages_per_site": 10,
 }

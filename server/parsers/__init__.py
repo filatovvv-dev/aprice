@@ -3,9 +3,9 @@
 Содержит абстракцию :class:`BaseSiteParser`, внутренний формат
 :class:`Ad`, иерархию исключений и фабрику :func:`get_parser`.
 
-Фабрика знает четыре поддерживаемые площадки (auto.ru, drom.ru,
-avito.ru, bibika.ru). SberAuto в v1 не поддерживается (S-15) — для него
-фабрика бросает :class:`UnsupportedSiteError`; отдельного модуля нет.
+Фабрика знает три поддерживаемые площадки (auto.ru, drom.ru, avito.ru).
+SberAuto (S-15) и bibika.ru (отключена решением Заказчика) не поддерживаются —
+для них фабрика бросает :class:`UnsupportedSiteError`; отдельных модулей нет.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from server.parsers.base import (
     ProgressCallback,
     UnsupportedSiteError,
 )
-from server.parsers.bibika import BibikaParser
 from server.parsers.drom import DromParser
 
 logger = logging.getLogger("aprice.server.parsers")
@@ -35,11 +34,11 @@ PARSER_REGISTRY: dict[str, type[BaseSiteParser]] = {
     AutoRuParser.site_name: AutoRuParser,
     DromParser.site_name: DromParser,
     AvitoParser.site_name: AvitoParser,
-    BibikaParser.site_name: BibikaParser,
 }
 
-#: Площадки, явно не поддерживаемые в v1 (S-15).
-UNSUPPORTED_SITES: frozenset[str] = frozenset({"sberauto.com"})
+#: Площадки, явно не поддерживаемые: sberauto.com (S-15) и bibika.ru (отключена
+#: решением Заказчика).
+UNSUPPORTED_SITES: frozenset[str] = frozenset({"sberauto.com", "bibika.ru"})
 
 
 def get_parser(site_name: str, config: Config) -> BaseSiteParser:
@@ -47,7 +46,7 @@ def get_parser(site_name: str, config: Config) -> BaseSiteParser:
 
     Args:
         site_name: домен площадки (``"auto.ru"``, ``"drom.ru"``,
-            ``"avito.ru"``, ``"bibika.ru"``).
+            ``"avito.ru"``).
         config: конфигурация приложения, передаваемая парсеру.
 
     Returns:
@@ -55,11 +54,11 @@ def get_parser(site_name: str, config: Config) -> BaseSiteParser:
 
     Raises:
         UnsupportedSiteError: площадка не поддерживается (в т.ч.
-            ``"sberauto.com"``) или неизвестна.
+            ``"sberauto.com"``, ``"bibika.ru"``) или неизвестна.
     """
     if site_name in UNSUPPORTED_SITES:
         raise UnsupportedSiteError(
-            f"Площадка {site_name!r} не поддерживается в v1 (S-15)"
+            f"Площадка {site_name!r} не поддерживается (отключена)"
         )
     parser_cls = PARSER_REGISTRY.get(site_name)
     if parser_cls is None:
@@ -79,7 +78,6 @@ __all__ = [
     "AutoRuParser",
     "DromParser",
     "AvitoParser",
-    "BibikaParser",
     "PARSER_REGISTRY",
     "UNSUPPORTED_SITES",
     "get_parser",

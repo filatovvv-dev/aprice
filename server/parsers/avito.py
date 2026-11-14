@@ -505,24 +505,6 @@ class AvitoParser(BaseSiteParser):
         )
 
     @staticmethod
-    def _year_in_range(year: Optional[int], spec: dict) -> bool:
-        """Страховка от игнорирования ``minyear``/``maxyear``: год в ``[year_from, year_to]``.
-
-        Год неизвестен (``None``) — карточка проходит; границы не заданы или не числа —
-        не ограничивают.
-        """
-        if year is None:
-            return True
-        for key, ok in (("year_from", lambda b: year >= b), ("year_to", lambda b: year <= b)):
-            try:
-                bound = int(spec.get(key))
-            except (TypeError, ValueError):
-                continue
-            if bound and not ok(bound):
-                return False
-        return True
-
-    @staticmethod
     def _absolute(href: str) -> str:
         """Абсолютный URL: относительный ``href`` дополняется :data:`BASE_URL`."""
         return BASE_URL + href if href.startswith("/") else href

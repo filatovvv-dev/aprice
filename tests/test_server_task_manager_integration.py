@@ -32,8 +32,9 @@ SPEC = {
     "year_from": 2018,
     "year_to": 2021,
 }
-FOUR = ["auto.ru", "drom.ru", "avito.ru", "bibika.ru"]
 THREE = ["auto.ru", "drom.ru", "avito.ru"]
+FOUR = THREE + ["stub4.test"]  # четвёртая — тестовая заглушка (fourth_stub_site)
+pytestmark = pytest.mark.usefixtures("fourth_stub_site")
 
 
 # ----------------------------------------------------------------------
@@ -317,7 +318,7 @@ def test_restore_running_task_continues_from_last_page(mgr, store):
     first_page = {}
     for e in rec.of("progress", task_id):
         first_page.setdefault(e[2]["site"], e[2]["page"])
-    assert first_page == {"auto.ru": 4, "drom.ru": 3, "avito.ru": 3, "bibika.ru": 3}
+    assert first_page == {"auto.ru": 4, "drom.ru": 3, "avito.ru": 3, "stub4.test": 3}
     assert {v["pages_done"] for v in task.per_site.values()} == {5}
 
 
@@ -462,3 +463,71 @@ def test_page_totals_counts_pages_across_sites(mgr):
     assert mgr.page_totals("nope") is None
     run_to_end(rec, task_id)
     assert mgr.page_totals(task_id) == (12, 12)
+
+
+# ----------------------------------------------------------------------
+# 3.11: площадки по умолчанию и отключённая bibika.ru
+# ----------------------------------------------------------------------
+def stub_options(**extra) -> dict:
+    """Опции без ``sites``: проверяется выбор площадок по умолчанию."""
+    opts = {"max_pages_per_site": 1, "test_fast_mode": True, "use_stub_data": True,
+            "test_delay": [0.05, 0.05]}
+    opts.update(extra)
+    return opts
+
+
+def test_constants_and_default_settings_list_three_active_sites():
+    from common import constants
+
+    assert constants.SITES == ["auto.ru", "drom.ru", "avito.ru"]
+    assert constants.DEFAULT_SETTINGS["server"]["default_sites"] == constants.SITES
+
+
+def test_sites_not_passed_uses_default_sites_from_config(mgr, config):
+    rec = Recorder(mgr)
+    task_id = mgr.submit(SPEC, stub_options())
+    run_to_end(rec, task_id)
+    assert set(mgr.get_task(task_id).per_site) == set(THREE)
+    assert mgr.get_task(task_id).options["sites"] == THREE
+
+
+def test_default_sites_are_taken_from_config(qapp, store, config):
+    config.set("server", "default_sites", ["drom.ru", "avito.ru"])
+    mgr = TaskManager(config, store)
+    try:
+        rec = Recorder(mgr)
+        task_id = mgr.submit(SPEC, stub_options())
+        run_to_end(rec, task_id)
+        assert set(mgr.get_task(task_id).per_site) == {"drom.ru", "avito.ru"}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("bad", [[], None, "auto.ru", ["ya.ru", 5], 7])
+def test_bad_default_sites_in_config_fall_back_to_three(qapp, store, config, bad):
+    config.set("server", "default_sites", bad)
+    mgr = TaskManager(config, store)
+    try:
+        assert mgr._default_sites() == THREE
+    finally:
+        mgr.shutdown()
+
+
+def test_explicit_sites_override_config_defaults(qapp, store, config):
+    config.set("server", "default_sites", ["drom.ru"])
+    mgr = TaskManager(config, store)
+    try:
+        rec = Recorder(mgr)
+        task_id = mgr.submit(SPEC, stub_options(sites=["avito.ru"]))
+        run_to_end(rec, task_id)
+        assert set(mgr.get_task(task_id).per_site) == {"avito.ru"}
+    finally:
+        mgr.shutdown()
+
+
+def test_bibika_is_unsupported_and_other_sites_still_collect(mgr):
+    rec = Recorder(mgr)
+    task_id = mgr.submit(SPEC, fast(sites=["auto.ru", "bibika.ru"], pages=2))
+    run_to_end(rec, task_id)
+    assert error_kinds(mgr, task_id) == {("bibika.ru", "unsupported")}
+    assert rec.of("completed", task_id) and mgr.get_task(task_id).total_ads > 0

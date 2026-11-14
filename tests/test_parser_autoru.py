@@ -542,3 +542,50 @@ def test_default_settings_have_server_section(tmp_path):
     config = Config(tmp_path / "s.json").load()
     assert config.get("server", "ignore_https_errors") is True
     assert config.get("server", "playwright_headless") is True
+
+
+# ----------------------------------------------------------------------
+# 3.11: пост-фильтр по годам (страховка, если фильтр URL не сработал)
+# ----------------------------------------------------------------------
+def _year_card(year: int | None, n: int = 1) -> dict:
+    body = f"BMW X5\n7 700 000 ₽\n3.0 л / Дизель\n{year}\n81 000 км" if year else (
+        "BMW X5\n7 700 000 ₽\n81 000 км")
+    return card(f"https://auto.ru/cars/used/sale/bmw/x5/{n}-yy/", body)
+
+
+def test_year_outside_range_is_dropped(parser):
+    tab = MagicMock()
+    tab.locator.return_value.evaluate_all.return_value = [
+        _year_card(2026, 1), _year_card(2019, 2), _year_card(2017, 3),
+    ]
+    ads = parser._parse_listings_from_page(tab, SPEC)  # 2018–2021
+    assert [a.year for a in ads] == [2019]
+
+
+def test_card_without_year_passes_year_filter(parser):
+    tab = MagicMock()
+    tab.locator.return_value.evaluate_all.return_value = [_year_card(None, 1)]
+    ads = parser._parse_listings_from_page(tab, SPEC)
+    assert len(ads) == 1 and ads[0].year is None
+
+
+@pytest.mark.parametrize("year, kept", [(2017, False), (2018, True), (2021, True), (2022, False)])
+def test_year_filter_boundaries_are_inclusive(parser, year, kept):
+    tab = MagicMock()
+    tab.locator.return_value.evaluate_all.return_value = [_year_card(year)]
+    assert bool(parser._parse_listings_from_page(tab, SPEC)) is kept
+
+
+def test_year_filter_without_bounds_keeps_everything(parser):
+    tab = MagicMock()
+    tab.locator.return_value.evaluate_all.return_value = [_year_card(2026)]
+    spec = {k: v for k, v in SPEC.items() if not k.startswith("year_")}
+    assert len(parser._parse_listings_from_page(tab, spec)) == 1
+
+
+def test_all_cards_out_of_range_warns(parser, caplog):
+    tab = MagicMock()
+    tab.locator.return_value.evaluate_all.return_value = [_year_card(2026, 1), _year_card(2025, 2)]
+    with caplog.at_level("WARNING", logger="aprice.server.parsers"):
+        assert parser._parse_listings_from_page(tab, SPEC) == []
+    assert "игнорирует фильтр по годам" in caplog.text

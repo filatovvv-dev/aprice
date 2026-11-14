@@ -248,7 +248,8 @@ class TaskManager(QObject):
 
         Args:
             spec: спецификация задания (валидируется по контракту).
-            options: опции задания; помимо контрактных (``sites``,
+            options: опции задания; ``sites`` не передан -> ``server.default_sites``
+                из конфига; помимо контрактных (``sites``,
                 ``max_ads_per_site``, ``max_pages_per_site``) допускаются
                 служебные ``test_fast_mode`` (только короткие паузы), ``test_delay``
                 и ``use_stub_data`` (заглушка вместо сети; для автотестов).
@@ -263,6 +264,8 @@ class TaskManager(QObject):
         if self._shutting_down:
             raise RuntimeError("TaskManager остановлен")
         raw_options = dict(options or {})
+        if raw_options.get("sites") is None:
+            raw_options["sites"] = self._default_sites()  # не передано -> из конфига
         protocol.validate_spec(spec)
         normalized = protocol.validate_options(raw_options)
         merged = {**raw_options, **normalized}
@@ -424,11 +427,24 @@ class TaskManager(QObject):
     # ------------------------------------------------------------------
     # Параметры задания
     # ------------------------------------------------------------------
-    @staticmethod
-    def _sites(task: Task) -> list[str]:
-        """Площадки задания (по умолчанию — без ``sberauto.com``)."""
+    def _default_sites(self) -> list[str]:
+        """Площадки по умолчанию: ``server.default_sites`` из конфига.
+
+        Берутся только допустимые строки без повторов; пустой или некорректный
+        список -> :data:`protocol.DEFAULT_SITES`.
+        """
+        raw = self._config.get("server", "default_sites", None)
+        sites: list[str] = []
+        if isinstance(raw, list):
+            for site in raw:
+                if isinstance(site, str) and site in protocol.ALLOWED_SITES and site not in sites:
+                    sites.append(site)
+        return sites or list(protocol.DEFAULT_SITES)
+
+    def _sites(self, task: Task) -> list[str]:
+        """Площадки задания: переданные в ``options.sites``, иначе ``default_sites``."""
         sites = task.options.get("sites")
-        return list(sites) if sites else list(protocol.DEFAULT_SITES)
+        return list(sites) if sites else self._default_sites()
 
     @staticmethod
     def _max_ads_per_site(task: Task) -> int:
