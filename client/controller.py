@@ -7,7 +7,10 @@
   решение 3.6); остановка — ``stop_task``;
 * после ``completed`` объявления читаются **из SQLite напрямую** (только чтение,
   :mod:`client.repository`) — Server и Client на одной машине;
-* статистика (min/max/median...) здесь **не считается** — это 4.2.
+* (4.2) цены из результата считает :func:`client.stats.calculate_stats`, оценка
+  сохраняется в историю (:mod:`client.history`) и показывается в окне; выбор записи
+  истории восстанавливает форму и показывает сохранённые показатели **без** нового
+  сбора.
 
 Решения 4.1:
 
@@ -16,6 +19,8 @@
   отдельная задача.
 * Единичный сбой опроса не обрывает ожидание: связь считается потерянной после
   :data:`MAX_POLL_FAILURES` подряд неудач.
+* Ошибка записи истории не ломает показ результата — только лог. Оценка без цен
+  (``count == 0``) в историю не попадает: восстанавливать из неё нечего.
 * Окно используется как «утка» (методы ``set_*``/``show_*`` и сигналы), поэтому
   контроллер тестируется без настоящего GUI.
 """
@@ -32,6 +37,7 @@ from common import constants
 from common.config import Config
 from common.ipc_client import IpcClient, IpcError
 from client import form
+from client.history import describe, load_history, save_to_history
 from client.repository import (
     ReferenceData,
     RepositoryError,
@@ -39,6 +45,7 @@ from client.repository import (
     load_ads,
     load_reference,
 )
+from client.stats import calculate_stats
 
 logger = logging.getLogger("aprice.client.controller")
 
@@ -71,6 +78,7 @@ class ClientController(QObject):
         state_db: Optional[Path] = None,
         poll_interval_ms: int = POLL_INTERVAL_MS,
         ads_loader: Callable[[Path, str], list[dict]] = load_ads,
+        history_path: Optional[Path] = None,
     ) -> None:
         """Создаёт контроллер и подключает его к сигналам окна.
 
@@ -82,6 +90,7 @@ class ClientController(QObject):
             state_db: путь к серверной базе (по умолчанию ``constants.SERVER_STATE_DB``).
             poll_interval_ms: период опроса статуса.
             ads_loader: чтение объявлений (подмена в тестах).
+            history_path: файл истории (по умолчанию ``constants.CLIENT_HISTORY_FILE``).
         """
         super().__init__()
         self._window = window
@@ -90,6 +99,9 @@ class ClientController(QObject):
         self._reference_db = Path(reference_db or constants.DB_FILE)
         self._state_db = Path(state_db or constants.SERVER_STATE_DB)
         self._ads_loader = ads_loader
+        self._history_path = Path(history_path) if history_path is not None else None
+        self._history: list[dict] = []
+        self._spec: Optional[dict] = None
         self._reference = ReferenceData()
         self.task_id: Optional[str] = None
         self._poll_failures = 0
@@ -103,7 +115,9 @@ class ClientController(QObject):
         window.manufacturer_changed.connect(self.on_manufacturer_changed)
         window.model_changed.connect(self.on_model_changed)
         window.generation_changed.connect(self.on_generation_changed)
+        window.history_selected.connect(self.on_history_selected)
         self.load_reference()
+        self.refresh_history()
 
     # ------------------------------------------------------------------
     # Справочники
@@ -171,6 +185,7 @@ class ClientController(QObject):
             self._window.show_error(error)
             return
         spec, options = form.build_spec(state), form.build_options()
+        self._spec = spec
         self._window.clear_results()
         self._window.set_running(True)
         self._window.set_status("Отправка задания…")
@@ -258,8 +273,66 @@ class ClientController(QObject):
             self._window.set_status("Сбор завершён, но результаты не прочитаны")
             self._window.show_error(f"Не удалось прочитать результаты:\n{exc}")
             return
-        self._window.show_results(len(ads), count_by_site(ads))
+        stats = calculate_stats([ad.get("price") for ad in ads])
+        self._window.show_results(len(ads), count_by_site(ads), stats["count"])
+        self._window.update_stats(stats)
         self._window.set_status(f"Готово: собрано объявлений — {len(ads)}")
+        if stats["count"] > 0 and self._spec is not None:
+            try:
+                save_to_history(stats, self._spec, path=self._history_path)
+            except OSError as exc:
+                logger.error("История запросов не сохранена: %s", exc)
+            self.refresh_history()
+
+    # ------------------------------------------------------------------
+    # История запросов
+    # ------------------------------------------------------------------
+    def refresh_history(self) -> None:
+        """Перечитывает историю и обновляет выпадающий список."""
+        self._history = load_history(self._history_path)
+        self._window.set_history([describe(entry) for entry in self._history])
+
+    def on_history_selected(self, index: int) -> None:
+        """Просмотр записи истории: форма и показатели восстанавливаются, сбор не идёт."""
+        if self.task_id is not None or not 0 <= index < len(self._history):
+            return
+        entry = self._history[index]
+        spec = entry.get("spec") if isinstance(entry.get("spec"), dict) else {}
+        self._restore_form(spec)
+        self._window.clear_results()
+        self._window.show_results(int(entry.get("count") or 0), {})
+        self._window.update_stats(entry)
+        self._window.set_status(f"Сохранённый результат: {describe(entry)}")
+
+    def _restore_form(self, spec: dict) -> None:
+        """Выставляет форму по ``spec`` каскадом: марка -> модель -> поколение -> остальное."""
+        window = self._window
+        exact = spec.get("mode") != form.MODE_RANGE
+        window.set_mode(form.MODE_EXACT if exact else form.MODE_RANGE)
+        maker = str(spec.get("manufacturer") or "")
+        window.select_manufacturer(maker)
+        self.on_manufacturer_changed(maker)
+        model = str(spec.get("model") or "")
+        window.select_model(model)
+        self.on_model_changed(model)
+        generation = str(spec.get("generation") or "")
+        window.select_generation(generation)
+        self.on_generation_changed(generation)
+        transmissions = list(spec.get("transmissions") or [])
+        fuels = list(spec.get("fuels") or [])
+        if exact:
+            if spec.get("year_from") is not None:
+                window.select_year(spec["year_from"])
+            window.select_transmission(transmissions[0] if transmissions else "")
+            window.select_fuel(fuels[0] if fuels else "")
+        else:
+            window.set_range(
+                spec.get("year_from"),
+                spec.get("year_to"),
+                spec.get("engine_volume_from"),
+                spec.get("engine_volume_to"),
+            )
+            window.set_checked(transmissions, fuels)
 
     def _finish_failed(self, message: str) -> None:
         self.timer.stop()

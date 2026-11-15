@@ -13,12 +13,15 @@
 Программное заполнение списков идёт при заблокированных сигналах: смена
 выбора вызывает только пользователь.
 
-Дизайн минималистичный; в таблице результатов пока только количество объявлений,
-строки статистики (min/max/mean/median/trimmed mean) заполнит подзадача 4.2.
+Подзадача 4.2: таблица статистики (:meth:`MainWindow.update_stats`, числа вида
+``5 640 000 ₽``), красное предупреждение под таблицей и выпадающий список истории
+запросов (``history_selected``) с программным восстановлением формы (``select_*``,
+``set_mode``, ``set_range``, ``set_checked``) — всё без сигналов, как и ``set_*``.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from PyQt6.QtCore import pyqtSignal
@@ -48,9 +51,20 @@ from client.form import FormState
 WINDOW_TITLE = "АвтоПрайс — оценка стоимости автомобиля"
 PLACEHOLDER = "— выберите —"
 ANY_TEXT = "Любая"
-#: Строки таблицы результатов; значения посчитает подзадача 4.2.
+#: Строки таблицы результатов и ключи соответствующих показателей ``calculate_stats``.
 STAT_ROWS = ("Минимум", "Максимум", "Среднее", "Медиана", "Усечённое среднее")
+STAT_KEYS = ("min", "max", "mean", "median", "trimmed_mean")
 NO_VALUE = "—"
+HISTORY_PLACEHOLDER = "— История запросов —"
+WARNING_STYLE = "color: red;"
+
+
+def format_price(value: Optional[float]) -> str:
+    """``5640000.4`` -> ``5 640 000 ₽``; ``None`` -> ``—``."""
+    if value is None:
+        return NO_VALUE
+    rounded = int(math.floor(value + 0.5))  # «половина вверх», не банковское округление
+    return f"{rounded:,}".replace(",", " ") + " ₽"
 
 
 class MainWindow(QMainWindow):
@@ -61,6 +75,8 @@ class MainWindow(QMainWindow):
     manufacturer_changed = pyqtSignal(str)
     model_changed = pyqtSignal(str)
     generation_changed = pyqtSignal(str)
+    #: Выбрана запись истории: индекс в списке, переданном в :meth:`set_history`.
+    history_selected = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -70,6 +86,7 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        layout.addWidget(self._build_history_panel())
         layout.addWidget(self._build_mode_panel())
         layout.addWidget(self._build_common_panel())
         layout.addWidget(self._build_exact_panel())
@@ -85,6 +102,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Построение
     # ------------------------------------------------------------------
+    def _build_history_panel(self) -> QWidget:
+        box = QGroupBox("История запросов")
+        row = QHBoxLayout(box)
+        self.history_combo = QComboBox()
+        row.addWidget(self.history_combo)
+        self._reset_combo(self.history_combo, [], HISTORY_PLACEHOLDER)
+        return box
+
     def _build_mode_panel(self) -> QWidget:
         box = QGroupBox("Режим")
         row = QHBoxLayout(box)
@@ -199,11 +224,15 @@ class MainWindow(QMainWindow):
         self.stats_table.setColumnCount(2)
         self.stats_table.setHorizontalHeaderLabels(["Показатель", "Значение"])
         self.stats_table.setRowCount(len(STAT_ROWS))
+        self.warning_label = QLabel("")
+        self.warning_label.setStyleSheet(WARNING_STYLE)
+        self.warning_label.setWordWrap(True)
         self.sites_table = QTableWidget()
         self.sites_table.setColumnCount(2)
         self.sites_table.setHorizontalHeaderLabels(["Площадка", "Объявлений"])
         layout.addWidget(self.count_label)
         layout.addWidget(self.stats_table)
+        layout.addWidget(self.warning_label)
         layout.addWidget(self.sites_table)
         self.clear_results()
         return box
@@ -225,6 +254,9 @@ class MainWindow(QMainWindow):
             spin.valueChanged.connect(lambda _v: self._update_buttons())
         for spin in (self.volume_from_spin, self.volume_to_spin):
             spin.valueChanged.connect(lambda _v: self._update_buttons())
+        self.history_combo.currentIndexChanged.connect(
+            lambda index: self.history_selected.emit(index - 1) if index >= 1 else None
+        )
         self.evaluate_button.clicked.connect(lambda _checked=False: self.evaluate_requested.emit())
         self.stop_button.clicked.connect(lambda _checked=False: self.stop_requested.emit())
 
@@ -267,6 +299,7 @@ class MainWindow(QMainWindow):
         """«Оценить» активна, когда форма готова и сбор не идёт; «Остановить» — наоборот."""
         self.evaluate_button.setEnabled(not self._running and form.is_ready(self.form_state()))
         self.stop_button.setEnabled(self._running)
+        self.history_combo.setEnabled(not self._running and self.history_combo.count() > 1)
 
     # ------------------------------------------------------------------
     # Команды контроллера
@@ -311,18 +344,85 @@ class MainWindow(QMainWindow):
 
     def clear_results(self) -> None:
         self.count_label.setText("Объявлений: —")
+        self.warning_label.setText("")
+        self.warning_label.setVisible(False)
         for row, name in enumerate(STAT_ROWS):
             self.stats_table.setItem(row, 0, QTableWidgetItem(name))
             self.stats_table.setItem(row, 1, QTableWidgetItem(NO_VALUE))
         self.sites_table.setRowCount(0)
 
-    def show_results(self, total: int, by_site: dict[str, int]) -> None:
-        """Количество объявлений и разбивка по площадкам (статистика — 4.2)."""
-        self.count_label.setText(f"Объявлений: {total}")
+    def show_results(
+        self, total: int, by_site: dict[str, int], priced: Optional[int] = None
+    ) -> None:
+        """Количество объявлений (и учтённых в статистике, если их меньше) и площадки."""
+        text = f"Объявлений: {total}"
+        if priced is not None and priced != total:
+            text += f" (с ценой: {priced})"
+        self.count_label.setText(text)
         self.sites_table.setRowCount(len(by_site))
         for row, (site, count) in enumerate(by_site.items()):
             self.sites_table.setItem(row, 0, QTableWidgetItem(site))
             self.sites_table.setItem(row, 1, QTableWidgetItem(str(count)))
+
+    def update_stats(self, stats: dict) -> None:
+        """Заполняет таблицу показателей и красное предупреждение под ней."""
+        for row, key in enumerate(STAT_KEYS):
+            self.stats_table.setItem(row, 1, QTableWidgetItem(format_price(stats.get(key))))
+        warning = stats.get("warning")
+        self.warning_label.setText(warning or "")
+        self.warning_label.setVisible(bool(warning))
+
+    # ------------------------------------------------------------------
+    # История и восстановление формы (без сигналов)
+    # ------------------------------------------------------------------
+    def set_history(self, labels: list[str]) -> None:
+        """Подписи записей истории (новые первыми); выбрана строка-заполнитель."""
+        self._reset_combo(self.history_combo, labels, HISTORY_PLACEHOLDER)
+        self._update_buttons()
+
+    def set_mode(self, mode: str) -> None:
+        """Переключает режим (А/Б) программно."""
+        (self.radio_exact if mode == form.MODE_EXACT else self.radio_range).setChecked(True)
+
+    def select_manufacturer(self, name: str) -> bool:
+        return self._select(self.manufacturer_combo, name)
+
+    def select_model(self, name: str) -> bool:
+        return self._select(self.model_combo, name)
+
+    def select_generation(self, name: str) -> bool:
+        return self._select(self.generation_combo, name)
+
+    def select_year(self, year: int) -> bool:
+        return self._select(self.year_combo, str(year))
+
+    def select_transmission(self, name: str) -> bool:
+        return self._select(self.transmission_combo, name)
+
+    def select_fuel(self, name: str) -> bool:
+        return self._select(self.fuel_combo, name)
+
+    def set_range(
+        self,
+        year_from: Optional[int],
+        year_to: Optional[int],
+        volume_from: Optional[float],
+        volume_to: Optional[float],
+    ) -> None:
+        """Диапазоны режима Б; ``None`` у объёма — граница не задана."""
+        if year_from is not None:
+            self.year_from_spin.setValue(int(year_from))
+        if year_to is not None:
+            self.year_to_spin.setValue(int(year_to))
+        self.volume_from_spin.setValue(float(volume_from or 0.0))
+        self.volume_to_spin.setValue(float(volume_to or 0.0))
+
+    def set_checked(self, transmissions: list[str], fuels: list[str]) -> None:
+        """Отмечает чекбоксы КПП и топлива режима Б (остальные снимает)."""
+        for name, check in self.transmission_checks.items():
+            check.setChecked(name in transmissions)
+        for name, check in self.fuel_checks.items():
+            check.setChecked(name in fuels)
 
     # ------------------------------------------------------------------
     # Вспомогательное
@@ -333,6 +433,19 @@ class MainWindow(QMainWindow):
         if combo.currentIndex() <= 0 and combo.itemText(0) in (PLACEHOLDER, ANY_TEXT):
             return ""
         return combo.currentText()
+
+    def _select(self, combo: QComboBox, text: str) -> bool:
+        """Выбирает пункт по тексту без сигналов; пустой текст — строка-заполнитель."""
+        for index in range(combo.count()):
+            if combo.itemText(index) == text or (not text and index == 0):
+                combo.blockSignals(True)
+                try:
+                    combo.setCurrentIndex(index)
+                finally:
+                    combo.blockSignals(False)
+                self._update_buttons()
+                return True
+        return False
 
     @staticmethod
     def _reset_combo(combo: QComboBox, items: list[str], first: Optional[str]) -> None:
