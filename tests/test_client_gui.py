@@ -16,6 +16,7 @@ from typing import Optional
 import pytest
 from PyQt6.QtWidgets import QApplication
 
+from common import constants
 from common.config import Config
 from common.ipc_client import IpcConnectionError, IpcTimeoutError
 from client import controller as controller_module
@@ -112,6 +113,14 @@ def dialogs(monkeypatch) -> Dialogs:
     recorded = Dialogs()
     monkeypatch.setattr(gui_module, "QMessageBox", recorded)
     return recorded
+
+
+@pytest.fixture(autouse=True)
+def history_file(tmp_path, monkeypatch) -> Path:
+    """История запросов — во временный файл: тесты не трогают настоящий data/."""
+    path = tmp_path / "history.json"
+    monkeypatch.setattr(constants, "CLIENT_HISTORY_FILE", path)
+    return path
 
 
 @pytest.fixture()
@@ -743,3 +752,180 @@ def test_main_builds_window_and_controller_without_side_effects(qapp, monkeypatc
     assert created["window_id"] == "client_main"
     assert created["logging"]["component"] == "client"
     assert len(shown) == 1 and isinstance(shown[0], MainWindow)
+
+
+# ----------------------------------------------------------------------
+# 4.2: статистика в окне, история запросов
+# ----------------------------------------------------------------------
+from client.gui import HISTORY_PLACEHOLDER, WARNING_STYLE, format_price  # noqa: E402
+from client.history import describe, load_history  # noqa: E402
+
+
+def stat_cells(window) -> list[str]:
+    return [window.stats_table.item(r, 1).text() for r in range(len(STAT_ROWS))]
+
+
+def run_task(window, ctrl, ipc, task_id="T1") -> None:
+    """Режим А: BMW X5, год 2019; сбор завершается ``completed``."""
+    pick_bmw_x5(window, "2019")
+    ipc.submit_reply = {"type": "task_accepted", "task_id": task_id, "queue_position": 0}
+    ipc.status_replies = [{"type": "status", "task_id": task_id, "state": "completed"}]
+    ctrl.submit()
+    ctrl.poll()
+
+
+@pytest.mark.parametrize("value,text", [
+    (5_640_000, "5 640 000 ₽"), (5_640_000.4, "5 640 000 ₽"), (999, "999 ₽"),
+    (1_234_567.5, "1 234 568 ₽"), (6_500_000.5, "6 500 001 ₽"), (None, NO_VALUE),
+])
+def test_format_price(value, text):
+    assert format_price(value) == text
+
+
+def test_update_stats_fills_table_and_shows_red_warning(window):
+    window.update_stats({"min": 4_200_000, "max": 9_050_000, "mean": 6_500_000.5,
+                         "median": 6_800_000.0, "trimmed_mean": None,
+                         "warning": "Мало данных (N < 10). Оценка может быть неточной."})
+    assert stat_cells(window) == ["4 200 000 ₽", "9 050 000 ₽", "6 500 001 ₽",
+                                  "6 800 000 ₽", NO_VALUE]
+    assert window.warning_label.text().startswith("Мало данных")
+    assert window.warning_label.isVisibleTo(window)
+    assert "red" in window.warning_label.styleSheet() == WARNING_STYLE
+
+
+def test_no_warning_hides_label_and_clear_resets(window):
+    window.update_stats({"min": 1, "warning": "x"})
+    window.update_stats({"min": 1, "max": 2, "mean": 1.5, "median": 1.5,
+                         "trimmed_mean": 1.5, "warning": None})
+    assert window.warning_label.text() == "" and not window.warning_label.isVisibleTo(window)
+    window.update_stats({"warning": "x"})
+    window.clear_results()
+    assert stat_cells(window) == [NO_VALUE] * 5 and window.warning_label.text() == ""
+
+
+def test_completed_fills_stats_warning_and_saves_history(window, ctrl, ipc, history_file):
+    run_task(window, ctrl, ipc)
+    # T1: 5 000 000, 5 500 000, 4 900 000 -> N = 3 < 10
+    assert stat_cells(window) == ["4 900 000 ₽", "5 500 000 ₽", "5 133 333 ₽",
+                                  "5 000 000 ₽", "5 133 333 ₽"]
+    assert window.warning_label.text().startswith("Мало данных (N < 10)")
+    saved = load_history(history_file)
+    assert len(saved) == 1
+    assert saved[0]["count"] == 3 and saved[0]["min"] == 4_900_000
+    assert saved[0]["spec"] == ipc.calls[0][1]  # ровно тот spec, что ушёл на Server
+    assert "ads" not in saved[0] and "url" not in str(saved[0])  # объявления не хранятся
+    assert items(window.history_combo) == [HISTORY_PLACEHOLDER, describe(saved[0])]
+
+
+def test_history_combo_disabled_while_running_and_enabled_after(window, ctrl, ipc):
+    assert not window.history_combo.isEnabled()  # истории нет
+    run_task(window, ctrl, ipc)
+    assert window.history_combo.isEnabled()
+    pick_bmw_x5(window, "2019")
+    ipc.submit_reply = {"type": "task_accepted", "task_id": "T1", "queue_position": 0}
+    ctrl.submit()
+    assert not window.history_combo.isEnabled()
+
+
+def test_empty_result_is_not_saved(window, ctrl, ipc, history_file):
+    pick_bmw_x5(window, "2019")
+    ipc.submit_reply = {"type": "task_accepted", "task_id": "NOPE", "queue_position": 0}
+    ipc.status_replies = [{"type": "status", "task_id": "NOPE", "state": "completed"}]
+    ctrl.submit()
+    ctrl.poll()
+    assert window.warning_label.text() == "Нет данных для оценки."
+    assert load_history(history_file) == []
+    assert items(window.history_combo) == [HISTORY_PLACEHOLDER]
+
+
+def test_history_write_error_does_not_break_results(window, ctrl, ipc, dialogs, monkeypatch):
+    monkeypatch.setattr(controller_module, "save_to_history",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("диск полон")))
+    run_task(window, ctrl, ipc)
+    assert window.count_label.text() == "Объявлений: 3" and stat_cells(window)[0] == "4 900 000 ₽"
+    assert dialogs.messages == [] and window.status_label.text().startswith("Готово")
+
+
+def test_history_selection_restores_exact_form_without_new_collection(window, ctrl, ipc):
+    choose(window.manufacturer_combo, "BMW")
+    choose(window.model_combo, "X5")
+    choose(window.generation_combo, "IV (G05)")
+    choose(window.year_combo, "2019")
+    choose(window.transmission_combo, "АКПП")
+    choose(window.fuel_combo, "Бензин")
+    ipc.submit_reply = {"type": "task_accepted", "task_id": "T1", "queue_position": 0}
+    ipc.status_replies = [{"type": "status", "task_id": "T1", "state": "completed"}]
+    ctrl.submit()
+    ctrl.poll()
+    calls_before = list(ipc.calls)
+
+    choose(window.manufacturer_combo, "Audi")  # пользователь ушёл в другую форму
+    choose(window.model_combo, "A4")
+    window.clear_results()
+    choose(window.history_combo, items(window.history_combo)[1])  # выбор записи
+
+    state = window.form_state()
+    assert (state.mode, state.manufacturer, state.model, state.generation) == (
+        form.MODE_EXACT, "BMW", "X5", "IV (G05)")
+    assert (state.year, state.transmission, state.fuel) == (2019, "АКПП", "Бензин")
+    assert stat_cells(window)[0] == "4 900 000 ₽"
+    assert window.count_label.text() == "Объявлений: 3"
+    assert window.sites_table.rowCount() == 0
+    assert ipc.calls == calls_before  # новый сбор НЕ запускался
+    assert ctrl.task_id is None and not ctrl.timer.isActive()
+    assert window.status_label.text().startswith("Сохранённый результат")
+
+
+def test_history_selection_restores_range_form(window, ctrl, ipc, history_file):
+    from client.history import save_to_history
+    from client.stats import calculate_stats
+    spec = {"mode": "range", "manufacturer": "BMW", "model": "X5", "year_from": 2015,
+            "year_to": 2019, "transmissions": ["АКПП", "Робот"], "fuels": ["Дизель"],
+            "engine_volume_from": 2.0, "engine_volume_to": 3.5}
+    save_to_history(calculate_stats([1_000_000 + i for i in range(25)]), spec)
+    ctrl.refresh_history()
+    choose(window.history_combo, items(window.history_combo)[1])
+    state = window.form_state()
+    assert state.mode == form.MODE_RANGE and (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.year_from, state.year_to) == (2015, 2019)
+    assert (state.volume_from, state.volume_to) == (2.0, 3.5)
+    assert sorted(state.transmissions) == ["АКПП", "Робот"] and state.fuels == ["Дизель"]
+    assert window.warning_label.text() == ""  # N = 25 — без предупреждения
+    assert window.count_label.text() == "Объявлений: 25"
+
+
+def test_history_selection_ignored_while_collecting(window, ctrl, ipc):
+    run_task(window, ctrl, ipc)
+    pick_bmw_x5(window, "2019")
+    ipc.submit_reply = {"type": "task_accepted", "task_id": "T1", "queue_position": 0}
+    ctrl.submit()
+    window.clear_results()
+    ctrl.on_history_selected(0)  # даже если сигнал дошёл
+    assert stat_cells(window) == [NO_VALUE] * 5
+    ctrl.on_history_selected(7)  # и индекс вне диапазона безопасен
+    ctrl.on_history_selected(-1)
+
+
+def test_placeholder_selection_does_nothing(window, ctrl, ipc):
+    run_task(window, ctrl, ipc)
+    window.clear_results()
+    choose(window.history_combo, HISTORY_PLACEHOLDER)
+    assert stat_cells(window) == [NO_VALUE] * 5
+
+
+def test_history_survives_restart_and_is_limited_to_ten(window, ctrl, ipc, qapp, reference_db,
+                                                         state_db, tmp_path):
+    for _ in range(12):
+        run_task(window, ctrl, ipc)
+    assert len(items(window.history_combo)) == 1 + 10
+    other = MainWindow()
+    ClientController(other, Config(tmp_path / "s.json"), ipc=FakeIpc(),
+                     reference_db=reference_db, state_db=state_db)
+    assert len(items(other.history_combo)) == 11  # история прочитана при старте
+
+
+def test_priced_count_shown_when_some_ads_have_no_price(window):
+    window.show_results(5, {"auto.ru": 5}, 3)
+    assert window.count_label.text() == "Объявлений: 5 (с ценой: 3)"
+    window.show_results(5, {"auto.ru": 5}, 5)
+    assert window.count_label.text() == "Объявлений: 5"
