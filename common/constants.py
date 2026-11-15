@@ -46,6 +46,7 @@ LOGS_DIR: Path = ROOT_DIR / "logs"
 
 DB_FILE: Path = DATA_DIR / "aprice.db"
 SERVER_STATE_DB = DATA_DIR / "aprice_server_state.db"
+CLIENT_HISTORY_FILE: Path = DATA_DIR / "aprice_client_history.json"
 SETTINGS_FILE: Path = CONFIG_DIR / "settings.json"
 
 # INI-файлы позиций окон (WindowManager): у каждого компонента — свой файл,

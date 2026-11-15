@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 data/debug/
+
+# История запросов Client (локальные данные пользователя)
+data/aprice_client_history.json
+data/aprice_client_history.json.tmp
