@@ -484,3 +484,25 @@ def test_get_active_task_after_stop_is_none(mgr):
     run_to_end(mgr, rec, tid)
     pump_until(lambda: mgr.current_task_id() is None)
     assert mgr.has_active_tasks() is False
+
+
+def test_get_active_task_reports_stopping_state(mgr):
+    tid = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    pump_until(lambda: mgr.current_task_id() == tid)
+    assert mgr.stop(tid)
+    active = mgr.get_active_task()
+    assert active is not None and active["task_id"] == tid and active["state"] == "stopping"
+    assert mgr.has_active_tasks() is True
+
+
+def test_get_active_task_sees_queued_task_when_nothing_runs(mgr):
+    """Задание ждёт в очереди, ничего не выполняется (окно между завершением и запуском)."""
+    first = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    second = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    pump_until(lambda: mgr.current_task_id() == first)
+    current, mgr._current_id = mgr._current_id, None  # имитация паузы между заданиями
+    try:
+        active = mgr.get_active_task()
+        assert active["task_id"] == second and active["state"] == "queued"
+    finally:
+        mgr._current_id = current

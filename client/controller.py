@@ -11,6 +11,11 @@
   сохраняется в историю (:mod:`client.history`) и показывается в окне; выбор записи
   истории восстанавливает форму и показывает сохранённые показатели **без** нового
   сбора.
+* (4.3) Lifecycle: контроллер держит «сеанс» — долгоживущее соединение с Server
+  (``get_active_task(session=True)``). Пока оно открыто, Server не завершается; при
+  закрытии окна (:meth:`shutdown`) соединение закрывается, и Server выходит, если
+  заданий нет. Если Server уже выполняет задание, Client **подхватывает** его: форма
+  восстанавливается по ``spec``, опрос продолжается.
 
 Решения 4.1:
 
@@ -79,6 +84,7 @@ class ClientController(QObject):
         poll_interval_ms: int = POLL_INTERVAL_MS,
         ads_loader: Callable[[Path, str], list[dict]] = load_ads,
         history_path: Optional[Path] = None,
+        session_ipc: Optional[IpcClient] = None,
     ) -> None:
         """Создаёт контроллер и подключает его к сигналам окна.
 
@@ -91,6 +97,8 @@ class ClientController(QObject):
             poll_interval_ms: период опроса статуса.
             ads_loader: чтение объявлений (подмена в тестах).
             history_path: файл истории (по умолчанию ``constants.CLIENT_HISTORY_FILE``).
+            session_ipc: долгоживущий IPC-клиент для «сеанса» (по умолчанию
+                ``IpcClient(one_shot=False)``, создаётся при первом обращении).
         """
         super().__init__()
         self._window = window
@@ -102,6 +110,8 @@ class ClientController(QObject):
         self._history_path = Path(history_path) if history_path is not None else None
         self._history: list[dict] = []
         self._spec: Optional[dict] = None
+        self._session_ipc = session_ipc
+        self._session_open = False
         self._reference = ReferenceData()
         self.task_id: Optional[str] = None
         self._poll_failures = 0
@@ -201,6 +211,7 @@ class ClientController(QObject):
             return
         self.task_id = str(reply["task_id"])
         self._poll_failures = 0
+        self._open_session()  # Server мог быть запущен позже Client — сеанс ещё не открыт
         position = reply.get("queue_position")
         suffix = f" (впереди заданий: {position})" if position else ""
         self._window.set_status(f"Задание принято{suffix}")
@@ -245,8 +256,64 @@ class ClientController(QObject):
             self._window.set_status(self._status_text(state, reply))
 
     def shutdown(self) -> None:
-        """Останавливает опрос (закрытие окна)."""
+        """Закрытие окна: останавливает опрос и закрывает «сеанс» (Server может выйти)."""
         self.timer.stop()
+        self._close_session()
+
+    # ------------------------------------------------------------------
+    # Жизненный цикл (4.3)
+    # ------------------------------------------------------------------
+    def start_session(self) -> bool:
+        """Открывает «сеанс» с Server и подхватывает активное задание, если оно есть.
+
+        Вызывается при старте окна. Server не запущен — не ошибка: сеанс откроется при
+        первой успешной отправке задания (:meth:`submit`).
+
+        Returns:
+            bool: ``True``, если задание подхвачено.
+        """
+        reply = self._open_session()
+        if reply is None or reply.get("type") != "active_task" or not reply.get("task_id"):
+            return False
+        return self._adopt_task(reply)
+
+    def _open_session(self) -> Optional[dict]:
+        """Один запрос ``get_active_task(session=True)``; ``None``, если Server недоступен."""
+        if self._session_open:
+            return None
+        if self._session_ipc is None:
+            self._session_ipc = IpcClient(one_shot=False)
+        try:
+            reply = self._session_ipc.get_active_task(session=True)
+        except IpcError as exc:
+            logger.info("Сеанс с Server не открыт (%s)", exc)
+            return None
+        self._session_open = reply.get("type") == "active_task"
+        return reply
+
+    def _close_session(self) -> None:
+        if self._session_ipc is not None:
+            try:
+                self._session_ipc.close()
+            except Exception:  # noqa: BLE001 — закрытие не должно ломать выход
+                logger.debug("Сеанс закрыт с ошибкой", exc_info=True)
+        self._session_open = False
+
+    def _adopt_task(self, reply: dict) -> bool:
+        """Подхватывает задание Server: форма по ``spec``, индикатор «занят», опрос."""
+        if self.task_id is not None:
+            return False
+        self.task_id = str(reply["task_id"])
+        spec = reply.get("spec") if isinstance(reply.get("spec"), dict) else {}
+        self._spec = spec
+        self._poll_failures = 0
+        self._restore_form(spec)
+        self._window.clear_results()
+        self._window.set_running(True)
+        self._window.set_status("Подхвачено активное задание сервера")
+        logger.info("Подхвачено активное задание %s", self.task_id)
+        self.timer.start()
+        return True
 
     # ------------------------------------------------------------------
     # Завершение
@@ -273,7 +340,9 @@ class ClientController(QObject):
             self._window.set_status("Сбор завершён, но результаты не прочитаны")
             self._window.show_error(f"Не удалось прочитать результаты:\n{exc}")
             return
-        stats = calculate_stats([ad.get("price") for ad in ads])
+        prices = [ad.get("price") for ad in ads]
+        stats = calculate_stats(prices)
+        self._window.update_charts(prices)
         self._window.show_results(len(ads), count_by_site(ads), stats["count"])
         self._window.update_stats(stats)
         self._window.set_status(f"Готово: собрано объявлений — {len(ads)}")

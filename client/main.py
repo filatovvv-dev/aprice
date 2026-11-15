@@ -30,7 +30,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     config = Config().load()
     setup_logging(component="client", config=config)
 
-    window = MainWindow()
+    window = MainWindow(show_vpn_warning=bool(config.get("client", "show_vpn_warning", True)))
     controller = ClientController(window, config)  # ссылка живёт до конца exec()
     app.aboutToQuit.connect(controller.shutdown)
 
@@ -38,6 +38,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     window_manager.apply(window, WINDOW_ID)
 
     window.show()
+    controller.start_session()  # открыть сеанс и подхватить активное задание Server
     logger.info("Client started")
     return app.exec()
 

@@ -136,6 +136,10 @@ DEFAULT_SETTINGS: dict = {
         # Площадки по умолчанию, если в options.sites ничего не передано.
         "default_sites": list(SITES),
     },
+    "client": {
+        # Жёлтая плашка «отключите VPN» при старте Клиента (4.3).
+        "show_vpn_warning": True,
+    },
     "logging": {
         "level": "INFO",
         "max_file_size_mb": 10,
