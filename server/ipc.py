@@ -9,7 +9,10 @@ GUI-потоке через сигналы Qt (IPC-07) — блокирующи�
     * ``message_received(dict)`` — разобранные поля сообщения (включая
       ``type``); подписку выполняет TaskManager (подзадача 3.4);
     * ``error(str)`` — сетевые/протокольные проблемы (таймауты, разрывы);
-    * ``stopped()`` — сервер остановлен (:meth:`IpcServer.stop`).
+    * ``stopped()`` — сервер остановлен (:meth:`IpcServer.stop`);
+    * ``client_disconnected(str)`` — закрылось «сессионное» соединение Клиента
+      (``get_active_task`` с ``session=true``, подзадача 4.3); аргумент — ``peer``.
+      Обычные one-shot соединения этот сигнал не вызывают.
 
 Сервер умеет отвечать клиенту (:meth:`IpcServer.send_to` по ``peer``-адресу),
 что используется в тестах 3.1 и понадобится TaskManager в 3.4 для отправки
@@ -58,6 +61,8 @@ class _Connection:
         # и не удаляется сборщиком мусора раньше времени.
         self.timer: QTimer = QTimer(socket_)
         self.timer.setSingleShot(True)
+        #: «Сеанс Клиента»: без таймаута простоя, закрытие сообщается сигналом.
+        self.session: bool = False
 
     def restart_timer(self) -> None:
         """Перезапустить таймер ожидания данных (idle-timeout)."""
@@ -73,6 +78,8 @@ class IpcServer(QObject):
     error = pyqtSignal(str)
     #: Сервер остановлен (stop()).
     stopped = pyqtSignal()
+    #: Закрылось сессионное соединение Клиента (аргумент — peer).
+    client_disconnected = pyqtSignal(str)
 
     def __init__(
         self,
@@ -146,6 +153,10 @@ class IpcServer(QObject):
     def clients_count(self) -> int:
         """Число активных клиентских соединений (для тестов и диагностики)."""
         return len(self._connections)
+
+    def sessions_count(self) -> int:
+        """Число открытых сессионных соединений Клиентов."""
+        return sum(1 for conn in self._connections.values() if conn.session)
 
     def send_to(self, peer: str, msg: protocol.Message) -> bool:
         """Отправить сообщение клиенту по адресу соединения (IPC-06).
@@ -221,11 +232,14 @@ class IpcServer(QObject):
         except RuntimeError:
             pass  # таймер уже удалён вместе с родительским сокетом
         logger.debug("IPC: клиент отключился: %s", peer)
+        if conn.session and self._running:
+            self.client_disconnected.emit(peer)
 
     def _on_ready_read(self, conn: _Connection) -> None:
         """Накопить байты, выдать полностью принятые строки (IPC-02)."""
         peer = f"{conn.sock.peerAddress().toString()}:{conn.sock.peerPort()}"
-        conn.restart_timer()  # пересчёт простоя: данные поступают
+        if not conn.session:
+            conn.restart_timer()  # пересчёт простоя: данные поступают
         data = conn.sock.readAll().data()
         conn.buffer.extend(data)
         if len(conn.buffer) > MAX_MESSAGE_BYTES:
@@ -258,6 +272,10 @@ class IpcServer(QObject):
             code = str(exc).split(":", 1)[0].strip() or "invalid_message"
             self._invalid(conn, peer, request_id=request_id, detail=str(exc), code=code)
             return
+        if isinstance(msg, protocol.GetActiveTaskMsg) and msg.session and not conn.session:
+            conn.session = True
+            conn.timer.stop()  # сеанс Клиента живёт, пока Клиент не закроет сокет
+            logger.info("IPC: сеанс Клиента открыт: %s", peer)
         payload = _msg_to_dict(msg)
         payload["_peer"] = peer
         logger.debug("IPC: получено %s от %s", payload.get("type"), peer)

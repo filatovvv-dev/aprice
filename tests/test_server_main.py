@@ -376,3 +376,130 @@ def test_all_tests_share_one_qapplication(qapp):
     """Sanity: в сессии один экземпляр, и это именно ``QApplication`` (с GUI)."""
     assert QApplication.instance() is qapp
     assert isinstance(QApplication.instance(), QApplication)
+
+
+# ----------------------------------------------------------------------
+# 4.3: жизненный цикл — завершение при закрытии Клиента, get_active_task
+# ----------------------------------------------------------------------
+@pytest.fixture()
+def quits(qapp, monkeypatch) -> list[int]:
+    """Перехватывает ``QApplication.quit`` — тесты не гасят общий цикл событий."""
+    calls: list[int] = []
+    monkeypatch.setattr(qapp, "quit", lambda: calls.append(1))
+    return calls
+
+
+def open_session(qapp, srv: ServerApp) -> IpcClient:
+    """Сессионное соединение Клиента (долгоживущее, ``session=true``)."""
+    client = IpcClient(port=srv.ipc_server.port(), timeout=5, one_shot=False)
+    reply = call_in_thread(qapp, lambda: client.get_active_task(session=True))
+    assert reply["type"] == "active_task"
+    return client
+
+
+def test_server_quits_when_client_closes_and_no_active_tasks(qapp, srv, quits):
+    client = open_session(qapp, srv)
+    assert srv.ipc_server.sessions_count() == 1 and quits == []
+    client.close()
+    pump_until(lambda: quits == [1])
+
+
+def test_server_stays_when_client_closes_with_active_task(qapp, srv, quits, monkeypatch):
+    monkeypatch.setattr(srv.task_manager, "has_active_tasks", lambda: True)
+    client = open_session(qapp, srv)
+    client.close()
+    pump_until(lambda: srv.ipc_server.sessions_count() == 0)
+    for _ in range(20):
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert quits == []
+
+
+def test_server_stays_while_another_client_is_connected(qapp, srv, quits):
+    first, second = open_session(qapp, srv), open_session(qapp, srv)
+    first.close()
+    pump_until(lambda: srv.ipc_server.sessions_count() == 1)
+    for _ in range(20):
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert quits == []
+    second.close()
+    pump_until(lambda: quits == [1])
+
+
+def test_one_shot_requests_never_stop_the_server(qapp, srv, quits):
+    """Обычные запросы Клиента (опрос статуса) — не «закрытие Клиента»."""
+    client = IpcClient(port=srv.ipc_server.port(), timeout=5, one_shot=True)
+    for _ in range(3):
+        call_in_thread(qapp, lambda: client.get_active_task())
+    for _ in range(20):
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert quits == [] and srv.ipc_server.sessions_count() == 0
+
+
+def test_client_disconnected_handler_directly(srv, quits, monkeypatch):
+    """Прямой вызов обработчика: ServerApp решает по ``has_active_tasks()``."""
+    monkeypatch.setattr(srv.task_manager, "has_active_tasks", lambda: True)
+    srv._on_client_disconnected("p")
+    assert quits == []
+    monkeypatch.setattr(srv.task_manager, "has_active_tasks", lambda: False)
+    srv._on_client_disconnected("p")
+    assert quits == [1]
+
+
+def test_no_quit_after_shutdown(srv, quits):
+    srv.shutdown()
+    srv._on_client_disconnected("p")
+    assert quits == []
+
+
+def test_session_connection_has_no_idle_timeout(qapp, store, wm, tmp_path, quits):
+    ipc = IpcServer(port=0, timeout_sec=0.3)
+    app = ServerApp(qapp, Config(tmp_path / "s.json"), state_store=store, ipc_server=ipc,
+                    window_manager=wm, on_already_running=lambda: None)
+    assert app.start()
+    try:
+        client = open_session(qapp, app)
+        idle = IpcClient(port=ipc.port(), timeout=5, one_shot=False)
+        call_in_thread(qapp, lambda: idle.get_status("x"))  # обычное долгое соединение
+        pump_until(lambda: ipc.clients_count() == 1, 3.0)  # обычное закрыто по таймауту
+        assert ipc.sessions_count() == 1  # а сеанс Клиента жив
+        client.close()
+        pump_until(lambda: quits == [1])
+    finally:
+        app.shutdown()
+
+
+def test_server_stop_does_not_report_client_disconnect(qapp, srv, quits):
+    client = open_session(qapp, srv)
+    srv.ipc_server.stop()
+    for _ in range(20):
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert quits == []
+    client.close()
+
+
+def test_get_active_task_over_ipc_without_tasks(qapp, srv):
+    client = IpcClient(port=srv.ipc_server.port(), timeout=5, one_shot=True)
+    reply = call_in_thread(qapp, lambda: client.get_active_task())
+    assert reply["type"] == "active_task" and reply["task_id"] is None
+
+
+def test_get_active_task_over_ipc_returns_running_task(qapp, srv):
+    client = IpcClient(port=srv.ipc_server.port(), timeout=5, one_shot=True)
+    accepted = call_in_thread(qapp, lambda: client.submit_task(SPEC, {**FAST, "max_pages_per_site": 50, "test_delay": [0.2, 0.2]}))
+    reply = call_in_thread(qapp, lambda: client.get_active_task())
+    assert reply["task_id"] == accepted["task_id"]
+    assert reply["state"] in ("queued", "running")
+    assert reply["spec"]["manufacturer"] == "BMW"
+    assert "_peer" not in reply
+
+
+def test_get_active_task_handler_reply_fields(wired):
+    mgr, ipc, handler = wired
+    send(handler, type="get_active_task", session=False)
+    peer, msg = ipc.sent[-1]
+    assert isinstance(msg, protocol.ActiveTaskMsg) and msg.request_id == "r1"
+    assert (msg.task_id, msg.state, msg.spec) == (None, None, None)

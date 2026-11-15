@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from server import protocol
 from server.protocol import (
     CancelTaskMsg,
     CaptchaRequiredMsg,
@@ -278,3 +279,38 @@ def test_validate_message_on_built_instance() -> None:
         validate_message(StatusMsg(task_id="t", state="weird"))
     validate_message(TaskAcceptedMsg(request_id="r", task_id="t",
                                      estimated_seconds=1800, queue_position=1))
+
+
+# ----------------------------------------------------------------------
+# 4.3: get_active_task / active_task
+# ----------------------------------------------------------------------
+def test_get_active_task_roundtrip_and_session_default():
+    msg = protocol.deserialize('{"type":"get_active_task","request_id":"r"}')
+    assert msg == protocol.GetActiveTaskMsg(request_id="r", session=False)
+    msg = protocol.deserialize('{"type":"get_active_task","request_id":"r","session":true}')
+    assert msg.session is True
+    assert protocol.deserialize(protocol.serialize(msg)) == msg
+
+
+@pytest.mark.parametrize("bad", ['"yes"', "1", "[]"])
+def test_get_active_task_session_must_be_bool(bad):
+    with pytest.raises(protocol.InvalidMessageError, match="invalid_field"):
+        protocol.deserialize(f'{{"type":"get_active_task","request_id":"r","session":{bad}}}')
+
+
+def test_get_active_task_requires_request_id():
+    with pytest.raises(protocol.InvalidMessageError, match="missing_field"):
+        protocol.deserialize('{"type":"get_active_task"}')
+
+
+def test_active_task_roundtrip_with_and_without_task():
+    full = protocol.ActiveTaskMsg(request_id="r", task_id="T", state="running",
+                                  spec={"manufacturer": "BMW"})
+    assert protocol.deserialize(protocol.serialize(full)) == full
+    empty = protocol.deserialize('{"type":"active_task","request_id":"r","task_id":null}')
+    assert (empty.task_id, empty.state, empty.spec) == (None, None, None)
+
+
+def test_active_task_rejects_unknown_state():
+    with pytest.raises(protocol.InvalidMessageError, match="invalid_field"):
+        protocol.deserialize('{"type":"active_task","task_id":"T","state":"weird"}')

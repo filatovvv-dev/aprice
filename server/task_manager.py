@@ -424,6 +424,26 @@ class TaskManager(QObject):
         """Идентификатор выполняющегося задания или ``None``."""
         return self._current_id
 
+    def has_active_tasks(self) -> bool:
+        """``True``, если есть выполняющееся задание или ожидающее в очереди."""
+        return self.get_active_task() is not None
+
+    def get_active_task(self) -> Optional[dict[str, Any]]:
+        """Активное задание для переподключения Клиента (подзадача 4.3).
+
+        Выполняющееся задание приоритетнее; иначе — первое ожидающее в очереди.
+
+        Returns:
+            dict | None: ``{"task_id", "state", "spec"}`` либо ``None``, если
+            заданий нет (очередь пуста и ничего не выполняется).
+        """
+        candidates = [self._current_id, *self._queue]
+        for task_id in candidates:
+            task = self._tasks.get(task_id) if task_id is not None else None
+            if task is not None and task.state in ("queued", "running", "stopping"):
+                return {"task_id": task.task_id, "state": task.state, "spec": dict(task.spec)}
+        return None
+
     # ------------------------------------------------------------------
     # Параметры задания
     # ------------------------------------------------------------------
