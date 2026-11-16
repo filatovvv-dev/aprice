@@ -13,6 +13,9 @@
 Программное заполнение списков идёт при заблокированных сигналах: смена
 выбора вызывает только пользователь.
 
+Подзадача 4.3: жёлтая плашка «отключите VPN» (скрывается по крестику и через 10 с,
+``show_vpn_warning``) и вкладки «Результат» / «Графики» (:class:`client.charts.ChartWidget`).
+
 Подзадача 4.2: таблица статистики (:meth:`MainWindow.update_stats`, числа вида
 ``5 640 000 ₽``), красное предупреждение под таблицей и выпадающий список истории
 запросов (``history_selected``) с программным восстановлением формы (``select_*``,
@@ -24,7 +27,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -39,6 +42,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -46,6 +50,7 @@ from PyQt6.QtWidgets import (
 )
 
 from client import form
+from client.charts import ChartWidget
 from client.form import FormState
 
 WINDOW_TITLE = "АвтоПрайс — оценка стоимости автомобиля"
@@ -57,6 +62,12 @@ STAT_KEYS = ("min", "max", "mean", "median", "trimmed_mean")
 NO_VALUE = "—"
 HISTORY_PLACEHOLDER = "— История запросов —"
 WARNING_STYLE = "color: red;"
+VPN_TEXT = "Внимание: для корректной работы отключите VPN перед началом сбора данных"
+VPN_STYLE = "background-color: #fff3cd; color: #856404; padding: 5px;"
+#: Через сколько плашка VPN скрывается сама, мс.
+VPN_BANNER_MS = 10_000
+TAB_RESULTS = "Результат"
+TAB_CHARTS = "Графики"
 
 
 def format_price(value: Optional[float]) -> str:
@@ -78,7 +89,9 @@ class MainWindow(QMainWindow):
     #: Выбрана запись истории: индекс в списке, переданном в :meth:`set_history`.
     history_selected = pyqtSignal(int)
 
-    def __init__(self) -> None:
+    def __init__(
+        self, show_vpn_warning: bool = True, vpn_banner_ms: int = VPN_BANNER_MS
+    ) -> None:
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
         self._running = False
@@ -86,6 +99,7 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        layout.addWidget(self._build_vpn_banner())
         layout.addWidget(self._build_history_panel())
         layout.addWidget(self._build_mode_panel())
         layout.addWidget(self._build_common_panel())
@@ -93,15 +107,47 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_range_panel())
         layout.addWidget(self._build_action_panel())
         layout.addWidget(self._build_progress_panel())
-        layout.addWidget(self._build_results_panel())
+        self.chart_widget = ChartWidget()  # до панели результатов: её clear_results чистит график
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_results_panel(), TAB_RESULTS)
+        self.tabs.addTab(self.chart_widget, TAB_CHARTS)
+        layout.addWidget(self.tabs)
 
         self._connect_signals()
+        self._start_vpn_banner(show_vpn_warning, vpn_banner_ms)
         self._apply_mode()
         self._update_buttons()
 
     # ------------------------------------------------------------------
     # Построение
     # ------------------------------------------------------------------
+    def _build_vpn_banner(self) -> QWidget:
+        self.vpn_banner = QWidget()
+        row = QHBoxLayout(self.vpn_banner)
+        self.vpn_label = QLabel(VPN_TEXT)
+        self.vpn_label.setStyleSheet(VPN_STYLE)
+        self.vpn_label.setWordWrap(True)
+        self.vpn_close_button = QPushButton("✕")
+        self.vpn_close_button.setToolTip("Скрыть")
+        row.addWidget(self.vpn_label)
+        row.addWidget(self.vpn_close_button)
+        self.vpn_close_button.clicked.connect(lambda _checked=False: self.hide_vpn_banner())
+        self.vpn_timer = QTimer(self)
+        self.vpn_timer.setSingleShot(True)
+        self.vpn_timer.timeout.connect(self.hide_vpn_banner)
+        return self.vpn_banner
+
+    def _start_vpn_banner(self, show: bool, timeout_ms: int) -> None:
+        """Плашка видна, только если включена в настройках; сама скрывается по таймеру."""
+        self.vpn_banner.setVisible(bool(show))
+        if show:
+            self.vpn_timer.start(timeout_ms)
+
+    def hide_vpn_banner(self) -> None:
+        """Скрыть плашку VPN (крестик или истёк таймер)."""
+        self.vpn_timer.stop()
+        self.vpn_banner.setVisible(False)
+
     def _build_history_panel(self) -> QWidget:
         box = QGroupBox("История запросов")
         row = QHBoxLayout(box)
@@ -346,6 +392,7 @@ class MainWindow(QMainWindow):
         self.count_label.setText("Объявлений: —")
         self.warning_label.setText("")
         self.warning_label.setVisible(False)
+        self.chart_widget.update_data([])
         for row, name in enumerate(STAT_ROWS):
             self.stats_table.setItem(row, 0, QTableWidgetItem(name))
             self.stats_table.setItem(row, 1, QTableWidgetItem(NO_VALUE))
@@ -363,6 +410,10 @@ class MainWindow(QMainWindow):
         for row, (site, count) in enumerate(by_site.items()):
             self.sites_table.setItem(row, 0, QTableWidgetItem(site))
             self.sites_table.setItem(row, 1, QTableWidgetItem(str(count)))
+
+    def update_charts(self, prices: list) -> None:
+        """Перерисовывает гистограмму и box plot (пустой список — надпись «Нет данных»)."""
+        self.chart_widget.update_data(prices)
 
     def update_stats(self, stats: dict) -> None:
         """Заполняет таблицу показателей и красное предупреждение под ней."""

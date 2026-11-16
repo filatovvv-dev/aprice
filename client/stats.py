@@ -41,6 +41,11 @@ def _is_valid_price(value: Any) -> bool:
     return math.isfinite(float(value)) and value > 0
 
 
+def valid_prices(prices: Iterable[Any]) -> list[Any]:
+    """Корректные цены по возрастанию (остальное отбрасывается, см. :func:`calculate_stats`)."""
+    return sorted(p for p in prices if _is_valid_price(p))
+
+
 def calculate_stats(prices: Iterable[Any]) -> dict[str, Any]:
     """Считает показатели по списку цен.
 
@@ -54,7 +59,7 @@ def calculate_stats(prices: Iterable[Any]) -> dict[str, Any]:
         когда данных нет.
     """
     raw = list(prices)
-    valid = sorted(p for p in raw if _is_valid_price(p))
+    valid = valid_prices(raw)
     ignored = len(raw) - len(valid)
     count = len(valid)
 

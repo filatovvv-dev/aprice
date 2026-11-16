@@ -88,6 +88,15 @@ class IpcClient:
         """Остановить выполнение задания (``stop_task``)."""
         return self._request("stop_task", {"task_id": task_id})
 
+    def get_active_task(self, session: bool = False) -> dict:
+        """Узнать активное задание (``active_task``; ``task_id`` — ``None``, если его нет).
+
+        ``session=True`` помечает соединение как «сеанс Клиента»: Server не закроет его
+        по таймауту простоя и завершится после его закрытия, если заданий нет. Нужно
+        использовать клиент с ``one_shot=False`` и держать его открытым.
+        """
+        return self._request("get_active_task", {"session": bool(session)})
+
     def cancel_task(self, task_id: str) -> dict:
         """Отменить задание — удалить из очереди и остановить (``cancel_task``)."""
         return self._request("cancel_task", {"task_id": task_id})

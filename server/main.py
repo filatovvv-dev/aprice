@@ -147,6 +147,7 @@ class ServerApp(QObject):
             return False
 
         _connect_ipc_to_task_manager(self.ipc_server, self.task_manager, logger)
+        self.ipc_server.client_disconnected.connect(self._on_client_disconnected)
         self.task_manager.captcha_required.connect(self._on_captcha)
 
         restored = self.task_manager.restore()
@@ -170,6 +171,23 @@ class ServerApp(QObject):
         self.tray.quit_requested.connect(self._request_quit)
         self.progress_window.stop_requested.connect(self._stop_current)
         self.tray.show()
+
+    def _on_client_disconnected(self, peer: str = "") -> None:
+        """Клиент закрылся: если заданий нет и других Клиентов нет — завершаем сервер.
+
+        При активном задании сервер продолжает работать: Клиент, запущенный снова,
+        подхватит его (``get_active_task``).
+        """
+        if self._quitted:
+            return
+        if self.ipc_server.sessions_count() > 0:
+            logger.info("Клиент %s отключился, но другие клиенты подключены", peer)
+            return
+        if self.task_manager.has_active_tasks():
+            logger.info("Клиент %s отключился; есть активное задание — сервер работает", peer)
+            return
+        logger.info("Клиент %s отключился, заданий нет — завершение сервера", peer)
+        self._app.quit()
 
     def _request_quit(self) -> None:
         """Пункт «Выход»: завершает цикл событий (дальше — ``aboutToQuit``)."""
@@ -253,7 +271,7 @@ def _connect_ipc_to_task_manager(
     """Подключает обработку входящих сообщений IPC к ``TaskManager``.
 
     Поддерживаются ``submit_task``, ``get_status``, ``stop_task``,
-    ``cancel_task``. Любое другое сообщение и любая ошибка обработки получают
+    ``cancel_task``, ``get_active_task``. Любое другое сообщение и любая ошибка обработки получают
     ``ErrorMsg`` (клиент ждёт ровно один ответ и иначе упёрся бы в таймаут).
     Служебное поле ``_peer`` снимается **до** передачи данных менеджеру.
 
@@ -332,7 +350,20 @@ def _connect_ipc_to_task_manager(
                 f"Task {task_id} not found or already finished",
             )
 
+    def on_get_active_task(peer: str, request_id: str, msg: dict) -> None:
+        active = task_manager.get_active_task()
+        reply(
+            peer,
+            protocol.ActiveTaskMsg(
+                request_id=request_id,
+                task_id=active["task_id"] if active else None,
+                state=active["state"] if active else None,
+                spec=active["spec"] if active else None,
+            ),
+        )
+
     handlers = {
+        "get_active_task": on_get_active_task,
         "submit_task": on_submit,
         "get_status": on_get_status,
         "stop_task": on_stop,

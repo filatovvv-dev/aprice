@@ -108,6 +108,31 @@ class CancelTaskMsg:
 
 
 @dataclass
+class GetActiveTaskMsg:
+    """Client -> Server: какое задание выполняется (или ждёт) прямо сейчас?
+
+    ``session=True`` — это соединение «сеанс Клиента»: Server не закрывает его по
+    таймауту простоя и, когда оно закроется, сообщает об этом (``client_disconnected``),
+    чтобы завершиться, если заданий нет (подзадача 4.3).
+    """
+
+    request_id: str
+    session: bool = False
+    type: str = "get_active_task"
+
+
+@dataclass
+class ActiveTaskMsg:
+    """Server -> Client: активное задание (``task_id=None`` — заданий нет)."""
+
+    request_id: str = ""
+    task_id: Optional[str] = None
+    state: Optional[str] = None
+    spec: Optional[dict] = None
+    type: str = "active_task"
+
+
+@dataclass
 class TaskAcceptedMsg:
     """Server -> Client: задание принято в очередь."""
 
@@ -184,6 +209,8 @@ Message = Union[
     GetStatusMsg,
     StopTaskMsg,
     CancelTaskMsg,
+    GetActiveTaskMsg,
+    ActiveTaskMsg,
     TaskAcceptedMsg,
     StatusMsg,
     TaskCompletedMsg,
@@ -199,6 +226,8 @@ MESSAGE_TYPES: dict[str, type] = {
     "get_status": GetStatusMsg,
     "stop_task": StopTaskMsg,
     "cancel_task": CancelTaskMsg,
+    "get_active_task": GetActiveTaskMsg,
+    "active_task": ActiveTaskMsg,
     "task_accepted": TaskAcceptedMsg,
     "status": StatusMsg,
     "task_completed": TaskCompletedMsg,
@@ -470,6 +499,35 @@ def _parse_cancel_task(data: dict) -> CancelTaskMsg:
     )
 
 
+def _parse_get_active_task(data: dict) -> GetActiveTaskMsg:
+    session = data.get("session", False)
+    if session is None:
+        session = False
+    if not isinstance(session, bool):
+        raise InvalidMessageError(
+            f"invalid_field: session ожидалось bool, получено {type(session).__name__} "
+            "(get_active_task)"
+        )
+    return GetActiveTaskMsg(
+        request_id=_as_str(data, "request_id", "get_active_task"), session=session
+    )
+
+
+def _parse_active_task(data: dict) -> ActiveTaskMsg:
+    state = _as_str(data, "state", "active_task", required=False)
+    if state is not None and state not in TASK_STATES:
+        raise InvalidMessageError(
+            f"invalid_field: state должен быть одним из {sorted(TASK_STATES)}, "
+            f"получено {state!r} (active_task)"
+        )
+    return ActiveTaskMsg(
+        request_id=_as_str(data, "request_id", "active_task", required=False) or "",
+        task_id=_as_str(data, "task_id", "active_task", required=False),
+        state=state,
+        spec=_as_dict(data, "spec", "active_task", required=False),
+    )
+
+
 def _parse_task_accepted(data: dict) -> TaskAcceptedMsg:
     """Разбор task_accepted (все поля обязательны, целые — валидируются)."""
     estimated = data.get("estimated_seconds")
@@ -577,6 +635,8 @@ _PARSERS = {
     "get_status": _parse_get_status,
     "stop_task": _parse_stop_task,
     "cancel_task": _parse_cancel_task,
+    "get_active_task": _parse_get_active_task,
+    "active_task": _parse_active_task,
     "task_accepted": _parse_task_accepted,
     "status": _parse_status,
     "task_completed": _parse_task_completed,

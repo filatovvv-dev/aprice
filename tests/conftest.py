@@ -48,3 +48,30 @@ def qapp() -> Iterator[QApplication]:
         app = QApplication([])
     assert isinstance(app, QApplication)
     yield app
+
+
+def _real_qt_canvas_available() -> bool:
+    """``True``, если matplotlib умеет Qt-холст (есть настоящие биндинги PyQt6)."""
+    try:
+        import matplotlib.backends.backend_qtagg  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_QT_CANVAS = _real_qt_canvas_available()
+
+
+@pytest.fixture(autouse=True)
+def chart_canvas(monkeypatch):
+    """Без настоящего Qt-холста (CI без PyQt6) подставляет виджет-пустышку.
+
+    На обычной машине с PyQt6 ничего не подменяется: тесты используют
+    ``FigureCanvasQTAgg``. Рисование (``draw_charts``) в любом случае настоящее.
+    """
+    if _QT_CANVAS:
+        return
+    from PyQt6.QtWidgets import QWidget
+    from client import charts
+
+    monkeypatch.setattr(charts, "_make_canvas", lambda figure: QWidget())

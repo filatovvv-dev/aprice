@@ -98,6 +98,27 @@ class FakeIpc:
         return [c[0] for c in self.calls]
 
 
+class FakeSession:
+    """Подмена долгоживущего ``IpcClient`` («сеанс» Клиента, 4.3)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.reply: object = {"type": "active_task", "request_id": "r", "task_id": None}
+        self.closed = 0
+        self.close_error: Optional[Exception] = None
+
+    def get_active_task(self, session: bool = False):
+        self.calls.append(("get_active_task", session))
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+    def close(self) -> None:
+        self.closed += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
 class Dialogs:
     """Собирает тексты ``QMessageBox.critical`` вместо показа окна."""
 
@@ -161,10 +182,15 @@ def ipc() -> FakeIpc:
 
 
 @pytest.fixture()
-def ctrl(window, ipc, reference_db, state_db, tmp_path):
+def session() -> FakeSession:
+    return FakeSession()
+
+
+@pytest.fixture()
+def ctrl(window, ipc, session, reference_db, state_db, tmp_path):
     controller = ClientController(
         window, Config(tmp_path / "settings.json"), ipc=ipc,
-        reference_db=reference_db, state_db=state_db,
+        reference_db=reference_db, state_db=state_db, session_ipc=session,
     )
     yield controller
     controller.shutdown()
@@ -747,7 +773,11 @@ def test_main_builds_window_and_controller_without_side_effects(qapp, monkeypatc
     monkeypatch.setattr(main_module, "WindowManager", FakeWindowManager)
     monkeypatch.setattr(MainWindow, "show", lambda self: shown.append(self))
     monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    monkeypatch.setattr(ClientController, "start_session",
+                        lambda self: created.setdefault("session_started", True))
     assert main_module.main(["aprice-client"]) == 0
+    assert created["session_started"] is True
+    assert shown[0].vpn_banner.isVisibleTo(shown[0])  # по умолчанию show_vpn_warning = true
     assert created["settings_filename"] == "aprice_client_settings.ini"
     assert created["window_id"] == "client_main"
     assert created["logging"]["component"] == "client"
@@ -929,3 +959,166 @@ def test_priced_count_shown_when_some_ads_have_no_price(window):
     assert window.count_label.text() == "Объявлений: 5 (с ценой: 3)"
     window.show_results(5, {"auto.ru": 5}, 5)
     assert window.count_label.text() == "Объявлений: 5"
+
+
+# ----------------------------------------------------------------------
+# 4.3: графики, VPN-плашка, жизненный цикл
+# ----------------------------------------------------------------------
+from client.gui import TAB_CHARTS, TAB_RESULTS, VPN_TEXT  # noqa: E402
+
+
+def test_vpn_banner_visible_by_default_with_text_and_style(qapp):
+    win = MainWindow()
+    assert win.vpn_banner.isVisibleTo(win)
+    assert win.vpn_label.text() == VPN_TEXT
+    assert "#fff3cd" in win.vpn_label.styleSheet()
+    assert win.vpn_timer.isActive() and win.vpn_timer.interval() == 10_000
+
+
+def test_vpn_banner_hidden_when_disabled(qapp):
+    win = MainWindow(show_vpn_warning=False)
+    assert not win.vpn_banner.isVisibleTo(win) and not win.vpn_timer.isActive()
+
+
+def test_vpn_banner_close_button_hides_it(qapp):
+    win = MainWindow()
+    win.vpn_close_button.click()
+    assert not win.vpn_banner.isVisibleTo(win) and not win.vpn_timer.isActive()
+
+
+def test_vpn_banner_hides_itself_by_timer(qapp):
+    win = MainWindow(vpn_banner_ms=30)
+    assert win.vpn_banner.isVisibleTo(win)
+    pump_until(lambda: not win.vpn_banner.isVisibleTo(win))
+
+
+def test_main_respects_show_vpn_warning_setting(monkeypatch, tmp_path):
+    from client import main as main_module
+
+    config = Config(tmp_path / "settings.json")
+    config.set("client", "show_vpn_warning", False)
+    monkeypatch.setattr(main_module, "Config", lambda: type("C", (), {"load": lambda self: config})())
+    monkeypatch.setattr(main_module, "setup_logging", lambda **kw: None)
+    monkeypatch.setattr(main_module, "WindowManager", lambda **kw: type(
+        "W", (), {"apply": lambda self, *a: None})())
+    monkeypatch.setattr(ClientController, "start_session", lambda self: False)
+    shown: list = []
+    monkeypatch.setattr(MainWindow, "show", lambda self: shown.append(self))
+    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    assert main_module.main(["aprice-client"]) == 0
+    assert not shown[0].vpn_banner.isVisibleTo(shown[0])
+
+
+def test_default_settings_enable_vpn_warning():
+    assert constants.DEFAULT_SETTINGS["client"]["show_vpn_warning"] is True
+
+
+def test_charts_tab_present(window):
+    assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == [TAB_RESULTS, TAB_CHARTS]
+    assert window.tabs.indexOf(window.chart_widget) == 1
+
+
+def test_completed_draws_charts_and_clear_resets_them(window, ctrl, ipc):
+    run_task(window, ctrl, ipc)  # T1: три цены
+    figure = window.chart_widget.figure
+    assert len(figure.axes) == 2
+    hist = figure.axes[0]
+    assert sum(p.get_height() for p in hist.patches) == 3
+    window.clear_results()
+    assert len(figure.axes) == 1
+
+
+def test_history_view_clears_charts(window, ctrl, ipc):
+    run_task(window, ctrl, ipc)
+    choose(window.history_combo, items(window.history_combo)[1])
+    assert len(window.chart_widget.figure.axes) == 1  # цены в истории не хранятся
+
+
+SPEC_ACTIVE = {"mode": "exact", "manufacturer": "BMW", "model": "X5", "generation": "IV (G05)",
+               "year_from": 2019, "year_to": 2019, "transmissions": ["АКПП"], "fuels": ["Бензин"]}
+
+
+def test_start_session_opens_session_and_without_task_does_nothing(window, ctrl, session):
+    assert ctrl.start_session() is False
+    assert session.calls == [("get_active_task", True)]
+    assert ctrl.task_id is None and not ctrl.timer.isActive()
+    assert window.evaluate_button.isEnabled() is False  # форма пуста, но не «занято»
+    assert not window.stop_button.isEnabled()
+
+
+def test_start_session_adopts_active_task(window, ctrl, ipc, session):
+    session.reply = {"type": "active_task", "task_id": "T1", "state": "running", "spec": SPEC_ACTIVE}
+    assert ctrl.start_session() is True
+    assert ctrl.task_id == "T1" and ctrl.timer.isActive()
+    assert window.stop_button.isEnabled() and not window.evaluate_button.isEnabled()
+    state = window.form_state()
+    assert (state.manufacturer, state.model, state.generation, state.year) == (
+        "BMW", "X5", "IV (G05)", 2019)
+    assert (state.transmission, state.fuel) == ("АКПП", "Бензин")
+    assert "Подхвачено" in window.status_label.text()
+    assert "submit_task" not in ipc.names()  # новое задание не отправляется
+
+
+def test_adopted_task_completes_into_stats_and_history(window, ctrl, ipc, session, history_file):
+    session.reply = {"type": "active_task", "task_id": "T1", "state": "running", "spec": SPEC_ACTIVE}
+    ctrl.start_session()
+    ipc.status_replies = [{"type": "status", "task_id": "T1", "state": "completed"}]
+    ctrl.poll()
+    assert ipc.calls[-1] == ("get_status", "T1")
+    assert window.count_label.text() == "Объявлений: 3" and stat_cells(window)[0] == "4 900 000 ₽"
+    assert load_history(history_file)[0]["spec"] == SPEC_ACTIVE
+    assert ctrl.task_id is None and not ctrl.timer.isActive()
+
+
+def test_adopt_with_missing_spec_still_polls(window, ctrl, ipc, session):
+    session.reply = {"type": "active_task", "task_id": "T1", "state": "queued"}
+    assert ctrl.start_session() is True and ctrl.timer.isActive()
+
+
+def test_start_session_server_down_is_silent(window, ctrl, session, dialogs):
+    session.reply = IpcConnectionError("нет связи")
+    assert ctrl.start_session() is False
+    assert dialogs.messages == [] and ctrl.task_id is None
+
+
+def test_start_session_error_reply_is_ignored(window, ctrl, session, dialogs):
+    session.reply = {"type": "error", "code": "unknown_type", "message": "старый Server"}
+    assert ctrl.start_session() is False and dialogs.messages == []
+
+
+def test_submit_opens_session_once_when_server_was_down_at_start(window, ctrl, ipc, session):
+    session.reply = IpcConnectionError("нет связи")
+    ctrl.start_session()
+    session.reply = {"type": "active_task", "task_id": "T1", "state": "queued", "spec": {}}
+    pick_bmw_x5(window, "2019")
+    ctrl.submit()
+    assert session.calls == [("get_active_task", True)] * 2  # старт (неудача) + submit
+    assert ctrl.task_id == "T1" and window.stop_button.isEnabled()  # ответ сеанса не «подхватывается»
+    ctrl.stop()
+    ipc.status_replies = [{"type": "status", "task_id": "T1", "state": "completed"}]
+    ctrl.poll()
+    pick_bmw_x5(window, "2019")
+    ctrl.submit()
+    assert len(session.calls) == 2  # сеанс уже открыт — повторно не открывается
+
+
+def test_shutdown_closes_session(window, ctrl, session):
+    ctrl.start_session()
+    ctrl.shutdown()
+    assert session.closed == 1 and not ctrl.timer.isActive()
+
+
+def test_shutdown_survives_close_error(window, ctrl, session):
+    ctrl.start_session()
+    session.close_error = OSError("broken pipe")
+    ctrl.shutdown()  # не падает
+    assert session.closed == 1
+
+
+def test_active_task_not_adopted_over_own_task(window, ctrl, ipc, session):
+    pick_bmw_x5(window, "2019")
+    ctrl.submit()
+    assert ctrl.task_id == "T1"
+    session.reply = {"type": "active_task", "task_id": "OTHER", "state": "running", "spec": {}}
+    ctrl._session_open = False  # как будто сеанс ещё не открывался
+    assert ctrl.start_session() is False and ctrl.task_id == "T1"

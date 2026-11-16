@@ -441,3 +441,68 @@ def test_progress_is_persisted_in_state_store(mgr, store):
         v["ads"] for v in progress["per_site"].values()
     )
     assert progress["per_site"]["auto.ru"]["pages_done"] == 2
+
+
+# ----------------------------------------------------------------------
+# 4.3: get_active_task / has_active_tasks
+# ----------------------------------------------------------------------
+def test_get_active_task_none_when_idle(mgr):
+    assert mgr.get_active_task() is None
+    assert mgr.has_active_tasks() is False
+
+
+def test_get_active_task_returns_running_task(mgr):
+    tid = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    pump_until(lambda: mgr.current_task_id() == tid)
+    active = mgr.get_active_task()
+    assert active["task_id"] == tid and active["state"] == "running"
+    assert active["spec"] == SPEC and mgr.has_active_tasks() is True
+
+
+def test_get_active_task_prefers_running_over_queued(mgr):
+    first = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    second = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    pump_until(lambda: mgr.current_task_id() == first)
+    assert mgr.get_active_task()["task_id"] == first
+    assert mgr.cancel(second) is True
+    assert mgr.get_active_task()["task_id"] == first
+
+
+def test_get_active_task_none_after_completion(mgr):
+    rec = Recorder(mgr)
+    tid = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=2))
+    run_to_end(mgr, rec, tid)
+    pump_until(lambda: mgr.current_task_id() is None)
+    assert mgr.get_active_task() is None and mgr.has_active_tasks() is False
+
+
+def test_get_active_task_after_stop_is_none(mgr):
+    rec = Recorder(mgr)
+    tid = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    pump_until(lambda: mgr.current_task_id() == tid)
+    assert mgr.stop(tid)
+    run_to_end(mgr, rec, tid)
+    pump_until(lambda: mgr.current_task_id() is None)
+    assert mgr.has_active_tasks() is False
+
+
+def test_get_active_task_reports_stopping_state(mgr):
+    tid = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    pump_until(lambda: mgr.current_task_id() == tid)
+    assert mgr.stop(tid)
+    active = mgr.get_active_task()
+    assert active is not None and active["task_id"] == tid and active["state"] == "stopping"
+    assert mgr.has_active_tasks() is True
+
+
+def test_get_active_task_sees_queued_task_when_nothing_runs(mgr):
+    """Задание ждёт в очереди, ничего не выполняется (окно между завершением и запуском)."""
+    first = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    second = mgr.submit(SPEC, fast(sites=["auto.ru"], pages=50, delay=(0.2, 0.2)))
+    pump_until(lambda: mgr.current_task_id() == first)
+    current, mgr._current_id = mgr._current_id, None  # имитация паузы между заданиями
+    try:
+        active = mgr.get_active_task()
+        assert active["task_id"] == second and active["state"] == "queued"
+    finally:
+        mgr._current_id = current
