@@ -228,3 +228,25 @@ def test_db_age_days(tmp_path):
     assert db_age_days(path, now=mtime + 3 * 86400 + 5) == 3
     assert db_age_days(path, now=mtime - 100) == 0
     assert db_age_days(tmp_path / "none.db") is None
+
+
+def test_failed_integrity_check_verdict_is_rejected(target, mirror, monkeypatch):
+    """Вердикт PRAGMA integrity_check != ok отклоняет базу, даже если файл читается."""
+    real_connect = sqlite3.connect
+
+    class Conn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if sql == "PRAGMA integrity_check":
+                return type("R", (), {"fetchall": lambda self: [("row 7 missing from index idx",)]})()
+            return self._conn.execute(sql, *args)
+
+        def close(self):
+            self._conn.close()
+
+    monkeypatch.setattr(db_update.sqlite3, "connect", lambda *a, **k: Conn(real_connect(*a, **k)))
+    with pytest.raises(DbUpdateError, match="целостности"):
+        download_database(URL, target, get=FakeGet(FakeResponse(mirror)))
+    assert names(target) == ["OLD"] and leftovers(target) == ["aprice.db"]
