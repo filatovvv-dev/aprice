@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QTimer, pyqtSignal
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
@@ -66,8 +68,17 @@ VPN_TEXT = "Внимание: для корректной работы откл�
 VPN_STYLE = "background-color: #fff3cd; color: #856404; padding: 5px;"
 #: Через сколько плашка VPN скрывается сама, мс.
 VPN_BANNER_MS = 10_000
+EXPORT_DEFAULT_NAME = "aprice_export.csv"
+EXPORT_FILTER = "CSV (*.csv);;Excel (*.xlsx)"
 TAB_RESULTS = "Результат"
 TAB_CHARTS = "Графики"
+
+
+def with_export_suffix(path: str, selected_filter: str = "") -> str:
+    """Дописывает расширение, если пользователь его не ввёл: по фильтру диалога, иначе ``.csv``."""
+    if Path(path).suffix.lower() in (".csv", ".xlsx"):
+        return path
+    return path + (".xlsx" if "xlsx" in (selected_filter or "").lower() else ".csv")
 
 
 def format_price(value: Optional[float]) -> str:
@@ -88,6 +99,9 @@ class MainWindow(QMainWindow):
     generation_changed = pyqtSignal(str)
     #: Выбрана запись истории: индекс в списке, переданном в :meth:`set_history`.
     history_selected = pyqtSignal(int)
+    #: Нажаты «Экспорт» (4.4) и «Настройки» (4.4).
+    export_requested = pyqtSignal()
+    settings_requested = pyqtSignal()
 
     def __init__(
         self, show_vpn_warning: bool = True, vpn_banner_ms: int = VPN_BANNER_MS
@@ -247,8 +261,10 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout(panel)
         self.evaluate_button = QPushButton("Оценить")
         self.stop_button = QPushButton("Остановить")
+        self.settings_button = QPushButton("Настройки")
         row.addWidget(self.evaluate_button)
         row.addWidget(self.stop_button)
+        row.addWidget(self.settings_button)
         return panel
 
     def _build_progress_panel(self) -> QWidget:
@@ -276,7 +292,10 @@ class MainWindow(QMainWindow):
         self.sites_table = QTableWidget()
         self.sites_table.setColumnCount(2)
         self.sites_table.setHorizontalHeaderLabels(["Площадка", "Объявлений"])
+        self.export_button = QPushButton("Экспорт")
+        self.export_button.setToolTip("Сохранить объявления в CSV или XLSX")
         layout.addWidget(self.count_label)
+        layout.addWidget(self.export_button)
         layout.addWidget(self.stats_table)
         layout.addWidget(self.warning_label)
         layout.addWidget(self.sites_table)
@@ -303,6 +322,8 @@ class MainWindow(QMainWindow):
         self.history_combo.currentIndexChanged.connect(
             lambda index: self.history_selected.emit(index - 1) if index >= 1 else None
         )
+        self.export_button.clicked.connect(lambda _checked=False: self.export_requested.emit())
+        self.settings_button.clicked.connect(lambda _checked=False: self.settings_requested.emit())
         self.evaluate_button.clicked.connect(lambda _checked=False: self.evaluate_requested.emit())
         self.stop_button.clicked.connect(lambda _checked=False: self.stop_requested.emit())
 
@@ -393,6 +414,7 @@ class MainWindow(QMainWindow):
         self.warning_label.setText("")
         self.warning_label.setVisible(False)
         self.chart_widget.update_data([])
+        self.export_button.setEnabled(False)
         for row, name in enumerate(STAT_ROWS):
             self.stats_table.setItem(row, 0, QTableWidgetItem(name))
             self.stats_table.setItem(row, 1, QTableWidgetItem(NO_VALUE))
@@ -410,6 +432,17 @@ class MainWindow(QMainWindow):
         for row, (site, count) in enumerate(by_site.items()):
             self.sites_table.setItem(row, 0, QTableWidgetItem(site))
             self.sites_table.setItem(row, 1, QTableWidgetItem(str(count)))
+
+    def set_export_enabled(self, enabled: bool) -> None:
+        """Кнопка «Экспорт» доступна, только когда есть что выгружать."""
+        self.export_button.setEnabled(bool(enabled))
+
+    def choose_export_path(self) -> Optional[str]:
+        """Диалог «Сохранить как»; возвращает путь с расширением ``.csv``/``.xlsx`` или ``None``."""
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Экспорт результатов", EXPORT_DEFAULT_NAME, EXPORT_FILTER
+        )
+        return with_export_suffix(path, selected) if path else None
 
     def update_charts(self, prices: list) -> None:
         """Перерисовывает гистограмму и box plot (пустой список — надпись «Нет данных»)."""

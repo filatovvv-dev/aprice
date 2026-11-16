@@ -531,7 +531,7 @@ def test_submit_sends_spec_and_options_and_starts_polling(window, ctrl, ipc):
     assert ipc.calls == [("submit_task", {
         "mode": "exact", "manufacturer": "BMW", "model": "X5", "year_from": 2020,
         "year_to": 2020, "transmissions": ["АКПП"], "fuels": [],
-    }, {})]
+    }, {"max_pages_per_site": 10, "max_ads_per_site": 500})]  # лимиты из настроек (4.4)
     assert ctrl.task_id == "T1"
     assert ctrl.timer.isActive() and ctrl.timer.interval() == POLL_INTERVAL_MS == 2000
     assert window.status_label.text() == "Задание принято"
@@ -1122,3 +1122,294 @@ def test_active_task_not_adopted_over_own_task(window, ctrl, ipc, session):
     session.reply = {"type": "active_task", "task_id": "OTHER", "state": "running", "spec": {}}
     ctrl._session_open = False  # как будто сеанс ещё не открывался
     assert ctrl.start_session() is False and ctrl.task_id == "T1"
+
+
+# ----------------------------------------------------------------------
+# 4.4: экспорт, настройки, обновление справочника
+# ----------------------------------------------------------------------
+import csv  # noqa: E402
+
+from PyQt6.QtCore import QObject, pyqtSignal  # noqa: E402
+
+from client.export import HEADERS, ExportError  # noqa: E402
+from client.gui import with_export_suffix  # noqa: E402
+
+
+def read_csv(path) -> list[list[str]]:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        return list(csv.reader(fh, delimiter=";"))
+
+
+def test_export_and_settings_buttons_exist(window):
+    assert window.export_button.text() == "Экспорт" and window.settings_button.text() == "Настройки"
+    assert not window.export_button.isEnabled()  # выгружать пока нечего
+    assert window.settings_button.isEnabled()
+
+
+def test_export_button_enabled_after_results_and_reset_by_new_task_and_history(window, ctrl, ipc):
+    run_task(window, ctrl, ipc)
+    assert window.export_button.isEnabled() and len(ctrl._last_ads) == 3
+    choose(window.history_combo, items(window.history_combo)[1])
+    assert not window.export_button.isEnabled() and ctrl._last_ads == []
+    run_task(window, ctrl, ipc)
+    assert window.export_button.isEnabled()
+    pick_bmw_x5(window, "2019")
+    ipc.submit_reply = {"type": "task_accepted", "task_id": "T1", "queue_position": 0}
+    ctrl.submit()
+    assert not window.export_button.isEnabled() and ctrl._last_ads == []
+
+
+def test_export_button_click_writes_raw_ads(window, ctrl, ipc, tmp_path, monkeypatch):
+    run_task(window, ctrl, ipc)
+    target = tmp_path / "out" / "result.csv"
+    monkeypatch.setattr(window, "choose_export_path", lambda: str(target))
+    window.export_button.click()
+    rows = read_csv(target)
+    assert rows[0] == list(HEADERS) and len(rows) == 4  # заголовок + 3 объявления
+    assert {r[0] for r in rows[1:]} == {"auto.ru", "drom.ru"}
+    assert sorted(int(r[4]) for r in rows[1:]) == [4_900_000, 5_000_000, 5_500_000]
+    assert "https://auto.ru/1" in {r[6] for r in rows[1:]}
+    assert window.status_label.text() == f"Экспортировано объявлений: 3 → {target}"
+
+
+def test_export_xlsx_via_controller(window, ctrl, ipc, tmp_path):
+    import pandas as pd
+    run_task(window, ctrl, ipc)
+    assert ctrl.export_data(tmp_path / "r.xlsx") == 3
+    frame = pd.read_excel(tmp_path / "r.xlsx", engine="openpyxl")
+    assert list(frame.columns) == list(HEADERS) and len(frame) == 3
+
+
+def test_export_data_accepts_explicit_ads(ctrl, tmp_path):
+    assert ctrl.export_data(tmp_path / "e.csv", [{"site": "s", "price": 1}]) == 1
+    assert read_csv(tmp_path / "e.csv")[1][0] == "s"
+
+
+def test_export_without_data_shows_error(window, ctrl, dialogs, monkeypatch):
+    monkeypatch.setattr(window, "choose_export_path", lambda: pytest.fail("диалог не должен открываться"))
+    ctrl.on_export_requested()
+    assert dialogs.messages == ["Нет данных для экспорта: сначала выполните оценку."]
+
+
+def test_export_cancelled_in_file_dialog_does_nothing(window, ctrl, ipc, tmp_path, monkeypatch):
+    run_task(window, ctrl, ipc)
+    before = window.status_label.text()
+    monkeypatch.setattr(window, "choose_export_path", lambda: None)
+    ctrl.on_export_requested()
+    assert window.status_label.text() == before and list(tmp_path.glob("*.csv")) == []
+
+
+def test_export_error_is_shown_and_status_unchanged(window, ctrl, ipc, dialogs, tmp_path, monkeypatch):
+    run_task(window, ctrl, ipc)
+    before = window.status_label.text()
+    monkeypatch.setattr(window, "choose_export_path", lambda: str(tmp_path / "bad.txt"))
+    ctrl.on_export_requested()
+    assert "формат" in dialogs.messages[-1] and window.status_label.text() == before
+    (tmp_path / "busy.csv").mkdir()
+    monkeypatch.setattr(window, "choose_export_path", lambda: str(tmp_path / "busy.csv"))
+    ctrl.on_export_requested()
+    assert "Не удалось записать" in dialogs.messages[-1]
+
+
+def test_export_data_raises_export_error(ctrl, tmp_path):
+    with pytest.raises(ExportError):
+        ctrl.export_data(tmp_path / "x.doc", [])
+
+
+@pytest.mark.parametrize("path,flt,expected", [
+    ("/a/b/report", "CSV (*.csv)", "/a/b/report.csv"),
+    ("/a/b/report", "Excel (*.xlsx)", "/a/b/report.xlsx"),
+    ("/a/b/report", "", "/a/b/report.csv"),
+    ("/a/b/report.xlsx", "CSV (*.csv)", "/a/b/report.xlsx"),  # явное расширение главнее фильтра
+    ("/a/b/report.CSV", "Excel (*.xlsx)", "/a/b/report.CSV"),
+])
+def test_with_export_suffix(path, flt, expected):
+    assert with_export_suffix(path, flt) == expected
+
+
+def test_choose_export_path_uses_dialog(window, monkeypatch):
+    results = iter([("/tmp/out", "Excel (*.xlsx)"), ("", "")])
+    seen = []
+
+    class FakeFileDialog:
+        @staticmethod
+        def getSaveFileName(parent, caption, directory, flt):
+            seen.append((directory, flt))
+            return next(results)
+
+    monkeypatch.setattr(gui_module, "QFileDialog", FakeFileDialog)
+    assert window.choose_export_path() == "/tmp/out.xlsx"
+    assert window.choose_export_path() is None  # «Отмена»
+    assert seen[0] == ("aprice_export.csv", "CSV (*.csv);;Excel (*.xlsx)")
+
+
+# ---- настройки ----
+class FakeDialog(QObject):
+    database_updated = pyqtSignal(object)
+    instances: list = []
+
+    def __init__(self, config, parent, db_path=None):
+        super().__init__()
+        self.args = (config, parent, db_path)
+        self.executed = 0
+        FakeDialog.instances.append(self)
+
+    def exec(self):
+        self.executed += 1
+        return 1
+
+
+class FakeWindowManager:
+    def __init__(self):
+        self.applied: list = []
+
+    def apply(self, widget, window_id):
+        self.applied.append((widget, window_id))
+
+
+@pytest.fixture()
+def settings_ctrl(window, ipc, session, reference_db, state_db, tmp_path):
+    FakeDialog.instances = []
+    wm = FakeWindowManager()
+    controller = ClientController(
+        window, Config(tmp_path / "settings.json"), ipc=ipc, reference_db=reference_db,
+        state_db=state_db, session_ipc=session, window_manager=wm,
+        settings_dialog_factory=FakeDialog,
+    )
+    controller.wm = wm
+    yield controller
+    controller.shutdown()
+
+
+def test_settings_button_opens_modal_dialog_positioned_by_window_manager(window, settings_ctrl, reference_db):
+    window.settings_button.click()
+    dialog = FakeDialog.instances[0]
+    assert dialog.executed == 1
+    assert dialog.args == (settings_ctrl._config, window, reference_db)
+    assert settings_ctrl.wm.applied == [(dialog, "settings_dialog")]
+
+
+def test_settings_without_window_manager(window, ipc, session, reference_db, state_db, tmp_path):
+    FakeDialog.instances = []
+    controller = ClientController(window, Config(tmp_path / "s.json"), ipc=ipc,
+                                  reference_db=reference_db, state_db=state_db, session_ipc=session,
+                                  settings_dialog_factory=FakeDialog)
+    controller.open_settings()
+    assert FakeDialog.instances[0].executed == 1
+    controller.shutdown()
+
+
+def test_default_dialog_is_settings_dialog(window, ctrl, monkeypatch):
+    import client.settings_dialog as sd
+    created = []
+
+    class Stub(FakeDialog):
+        def __init__(self, config, parent, db_path=None):
+            super().__init__(config, parent, db_path)
+            created.append(self)
+
+    monkeypatch.setattr(sd, "SettingsDialog", Stub)
+    ctrl.open_settings()
+    assert created and created[0].executed == 1
+
+
+def test_limits_from_settings_go_to_server(window, ctrl, ipc):
+    ctrl._config.set("client", "max_pages_per_site", 3)
+    ctrl._config.set("client", "max_ads_per_site", 120)
+    pick_bmw_x5(window, "2019")
+    ctrl.submit()
+    assert ipc.calls[0][2] == {"max_pages_per_site": 3, "max_ads_per_site": 120}
+
+
+@pytest.mark.parametrize("bad", [0, -5, "10", None, True, 1.5])
+def test_invalid_limits_are_not_sent(ctrl, bad):
+    ctrl._config.set("client", "max_pages_per_site", bad)
+    ctrl._config.set("client", "max_ads_per_site", bad)
+    assert ctrl._limit_options() == {}
+
+
+def add_manufacturer(path: Path, name: str) -> None:
+    conn = sqlite3.connect(path)
+    cur = conn.execute("INSERT INTO manufacturers (name, updated_at) VALUES (?, 't')", (name,))
+    conn.execute("INSERT INTO models (manufacturer_id, name, updated_at) VALUES (?, '001', 't')",
+                 (cur.lastrowid,))  # марка без моделей в списке не появляется
+    conn.commit()
+    conn.close()
+
+
+def test_database_update_reloads_reference_and_keeps_form(window, settings_ctrl, reference_db):
+    choose(window.manufacturer_combo, "BMW")
+    choose(window.model_combo, "X5")
+    choose(window.generation_combo, "IV (G05)")
+    choose(window.year_combo, "2019")
+    add_manufacturer(reference_db, "Zeekr")
+    settings_ctrl._on_database_updated(object())
+    assert "Zeekr" in items(window.manufacturer_combo)
+    state = window.form_state()
+    assert (state.manufacturer, state.model, state.generation, state.year) == (
+        "BMW", "X5", "IV (G05)", 2019)
+    assert window.status_label.text() == "Справочник обновлён"
+
+
+def test_database_update_keeps_range_form(window, settings_ctrl, reference_db):
+    window.set_mode(form.MODE_RANGE)
+    choose(window.manufacturer_combo, "BMW")
+    choose(window.model_combo, "X5")
+    window.year_from_spin.setValue(2015)
+    window.year_to_spin.setValue(2019)
+    window.volume_from_spin.setValue(2.0)
+    add_manufacturer(reference_db, "Zeekr")
+    settings_ctrl._on_database_updated(object())
+    state = window.form_state()
+    assert state.mode == form.MODE_RANGE and (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.year_from, state.year_to, state.volume_from) == (2015, 2019, 2.0)
+
+
+def test_database_update_during_collection_is_deferred(window, settings_ctrl, ipc, reference_db):
+    pick_bmw_x5(window, "2019")
+    ipc.submit_reply = {"type": "task_accepted", "task_id": "T1", "queue_position": 0}
+    settings_ctrl.submit()
+    add_manufacturer(reference_db, "Zeekr")
+    settings_ctrl._on_database_updated(object())
+    assert "Zeekr" not in items(window.manufacturer_combo) and settings_ctrl._reload_pending
+    assert "после сбора" in window.status_label.text()
+    ipc.status_replies = [{"type": "status", "task_id": "T1", "state": "completed"}]
+    settings_ctrl.poll()
+    assert "Zeekr" in items(window.manufacturer_combo) and not settings_ctrl._reload_pending
+    assert window.form_state().model == "X5"  # форма не сброшена
+    assert stat_cells(window)[0] == "4 900 000 ₽"  # результаты на месте
+
+
+def test_dialog_signal_triggers_reload(window, settings_ctrl, reference_db):
+    window.settings_button.click()
+    add_manufacturer(reference_db, "Zeekr")
+    FakeDialog.instances[0].database_updated.emit(object())
+    assert "Zeekr" in items(window.manufacturer_combo)
+
+
+def test_main_passes_window_manager_to_controller(monkeypatch, tmp_path):
+    from client import main as main_module
+
+    seen: dict = {}
+
+    class SpyController(ClientController):
+        def __init__(self, *args, **kwargs):
+            seen["kwargs"] = kwargs
+            super().__init__(*args, **kwargs)
+
+    class FakeManager:
+        def __init__(self, settings_filename):
+            seen["manager"] = self
+
+        def apply(self, window, window_id):
+            pass
+
+    monkeypatch.setattr(main_module, "Config", lambda: Config(tmp_path / "settings.json"))
+    monkeypatch.setattr(main_module, "setup_logging", lambda **kw: None)
+    monkeypatch.setattr(main_module, "WindowManager", FakeManager)
+    monkeypatch.setattr(main_module, "ClientController", SpyController)
+    monkeypatch.setattr(ClientController, "start_session", lambda self: False)
+    monkeypatch.setattr(MainWindow, "show", lambda self: None)
+    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    assert main_module.main(["aprice-client"]) == 0
+    assert seen["kwargs"]["window_manager"] is seen["manager"]  # окно настроек центруется (W-01)

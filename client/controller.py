@@ -24,6 +24,11 @@
   отдельная задача.
 * Единичный сбой опроса не обрывает ожидание: связь считается потерянной после
   :data:`MAX_POLL_FAILURES` подряд неудач.
+* (4.4) Экспорт: контроллер хранит объявления последнего сбора и по «Экспорт»
+  выгружает их в CSV/XLSX (:mod:`client.export`); «Настройки» открывает
+  :class:`client.settings_dialog.SettingsDialog`; лимиты сбора из настроек
+  (``client.max_pages_per_site`` / ``max_ads_per_site``) уходят Server в ``options``.
+  После обновления базы из зеркала справочник перечитывается с сохранением формы.
 * Ошибка записи истории не ломает показ результата — только лог. Оценка без цен
   (``count == 0``) в историю не попадает: восстанавливать из неё нечего.
 * Окно используется как «утка» (методы ``set_*``/``show_*`` и сигналы), поэтому
@@ -42,6 +47,7 @@ from common import constants
 from common.config import Config
 from common.ipc_client import IpcClient, IpcError
 from client import form
+from client.export import ExportError, export_ads
 from client.history import describe, load_history, save_to_history
 from client.repository import (
     ReferenceData,
@@ -85,6 +91,8 @@ class ClientController(QObject):
         ads_loader: Callable[[Path, str], list[dict]] = load_ads,
         history_path: Optional[Path] = None,
         session_ipc: Optional[IpcClient] = None,
+        window_manager: Optional[Any] = None,
+        settings_dialog_factory: Optional[Callable[..., Any]] = None,
     ) -> None:
         """Создаёт контроллер и подключает его к сигналам окна.
 
@@ -97,6 +105,10 @@ class ClientController(QObject):
             poll_interval_ms: период опроса статуса.
             ads_loader: чтение объявлений (подмена в тестах).
             history_path: файл истории (по умолчанию ``constants.CLIENT_HISTORY_FILE``).
+            window_manager: ``WindowManager`` для позиционирования окна настроек
+                (``None`` — окно не регистрируется).
+            settings_dialog_factory: ``factory(config, parent, db_path=...)`` -> диалог
+                настроек (подмена в тестах; по умолчанию ``SettingsDialog``).
             session_ipc: долгоживущий IPC-клиент для «сеанса» (по умолчанию
                 ``IpcClient(one_shot=False)``, создаётся при первом обращении).
         """
@@ -111,6 +123,10 @@ class ClientController(QObject):
         self._history: list[dict] = []
         self._spec: Optional[dict] = None
         self._session_ipc = session_ipc
+        self._window_manager = window_manager
+        self._dialog_factory = settings_dialog_factory
+        self._last_ads: list[dict] = []
+        self._reload_pending = False
         self._session_open = False
         self._reference = ReferenceData()
         self.task_id: Optional[str] = None
@@ -126,6 +142,8 @@ class ClientController(QObject):
         window.model_changed.connect(self.on_model_changed)
         window.generation_changed.connect(self.on_generation_changed)
         window.history_selected.connect(self.on_history_selected)
+        window.export_requested.connect(self.on_export_requested)
+        window.settings_requested.connect(self.open_settings)
         self.load_reference()
         self.refresh_history()
 
@@ -195,7 +213,9 @@ class ClientController(QObject):
             self._window.show_error(error)
             return
         spec, options = form.build_spec(state), form.build_options()
+        options.update(self._limit_options())
         self._spec = spec
+        self._last_ads = []
         self._window.clear_results()
         self._window.set_running(True)
         self._window.set_status("Отправка задания…")
@@ -330,6 +350,8 @@ class ClientController(QObject):
         else:
             self._window.set_status("Сбор завершился ошибкой")
             self._window.show_error(self._failure_text(reply))
+        if self._reload_pending:
+            self._reload_reference_keep_form()
 
     def _show_results(self, task_id: Optional[str]) -> None:
         self._window.set_status("Обработка…")
@@ -340,6 +362,8 @@ class ClientController(QObject):
             self._window.set_status("Сбор завершён, но результаты не прочитаны")
             self._window.show_error(f"Не удалось прочитать результаты:\n{exc}")
             return
+        self._last_ads = ads
+        self._window.set_export_enabled(bool(ads))
         prices = [ad.get("price") for ad in ads]
         stats = calculate_stats(prices)
         self._window.update_charts(prices)
@@ -354,6 +378,98 @@ class ClientController(QObject):
             self.refresh_history()
 
     # ------------------------------------------------------------------
+    # Экспорт, настройки (4.4)
+    # ------------------------------------------------------------------
+    def export_data(self, file_path: Any, site_data: Optional[list] = None) -> int:
+        """Записывает объявления в ``.csv``/``.xlsx``; по умолчанию — последнего сбора.
+
+        Raises:
+            ExportError: формат не поддерживается или файл не записан.
+        """
+        ads = self._last_ads if site_data is None else site_data
+        return export_ads(file_path, ads)
+
+    def on_export_requested(self) -> None:
+        """Кнопка «Экспорт»: выбор файла и выгрузка; ошибки — диалогом, без падения."""
+        if not self._last_ads:
+            self._window.show_error("Нет данных для экспорта: сначала выполните оценку.")
+            return
+        path = self._window.choose_export_path()
+        if not path:
+            return
+        try:
+            count = self.export_data(path)
+        except ExportError as exc:
+            logger.error("Экспорт не выполнен: %s", exc)
+            self._window.show_error(str(exc))
+            return
+        self._window.set_status(f"Экспортировано объявлений: {count} → {path}")
+
+    def _limit_options(self) -> dict:
+        """Лимиты сбора из настроек (``client.*``); некорректные значения пропускаются."""
+        limits: dict = {}
+        for key in ("max_pages_per_site", "max_ads_per_site"):
+            value = self._config.get("client", key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                limits[key] = value
+        return limits
+
+    def open_settings(self) -> None:
+        """Кнопка «Настройки»: модальное окно, позиция — через ``WindowManager``."""
+        factory = self._dialog_factory or self._default_dialog_factory
+        dialog = factory(self._config, self._window, db_path=self._reference_db)
+        dialog.database_updated.connect(self._on_database_updated)
+        if self._window_manager is not None:
+            self._window_manager.apply(dialog, "settings_dialog")
+        dialog.exec()
+
+    @staticmethod
+    def _default_dialog_factory(config: Any, parent: Any, db_path: Optional[Path] = None) -> Any:
+        from client.settings_dialog import SettingsDialog
+
+        return SettingsDialog(config, parent, db_path=db_path)
+
+    def _on_database_updated(self, _result: Any) -> None:
+        """Справочник заменён: перечитать (во время сбора — после его окончания)."""
+        if self.task_id is not None:
+            self._reload_pending = True
+            self._window.set_status("Справочник обновлён; форма обновится после сбора")
+            return
+        self._reload_reference_keep_form()
+        self._window.set_status("Справочник обновлён")
+
+    def _reload_reference_keep_form(self) -> None:
+        """Перечитывает справочник и возвращает выбранные в форме значения."""
+        self._reload_pending = False
+        state = self._window.form_state()
+        if self.load_reference():
+            self._restore_form(self._spec_from_state(state))
+
+    @staticmethod
+    def _spec_from_state(state: form.FormState) -> dict:
+        """Состояние формы в виде словаря, понятного :meth:`_restore_form` (без проверок)."""
+        spec: dict = {
+            "mode": state.mode,
+            "manufacturer": state.manufacturer,
+            "model": state.model,
+            "generation": state.generation,
+        }
+        if state.mode == form.MODE_RANGE:
+            spec.update(
+                year_from=state.year_from, year_to=state.year_to,
+                engine_volume_from=state.volume_from or None,
+                engine_volume_to=state.volume_to or None,
+                transmissions=list(state.transmissions), fuels=list(state.fuels),
+            )
+        else:
+            spec.update(
+                year_from=state.year,
+                transmissions=[state.transmission] if state.transmission else [],
+                fuels=[state.fuel] if state.fuel else [],
+            )
+        return spec
+
+    # ------------------------------------------------------------------
     # История запросов
     # ------------------------------------------------------------------
     def refresh_history(self) -> None:
@@ -366,6 +482,7 @@ class ClientController(QObject):
         if self.task_id is not None or not 0 <= index < len(self._history):
             return
         entry = self._history[index]
+        self._last_ads = []  # в истории объявления не хранятся — экспортировать нечего
         spec = entry.get("spec") if isinstance(entry.get("spec"), dict) else {}
         self._restore_form(spec)
         self._window.clear_results()

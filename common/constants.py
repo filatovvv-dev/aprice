@@ -139,6 +139,15 @@ DEFAULT_SETTINGS: dict = {
     "client": {
         # Жёлтая плашка «отключите VPN» при старте Клиента (4.3).
         "show_vpn_warning": True,
+        # Лимиты сбора, которые Client передаёт Server в options (4.4).
+        # Значения по умолчанию совпадают с server.protocol.DEFAULT_MAX_*.
+        "max_pages_per_site": 10,
+        "max_ads_per_site": 500,
+        # Зеркало справочника aprice.db (прямая ссылка или публичная ссылка
+        # Яндекс.Диска); пусто — обновление отключено (4.4).
+        "db_update_url": "",
+        # Старше скольких дней база считается устаревшей (подсказка в настройках).
+        "db_max_age_days": 30,
     },
     "logging": {
         "level": "INFO",
