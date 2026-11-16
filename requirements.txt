@@ -3,3 +3,5 @@ playwright>=1.40
 pandas>=2.1
 numpy>=1.26
 matplotlib>=3.8
+requests>=2.31
+openpyxl>=3.1
