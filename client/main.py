@@ -31,10 +31,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     setup_logging(component="client", config=config)
 
     window = MainWindow(show_vpn_warning=bool(config.get("client", "show_vpn_warning", True)))
-    controller = ClientController(window, config)  # ссылка живёт до конца exec()
-    app.aboutToQuit.connect(controller.shutdown)
-
     window_manager = WindowManager(settings_filename=constants.CLIENT_WINDOW_SETTINGS_FILE)
+    # window_manager нужен контроллеру для позиционирования окна настроек (W-01..W-06).
+    controller = ClientController(window, config, window_manager=window_manager)  # живёт до конца exec()
+    app.aboutToQuit.connect(controller.shutdown)
     window_manager.apply(window, WINDOW_ID)
 
     window.show()
