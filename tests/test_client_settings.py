@@ -5,11 +5,34 @@ import os
 import time
 
 import pytest
+from PyQt6.QtWidgets import QApplication
 
 import client.settings_dialog as sd
 from client.db_update import DbUpdateError, UpdateResult
 from client.settings_dialog import DbUpdateThread, SettingsDialog, url_error
 from common.config import Config
+
+
+def wait_for(condition, timeout: float = 5.0) -> None:
+    """Прокручивает события Qt, пока не выполнится ``condition`` (или не истечёт таймаут).
+
+    В настоящем Qt ``QThread`` работает асинхронно: сигналы потока доставляются в
+    GUI-поток через очередь событий, поэтому проверять результат сразу после
+    ``start_update()`` нельзя. Хелпер не зависит от ``QtTest``/``pytest-qt``.
+    """
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail("Условие не выполнено за отведённое время (поток не завершился?)")
+        QApplication.processEvents()
+        time.sleep(0.005)
+
+
+def finish_thread(d: SettingsDialog, timeout_ms: int = 5000) -> None:
+    """Дожидается окончания потока обновления, чтобы он не был уничтожен «на ходу»."""
+    if d._thread is not None:
+        assert d._thread.wait(timeout_ms)
+    QApplication.processEvents()
 
 
 class Boxes:
@@ -146,6 +169,8 @@ def test_update_success_emits_signal_and_informs(qapp, config, db_file, boxes):
     d.database_updated.connect(got.append)
     d.url_edit.setText("https://mirror.test/aprice.db")
     d.update_button.click()
+    wait_for(lambda: calls and got)  # поток асинхронный: ждём downloader и сигнал
+    finish_thread(d)
     assert calls == [("https://mirror.test/aprice.db", db_file)]
     assert got == [RESULT]
     assert "марок: 7" in d.update_status_label.text() and "марок: 7" in boxes.info_texts[0]
@@ -157,6 +182,8 @@ def test_update_uses_unsaved_url_field(qapp, config, db_file):
     d = SettingsDialog(config, db_path=db_file, thread_factory=fake_thread(RESULT, calls))
     d.url_edit.setText("https://unsaved.test/db")
     d.start_update()
+    wait_for(lambda: calls)
+    finish_thread(d)
     assert calls[0][0] == "https://unsaved.test/db"
     assert Config(config.path).load().get("client", "db_update_url") == ""  # в файл не писалось
 
@@ -168,6 +195,8 @@ def test_update_failure_shows_message_box(qapp, config, db_file, boxes):
     d.database_updated.connect(got.append)
     d.url_edit.setText("https://mirror.test/x.db")
     d.start_update()
+    wait_for(lambda: boxes.critical_texts)
+    finish_thread(d)
     assert boxes.critical_texts == ["Не удалось скачать базу: 404"]
     assert got == [] and d.update_button.isEnabled()
     assert d.update_status_label.text() == "Обновление не выполнено."
@@ -177,6 +206,8 @@ def test_unexpected_error_in_thread_is_reported_not_raised(qapp, config, db_file
     d = SettingsDialog(config, db_path=db_file, thread_factory=fake_thread(RuntimeError("boom"), []))
     d.url_edit.setText("https://mirror.test/x.db")
     d.start_update()
+    wait_for(lambda: boxes.critical_texts)
+    finish_thread(d)
     assert "Непредвиденная ошибка: boom" in boxes.critical_texts[0]
 
 
