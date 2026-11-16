@@ -200,6 +200,48 @@ def aggregate_configurations(mods: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Выбор марок (Builder-fix)
+# ---------------------------------------------------------------------------
+def select_brands(raw_brands: list[dict], limit: Optional[int]) -> list[dict]:
+    """Выбирает марки к обработке.
+
+    * ``limit`` пуст (``None``/``0``) — **все** марки каталога в исходном порядке.
+      (Раньше и при пустом лимите оставлялись только «популярные» марки — около 30
+      из 429, из-за чего полный сбор не работал.)
+    * ``limit`` задан — не более ``limit`` марок: сначала «популярные», затем остальные.
+    """
+    if not limit:
+        return list(raw_brands)
+    popular = [b for b in raw_brands if b.get("popular")]
+    rest = [b for b in raw_brands if not b.get("popular")]
+    return (popular + rest)[: int(limit)]
+
+
+def clear_cache(directory: Optional[Path] = None) -> int:
+    """Удаляет все файлы в каталоге кэша (по умолчанию ``data/cache/``).
+
+    Вложенные каталоги не затрагиваются. Несуществующий каталог — не ошибка.
+
+    Returns:
+        int: число удалённых файлов.
+
+    Raises:
+        OSError: файл не удалось удалить (занят, нет прав); уже удалённые
+            до ошибки файлы остаются удалёнными.
+    """
+    target = Path(directory) if directory is not None else constants.CACHE_DIR
+    if not target.is_dir():
+        return 0
+    removed = 0
+    for entry in target.iterdir():
+        if entry.is_file():
+            entry.unlink()
+            removed += 1
+    logger.info("Кэш очищен: %s, удалено файлов: %d", target, removed)
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Кэш HTTP-ответов (P-06)
 # ---------------------------------------------------------------------------
 class ResponseCache:
@@ -235,6 +277,10 @@ class ResponseCache:
             logger.debug("Кэш по URL устарел: %s", url)
             return None
         return payload.get("data")
+
+    def clear(self) -> int:
+        """Удаляет все файлы кэша; возвращает число удалённых файлов."""
+        return clear_cache(self._dir)
 
     def put(self, url: str, data: object) -> None:
         """Сохраняет ответ в кэш."""
@@ -296,6 +342,13 @@ class CatalogParser:
             self._limit = None
         else:
             self._limit = int(limit_brands)
+
+        # Запрос поколений по моделям, если общий /generations усечён (Builder-fix).
+        self._per_model_generations_enabled = bool(
+            config.get("builder", "generations_per_model", True)
+        )
+        self._generations_from_bulk = 0
+        self._generations_per_model = 0
 
         # Токен API cars-base.ru из конфига (задача №2, п. 6).
         self._token = str(config.get("builder", "cars_base_token", constants.CARS_BASE_TOKEN))
@@ -367,14 +420,16 @@ class CatalogParser:
         if not raw_brands:
             raise RuntimeError("API вернул пустой список марок")
 
-        popular = [b for b in raw_brands if b.get("popular")] or raw_brands
-        selected = popular[: self._limit] if self._limit else popular
+        selected = select_brands(raw_brands, self._limit)
         logger.info(
             "API /full: всего марок %d, к обработке выбрано %d (лимит %s)",
-            len(raw_brands), len(selected), self._limit,
+            len(raw_brands), len(selected),
+            self._limit if self._limit else "нет",
         )
 
         generations_index = self._build_generations_index()
+        self._generations_from_bulk = 0
+        self._generations_per_model = 0
 
         brands: list[BrandData] = []
         total = len(selected)
@@ -389,7 +444,13 @@ class CatalogParser:
                     name=model_raw["name"].strip(),
                     source_id=str(model_raw.get("id", "")),
                 )
-                gen_rows = generations_index.get(model_raw.get("id", ""), [])
+                model_key = str(model_raw.get("id", ""))
+                gen_rows = generations_index.get(model_key)
+                if gen_rows is None:
+                    # Общий список мог быть усечён (пагинация) — спрашиваем по модели.
+                    gen_rows = self._fetch_generations_for_model(model_key)
+                else:
+                    self._generations_from_bulk += len(gen_rows)
                 for gen_raw in gen_rows:
                     gen = GenerationData(
                         name=self._normalize_generation_name(gen_raw),
@@ -415,16 +476,59 @@ class CatalogParser:
             logger.info("Обработано марок: %d/%d", idx, total)
             self._progress(idx, total, f"Обработано марок: {idx}/{total} ({brand.name})")
             brands.append(brand)
+        logger.info(
+            "Поколения: из общего списка %d, запросами по моделям %d",
+            self._generations_from_bulk, self._generations_per_model,
+        )
         return brands
 
     def _build_generations_index(self) -> dict[str, list[dict]]:
         """Загружает все поколения одним запросом и индексирует по model_id."""
         data = self._http_json_cached(constants.CARS_BASE_GENERATIONS_URL)
+        rows = data.get("data", [])
         index: dict[str, list[dict]] = {}
-        for row in data.get("data", []):
-            index.setdefault(row.get("model_id", ""), []).append(row)
-        logger.info("API /generations: получено поколений: %d", len(data.get("data", [])))
+        for row in rows:
+            if row.get("model_id") is None:
+                continue
+            # Ключ — строка: id в /full и model_id в /generations могут отличаться типом.
+            index.setdefault(str(row["model_id"]), []).append(row)
+        logger.info("API /generations: получено поколений: %d (моделей с поколениями: %d)",
+                    len(rows), len(index))
         return index
+
+    def _fetch_generations_for_model(self, model_id: str) -> list[dict]:
+        """Поколения одной модели: ``/generations?model_id=...`` (с кэшем).
+
+        Нужен, когда общий ``/generations`` вернул не всё (усечён пагинацией).
+        Если API игнорирует ``model_id`` и отдаёт чужие строки, запросы по моделям
+        отключаются на весь прогон (иначе на каждую модель скачивался бы весь список);
+        из ответа берутся только строки нужной модели.
+        """
+        if not self._per_model_generations_enabled or not model_id:
+            return []
+        url = (
+            constants.CARS_BASE_GENERATIONS_URL
+            + "?"
+            + urllib.parse.urlencode({"model_id": model_id})
+        )
+        try:
+            data = self._http_json_cached(url)
+        except CaptchaDetectedError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Поколения модели %s: ошибка %s — пропускаю", model_id, exc)
+            return []
+        rows = data.get("data", [])
+        mine = [r for r in rows if str(r.get("model_id")) == model_id]
+        if len(mine) != len(rows):
+            logger.warning(
+                "API /generations игнорирует model_id (строк %d, для модели %s — %d): "
+                "запросы поколений по моделям отключены",
+                len(rows), model_id, len(mine),
+            )
+            self._per_model_generations_enabled = False
+        self._generations_per_model += len(mine)
+        return mine
 
     def _fetch_modifications(
         self, model_id: str, generation_id: Optional[str]
@@ -682,7 +786,13 @@ class CatalogParser:
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Некорректный JSON от {url}: {exc}") from exc
 
-        self._cache.put(request_url, data)
+        # Пустой ответ общих списков (/full, /generations) не кэшируем: иначе временный
+        # сбой «залипает» в кэше на TTL. Запросы с параметрами (по модели) — кэшируем:
+        # для них пустой ответ — обычное дело.
+        if "?" not in url and isinstance(data, dict) and not data.get("data"):
+            logger.warning("Пустой ответ %s — в кэш не записываю", url)
+        else:
+            self._cache.put(request_url, data)
         return data
 
     @staticmethod

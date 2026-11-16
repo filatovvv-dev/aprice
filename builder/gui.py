@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
 )
 
 from builder.database import Database
-from builder.parser import CaptchaDetectedError, CatalogParser
+from builder.parser import CaptchaDetectedError, CatalogParser, clear_cache
 from common import constants
 from common.config import Config
 from common.logger import QtLogEmitter
@@ -156,10 +156,16 @@ class BuilderWindow(QMainWindow):
         self.btn_stop = QPushButton("Остановить", central)
         self.btn_stop.setEnabled(False)
         self.btn_save_log = QPushButton("Сохранить лог", central)
+        self.btn_clear_cache = QPushButton("Очистить кэш", central)
+        self.btn_clear_cache.setToolTip(
+            "Удалить сохранённые ответы источника (data/cache/): следующий сбор "
+            "запросит данные заново"
+        )
         buttons_row.addWidget(self.btn_update)
         buttons_row.addWidget(self.btn_stop)
         buttons_row.addStretch(1)
         buttons_row.addWidget(self.btn_save_log)
+        buttons_row.addWidget(self.btn_clear_cache)
         layout.addLayout(buttons_row)
 
         # Ограничение объёма прогона (задача №2, п. 1.4): состояние
@@ -196,6 +202,7 @@ class BuilderWindow(QMainWindow):
         self.btn_update.clicked.connect(self._on_update_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
         self.btn_save_log.clicked.connect(self._on_save_log_clicked)
+        self.btn_clear_cache.clicked.connect(self._on_clear_cache_clicked)
 
     def _connect_logger(self, handler: logging.Handler) -> None:
         """Подключает GUI-хэндлер логгера к сигналу ``log_message``.
@@ -216,6 +223,7 @@ class BuilderWindow(QMainWindow):
             return
         self.log_view.appendPlainText("— Начало обновления базы —")
         self.btn_update.setEnabled(False)
+        self.btn_clear_cache.setEnabled(False)  # кэш используется сбором
         self.btn_stop.setEnabled(True)
         self.progress_bar.setRange(0, 0)
 
@@ -273,6 +281,18 @@ class BuilderWindow(QMainWindow):
         self._show_error(message)
         self._refresh_status()
 
+    def _on_clear_cache_clicked(self) -> None:
+        """Удаляет все файлы ``data/cache/`` (пустые ответы прошлых запусков и т. п.)."""
+        if self._worker is not None and self._worker.isRunning():
+            return
+        try:
+            removed = clear_cache()
+        except OSError as exc:
+            logger.error("Кэш не очищен: %s", exc)
+            self._show_error(f"Не удалось очистить кэш: {exc}")
+            return
+        self.log_view.appendPlainText(f"Кэш очищен: удалено файлов — {removed}")
+
     def _on_save_log_clicked(self) -> None:
         """Сохраняет содержимое лог-панели в файл через диалог."""
         default_name = datetime.now().strftime("aprice_builder_log_%Y%m%d_%H%M%S.txt")
@@ -298,6 +318,7 @@ class BuilderWindow(QMainWindow):
     def _reset_buttons(self) -> None:
         """Возвращает кнопки в состояние покоя."""
         self.btn_update.setEnabled(True)
+        self.btn_clear_cache.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
     def _refresh_status(self) -> None:
