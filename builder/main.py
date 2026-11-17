@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import QApplication
 from builder.database import Database
 from builder.gui import BuilderWindow
 from common.config import Config
+from common import constants, paths
 from common.logger import setup_logging
 
 
@@ -29,6 +30,11 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("APrice-Builder")
     app.setOrganizationName("APrice")
+
+    # Каталоги config/logs/data — рядом с .exe; вшитую aprice.db копируем при
+    # первом запуске (если рядом с .exe её ещё нет).
+    paths.ensure_runtime_dirs()
+    paths.bootstrap_reference_db(constants.DB_FILE)
 
     config = Config().load()
     gui_handler = setup_logging(config, component="builder")

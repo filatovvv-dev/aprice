@@ -6,8 +6,8 @@ Windows-приложение для оценки рыночной стоимос
 | Компонент | Назначение | Статус |
 |---|---|---|
 | **APrice-Builder** | Формирователь справочной базы (каталог марки → модели → поколения → КПП/топливо/объёмы/мощности) | ✅ реализован (задачи №1–2, включая доработки по код-ревью) |
-| **APrice-Server** | Фоновый сборщик объявлений | 🔒 заглушка (задача №3); `common` подготовлен к переиспользованию |
-| **APrice-Client** | GUI оценки | 🔒 заглушка (задача №4) |
+| **APrice-Server** | Фоновый сборщик объявлений (трей, IPC, парсеры) | ✅ реализован (задача №3) |
+| **APrice-Client** | GUI оценки (статистика, история, графики, экспорт) | ✅ реализован (задача №4) |
 
 **Стек:** Разработка и сборка — Python 3.11.x или 3.12.x (НЕ 3.15), PyQt6, Playwright (Chromium), SQLite, pandas/numpy, PyQt6.QtNetwork (IPC на QTcpServer).
 **Целевая ОС:** Windows 10/11 x64 (разработка возможна на Linux).
@@ -84,9 +84,12 @@ APrice/
 │   ├── database.py             # схема SQLite v2 + UPSERT (P-09)
 │   ├── migrations.py           # миграция схемы v1 → v2 (UNIQUE в configurations)
 │   └── gui.py                  # окно PyQt6, QThread-парсинг, чекбокс лимита марок
-├── server/__init__.py          # заглушка (задача №3)
-├── client/__init__.py          # заглушка (задача №4)
-├── common/                     # config, logger, window_manager, constants
+├── server/                     # APrice-Server (+ browser_check.py — установка Chromium)
+├── client/                     # APrice-Client
+├── common/                     # config, logger, window_manager, constants, paths
+│   └── paths.py                # BASE_DIR (каталог .exe / корень проекта), копирование aprice.db
+├── build.py                    # сборка всех трёх .exe (PyInstaller, onedir)
+├── build_scripts/              # builder.spec, server.spec, client.spec
 │   └── constants.py            # + константы IPC и Server (подготовка к задаче №3)
 ├── data/aprice.db              # справочная база (схема v2)
 ├── data/aprice.db.bak-v1       # резервная копия БД перед миграцией v1→v2
@@ -288,6 +291,73 @@ Server читает секцию `server` из `config/settings.json`:
   (чтение баз), `client/stats.py`, `client/history.py` (без Qt),
   `client/controller.py` (IPC, опрос), `client/gui.py` (окно),
   `client/main.py` (точка входа).
+
+## Сборка и развёртывание (этап 5)
+
+Распространяются **три независимые папки** (PyInstaller, режим `--onedir`):
+`dist/Builder/APrice-Builder.exe`, `dist/Server/APrice-Server.exe`,
+`dist/Client/APrice-Client.exe`. Python на машине пользователя не нужен.
+
+### Для разработчика: как собрать
+
+Сборка выполняется **на Windows 10/11 x64** (PyInstaller не кросс-компилирует).
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt pyinstaller
+python build.py
+```
+
+`build.py` очищает `dist/` и `build/`, по очереди собирает
+`build_scripts/builder.spec`, `server.spec`, `client.spec`
+(`--clean --noconfirm`), копирует `README.md` и `requirements.txt` в `dist/` и
+выводит «Сборка завершена. Файлы в dist/».
+
+* **Перед сборкой** положите в `data/aprice.db` **полную** справочную базу —
+  `builder.spec` вшивает именно этот файл (если его нет, сборка остановится).
+* В `.spec`-файлах используются `collect_all('PyQt6')`, `collect_all('matplotlib')`,
+  `collect_all('playwright')` и `hiddenimports`; при `ModuleNotFoundError` в
+  собранном приложении добавьте недостающий модуль в `hiddenimports` нужного `.spec`.
+* Chromium в сборку **не** входит (иначе +200 МБ): Server скачивает его сам.
+
+### Для пользователя: как запускать
+
+1. Запустите **`APrice-Server.exe`** — окно не появится, приложение свернётся в
+   трей. При самом первом запуске Server проверит наличие браузера Chromium и,
+   если его нет, скачает (окно «Идёт установка браузера», нужен интернет,
+   ~150 МБ, один раз). Если установка не удалась, будет показано сообщение
+   «Не удалось установить браузер. Проверьте соединение или установите вручную»
+   — в этом случае выполните в командной строке `playwright install chromium`.
+2. Запустите **`APrice-Client.exe`** — окно оценки стоимости.
+3. **`APrice-Builder.exe`** нужен только для обновления справочников
+   (марки/модели/поколения). При первом запуске он копирует вшитую
+   `aprice.db` в `data\` рядом с собой. Чтобы Client увидел обновлённую базу,
+   скопируйте её в `data\` рядом с `APrice-Client.exe` или используйте
+   «Настройки → Обновить базу» в Client.
+
+Папки `config\`, `logs\` и `data\` создаются **рядом с `.exe`** каждого
+компонента (а не во временной папке PyInstaller).
+
+### Системные требования
+
+Windows 10/11 x64, 4 ГБ ОЗУ, ~1 ГБ свободного места (с учётом Chromium),
+доступ в интернет для сбора объявлений.
+
+### Автозапуск Server (Планировщик задач Windows)
+
+1. Win+R → `taskschd.msc` → **Создать задачу…** (не «простую»).
+2. Вкладка **Общие**: имя `APrice-Server`; «Выполнять только для пользователя,
+   вошедшего в систему».
+3. Вкладка **Триггеры** → **Создать** → «Начать задачу»: **При входе в систему**
+   (укажите нужного пользователя).
+4. Вкладка **Действия** → **Создать** → «Запуск программы»: путь к
+   `...\Server\APrice-Server.exe`; в поле «Рабочая папка» — `...\Server`.
+5. Вкладка **Условия**: снимите «Запускать только при питании от сети»
+   (для ноутбуков). **ОК**.
+
+Server — GUI-приложение для трея, поэтому задача должна выполняться в сеансе
+пользователя (не «независимо от входа пользователя в систему»).
 
 ## Подготовка к задаче №3 (Server)
 

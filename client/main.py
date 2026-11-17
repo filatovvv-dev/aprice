@@ -8,7 +8,7 @@ from typing import Optional
 
 from PyQt6.QtWidgets import QApplication
 
-from common import constants
+from common import constants, paths
 from common.config import Config
 from common.logger import setup_logging
 from common.window_manager import WindowManager
@@ -27,6 +27,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     app.setQuitOnLastWindowClosed(True)
     app.setApplicationName(APPLICATION_NAME)
 
+    paths.ensure_runtime_dirs()  # config/, logs/, data/ — рядом с .exe
     config = Config().load()
     setup_logging(component="client", config=config)
 

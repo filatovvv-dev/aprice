@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from common import paths
+
 # ---------------------------------------------------------------------------
 # Версии и имена
 # ---------------------------------------------------------------------------
@@ -24,21 +26,11 @@ SOURCE_CARS_BASE: str = "cars-base.ru"
 # ---------------------------------------------------------------------------
 # Пути (относительно корня проекта / каталога .exe)
 # ---------------------------------------------------------------------------
-def _project_root() -> Path:
-    """Возвращает корень проекта или каталог .exe (для PyInstaller-сборки).
-
-    Returns:
-        Path: базовый каталог для data/, config/, logs/.
-    """
-    import sys
-
-    if getattr(sys, "frozen", False):  # собранное приложение (этап 5)
-        return Path(sys.executable).parent
-    # common/constants.py -> common -> корень проекта
-    return Path(__file__).resolve().parent.parent
+# Единая точка правды о путях — common/paths.py (учитывает PyInstaller, этап 5.1).
+BASE_DIR: Path = paths.BASE_DIR
 
 
-ROOT_DIR: Path = _project_root()
+ROOT_DIR: Path = BASE_DIR
 DATA_DIR: Path = ROOT_DIR / "data"
 CACHE_DIR: Path = DATA_DIR / "cache"
 CONFIG_DIR: Path = ROOT_DIR / "config"
