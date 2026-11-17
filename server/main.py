@@ -46,6 +46,11 @@ from server.tray import TrayIcon
 
 logger = logging.getLogger("aprice.server.main")
 
+# 5.2: portable-режим — Chromium ищется (и ставится) в browser/ рядом с .exe, а не в
+# AppData. Должно выполниться до любого запуска Playwright; его импорты в проекте
+# ленивые (внутри функций), поэтому достаточно сделать это при загрузке модуля.
+BROWSERS_DIR = paths.configure_playwright_browsers_path()
+
 SERVER_VERSION = "0.1.0"
 APPLICATION_NAME = "APrice-Server"
 FATAL_TITLE = "АвтоПрайс — ошибка"

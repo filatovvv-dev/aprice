@@ -22,12 +22,35 @@ logger = logging.getLogger("aprice.server.browser_check")
 INSTALL_FAILED_MESSAGE = (
     "Не удалось установить браузер. Проверьте соединение или установите вручную"
 )
+NOT_FOUND_MESSAGE = (
+    "Chromium не найден по пути {path}. "
+    "Установите его или положите в папку browser/ рядом с программой"
+)
 INSTALL_TITLE = "АвтоПрайс — установка браузера"
 INSTALL_PROGRESS_TEXT = (
     "Первый запуск: скачивается браузер Chromium (около 150 МБ).\n"
     "Пожалуйста, подождите — это происходит один раз."
 )
 INSTALL_TIMEOUT_SEC = 1800  # 30 минут на медленном канале
+
+
+def chromium_executable_path() -> str:
+    """Путь, по которому Playwright ожидает Chromium (``pw.chromium.executable_path``).
+
+    Учитывает ``PLAYWRIGHT_BROWSERS_PATH`` (``browser/`` рядом с ``.exe``, 5.2).
+    Если Playwright недоступен — возвращает каталог ``browser/`` как подсказку.
+
+    Returns:
+        str: путь к ``chrome.exe`` (файл может не существовать) либо каталог ``browser``.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            return str(pw.chromium.executable_path or "")
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось определить путь к Chromium")
+        return ""
 
 
 def chromium_installed() -> bool:
@@ -37,15 +60,23 @@ def chromium_installed() -> bool:
         bool: ``True`` — браузер установлен; ``False`` — его нет или Playwright
         недоступен/упал при проверке.
     """
-    try:
-        from playwright.sync_api import sync_playwright
+    executable = chromium_executable_path()
+    return bool(executable) and Path(executable).exists()
 
-        with sync_playwright() as pw:
-            executable = pw.chromium.executable_path
-        return bool(executable) and Path(executable).exists()
-    except Exception:  # noqa: BLE001 - любая ошибка = «считаем, что браузера нет»
-        logger.exception("Не удалось проверить наличие Chromium")
-        return False
+
+def not_found_message() -> str:
+    """Сообщение «Chromium не найден по пути …» (с учётом ``browser/`` рядом с ``.exe``)."""
+    path = chromium_executable_path() or os.environ.get(
+        "PLAYWRIGHT_BROWSERS_PATH", "browser"
+    )
+    return NOT_FOUND_MESSAGE.format(path=path)
+
+
+def _pin_browsers_path(env: dict[str, str]) -> None:
+    """Гарантирует, что установка пойдёт в ``PLAYWRIGHT_BROWSERS_PATH`` (browser/ рядом с .exe)."""
+    value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if value:
+        env["PLAYWRIGHT_BROWSERS_PATH"] = value
 
 
 def build_install_command() -> tuple[list[str], dict[str, str]]:
@@ -67,9 +98,11 @@ def build_install_command() -> tuple[list[str], dict[str, str]]:
         node, cli = (driver if isinstance(driver, tuple) else (str(driver), None))
         argv = [str(node)] + ([str(cli)] if cli else []) + ["install", "chromium"]
         env = dict(get_driver_env())
+        _pin_browsers_path(env)
         return argv, env
     except Exception:  # noqa: BLE001 - запасной вариант из ТЗ
         logger.warning("Драйвер Playwright не найден, использую команду 'playwright'")
+        _pin_browsers_path(env)
         return ["playwright", "install", "chromium"], env
 
 
@@ -194,6 +227,7 @@ def ensure_chromium(
     result = ui.run(installer)
     if result is not None and result[0] and is_installed():
         return True
-    logger.error("Chromium не установлен: %s", result[1] if result else "отменено")
-    ui.show_error(INSTALL_FAILED_MESSAGE)
+    hint = not_found_message()
+    logger.error("Chromium не установлен: %s. %s", result[1] if result else "отменено", hint)
+    ui.show_error(f"{INSTALL_FAILED_MESSAGE}\n\n{hint}")
     return False

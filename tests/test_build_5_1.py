@@ -154,15 +154,17 @@ def test_ensure_chromium_failure_shows_required_message():
         ui, is_installed=lambda: False, installer=lambda: (False, "SSL: CERTIFICATE_VERIFY_FAILED")
     )
     assert ok is False
-    assert ui.errors == [
+    assert len(ui.errors) == 1
+    assert ui.errors[0].startswith(
         "Не удалось установить браузер. Проверьте соединение или установите вручную"
-    ]
+    )
+    assert "Chromium не найден по пути" in ui.errors[0]  # 5.2: плюс подсказка с путём
 
 
 def test_ensure_chromium_cancel_shows_error():
     ui = FakeUi(result=None)
     assert browser_check.ensure_chromium(ui, is_installed=lambda: False) is False
-    assert ui.errors == [browser_check.INSTALL_FAILED_MESSAGE]
+    assert len(ui.errors) == 1 and ui.errors[0].startswith(browser_check.INSTALL_FAILED_MESSAGE)
 
 
 def test_install_chromium_reports_nonzero_exit():
