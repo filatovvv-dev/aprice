@@ -233,19 +233,96 @@ SPECS = {
 }
 
 
+# Что каждый компонент реально использует (5.1-fix): включить / исключить.
+EXCLUDES = {
+    "builder": {"matplotlib", "playwright", "pandas", "numpy", "openpyxl"},
+    "server": {"matplotlib", "pandas", "numpy", "openpyxl"},
+    "client": {"playwright"},
+}
+COLLECT_ALL = {
+    "builder": set(),
+    "server": {"playwright"},
+    "client": {"matplotlib"},
+}
+HIDDEN = {
+    "builder": {"PyQt6.QtWidgets", "sqlite3"},
+    "server": {"PyQt6.QtNetwork", "playwright.sync_api", "sqlite3"},
+    "client": {"matplotlib.backends.backend_qtagg", "pandas", "numpy", "openpyxl", "requests", "sqlite3"},
+}
+
+
+def _spec_namespace(key: str) -> dict:
+    """Исполняет .spec с заглушками PyInstaller и возвращает его переменные."""
+    captured: dict = {}
+
+    class Rec:
+        def __init__(self, *a, **kw):
+            self.kw = kw
+            self.pure = []
+            self.scripts, self.binaries, self.datas = [], [], []
+
+    def collect_all(name):
+        captured.setdefault("collected", []).append(name)
+        return [], [], []
+
+    ns = {
+        "SPECPATH": str(ROOT / "build_scripts"),
+        "Analysis": lambda *a, **kw: captured.update(analysis=kw) or Rec(**kw),
+        "PYZ": Rec, "EXE": lambda *a, **kw: captured.update(exe=kw) or Rec(**kw),
+        "COLLECT": lambda *a, **kw: captured.update(coll=kw) or Rec(**kw),
+    }
+    import types
+
+    hooks = types.ModuleType("PyInstaller.utils.hooks")
+    hooks.collect_all = collect_all
+    hooks.collect_submodules = lambda n: [n]
+    pkg = {"PyInstaller": types.ModuleType("PyInstaller"),
+           "PyInstaller.utils": types.ModuleType("PyInstaller.utils"),
+           "PyInstaller.utils.hooks": hooks}
+    saved = {k: sys.modules.get(k) for k in pkg}
+    sys.modules.update(pkg)
+    try:
+        exec(compile((ROOT / "build_scripts" / f"{key}.spec").read_text(encoding="utf-8"), f"{key}.spec", "exec"), ns)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    return captured
+
+
 @pytest.mark.parametrize("key", SPECS)
 def test_spec_files_are_onedir_with_required_hooks(key):
     name, entry = SPECS[key]
     text = (ROOT / "build_scripts" / f"{key}.spec").read_text(encoding="utf-8")
-    compile(text, f"{key}.spec", "exec")  # синтаксис
-    assert f"name='{name}'" in text
-    assert entry in text
-    assert "COLLECT(" in text and "exclude_binaries=True" in text  # onedir
+    assert f"name='{name}'" in text and entry in text
+    assert "exclude_binaries=True" in text and "COLLECT(" in text  # onedir
     assert "onefile" not in text.lower()
-    assert "collect_all('PyQt6')" in text
-    assert "collect_all('matplotlib')" in text
-    assert "collect_all('playwright')" in text
-    assert "hiddenimports" in text
+    cap = _spec_namespace(key)
+    assert set(cap.get("collected", [])) == COLLECT_ALL[key]
+    assert cap["analysis"]["hiddenimports"]
+    assert HIDDEN[key] <= set(cap["analysis"]["hiddenimports"])
+
+
+@pytest.mark.parametrize("key", SPECS)
+def test_spec_excludes_and_includes_are_disjoint(key):
+    """Исключённое не включено (и наоборот): excludes ⊇ ожидаемого, hiddenimports ∩ excludes = ∅."""
+    cap = _spec_namespace(key)
+    excludes = set(cap["analysis"]["excludes"])
+    hidden = set(cap["analysis"]["hiddenimports"])
+    assert EXCLUDES[key] <= excludes
+    assert not (hidden & excludes)
+    assert not (set(cap.get("collected", [])) & excludes)
+    # Лишние модули Qt не собираем, нужные не исключаем
+    assert {"PyQt6.QtWidgets", "PyQt6.QtGui", "PyQt6.QtCore"}.isdisjoint(excludes)
+
+
+def test_components_do_not_bundle_each_others_code():
+    assert "builder" not in " ".join(_spec_namespace("server")["analysis"]["hiddenimports"]).split()
+    client_hidden = set(_spec_namespace("client")["analysis"]["hiddenimports"])
+    assert "server.protocol" in client_hidden and "server" not in client_hidden
+    assert "client" not in _spec_namespace("builder")["analysis"]["hiddenimports"]
 
 
 def test_only_builder_spec_bundles_database():

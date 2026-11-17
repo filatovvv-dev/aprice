@@ -316,9 +316,16 @@ python build.py
 
 * **Перед сборкой** положите в `data/aprice.db` **полную** справочную базу —
   `builder.spec` вшивает именно этот файл (если его нет, сборка остановится).
-* В `.spec`-файлах используются `collect_all('PyQt6')`, `collect_all('matplotlib')`,
-  `collect_all('playwright')` и `hiddenimports`; при `ModuleNotFoundError` в
-  собранном приложении добавьте недостающий модуль в `hiddenimports` нужного `.spec`.
+* Каждый `.spec` включает только свои зависимости (остальное — в `excludes`):
+  Builder — PyQt6 + sqlite3 (без matplotlib/playwright/pandas/numpy/openpyxl);
+  Server — PyQt6 + playwright (`collect_all('playwright')`, нужен драйвер для
+  установки Chromium); Client — PyQt6 + matplotlib (`collect_all('matplotlib')`) +
+  pandas/numpy/openpyxl/requests (без playwright). Пакет PyQt6 целиком не
+  собирается: берутся только используемые модули Qt. При `ModuleNotFoundError` в
+  собранном приложении добавьте модуль в `hiddenimports` нужного `.spec`
+  (и уберите из `excludes`, если он там указан).
+* В собранном Builder HTML-фолбэк через Playwright недоступен (основной источник —
+  API cars-base.ru).
 * Chromium в сборку **не** входит (иначе +200 МБ): Server скачивает его сам.
 
 ### Для пользователя: как запускать
