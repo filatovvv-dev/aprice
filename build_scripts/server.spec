@@ -1,11 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller-спецификация APrice-Server (режим onedir, подзадача 5.1).
+"""PyInstaller-спецификация APrice-Server (режим onedir, 5.1 / 5.1-fix).
 
 Сборка: ``python build.py`` из корня проекта (или
 ``pyinstaller build_scripts/server.spec --clean --noconfirm``).
 Результат: ``dist/Server/APrice-Server.exe``.
+
+Состав: только то, что реально импортирует APrice-Server (PyQt6 (+QtNetwork для IPC), playwright, sqlite3).
+Лишние тяжёлые пакеты отрезаны через ``excludes``.
 Chromium НЕ вшивается: при первом запуске Server докачивает его сам
-(server/browser_check.py).
+(server/browser_check.py). Драйвер Playwright (node) берётся из collect_all('playwright').
 """
 
 import os
@@ -16,11 +19,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
 
 datas, binaries, hiddenimports = [], [], []
-
-# Тяжёлые пакеты с плагинами/данными: PyInstaller сам их не находит целиком.
 for _collected in (
-    collect_all('PyQt6'),        # плагины Qt (platforms, styles), QtNetwork и т.д.
-    collect_all('matplotlib'),   # mpl-data, шрифты, backend_qtagg
     collect_all('playwright'),   # driver (node + cli.js) для `playwright install`
 ):
     datas += _collected[0]
@@ -29,13 +28,21 @@ for _collected in (
 
 hiddenimports += [
     'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets', 'PyQt6.QtNetwork', 'PyQt6.sip',
-    'matplotlib.backends.backend_qtagg',
     'playwright.sync_api',
-    'sqlite3', 'pandas', 'numpy', 'openpyxl', 'requests',
+    'sqlite3',   # встроен в Python, но PyInstaller иногда его теряет
 ]
-# Собственные пакеты проекта (парсеры и пр. могут подгружаться динамически).
-for _pkg in ('common', 'builder', 'server', 'client'):
+# Собственные пакеты проекта (динамические загрузки не пропустить).
+for _pkg in ('common', 'server'):
     hiddenimports += collect_submodules(_pkg)
+
+# Пакеты, которые этому компоненту НЕ нужны (см. ТЗ 5.1-fix, п. 1–3).
+# Другие Qt-биндинги конфликтуют с PyQt6; ненужные модули Qt не тянем.
+excludes = [
+    'matplotlib', 'pandas', 'numpy', 'openpyxl',
+    'PyQt5', 'PySide2', 'PySide6', 'tkinter', 'pytest', 'IPython',
+    # неиспользуемые модули Qt (пакет PyQt6 целиком не собираем)
+    'PyQt6.QtWebEngineCore', 'PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebEngineQuick', 'PyQt6.QtWebChannel', 'PyQt6.QtQml', 'PyQt6.QtQuick', 'PyQt6.QtQuickWidgets', 'PyQt6.QtMultimedia', 'PyQt6.QtMultimediaWidgets', 'PyQt6.QtPdf', 'PyQt6.QtPdfWidgets', 'PyQt6.QtSql', 'PyQt6.QtTest', 'PyQt6.QtDesigner', 'PyQt6.QtBluetooth', 'PyQt6.QtNfc', 'PyQt6.QtSensors', 'PyQt6.QtSerialPort', 'PyQt6.Qt3DCore', 'PyQt6.QtPositioning', 'PyQt6.QtRemoteObjects', 'PyQt6.QtHelp', 'PyQt6.QtDBus'
+]
 
 a = Analysis(
     [os.path.join(ROOT, 'server/main.py')],
@@ -45,8 +52,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    # Другие Qt-биндинги конфликтуют с PyQt6; tkinter не нужен.
-    excludes=['PyQt5', 'PySide2', 'PySide6', 'tkinter'],
+    excludes=excludes,
     noarchive=False,
 )
 pyz = PYZ(a.pure)
