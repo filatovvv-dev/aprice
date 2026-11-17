@@ -3,12 +3,10 @@
 Модуль **без Qt**: окно только читает виджеты в :class:`FormState`, а проверка
 готовности и сборка ``spec`` — чистые функции, которые тестируются без GUI.
 
-Режимы (``spec.mode`` контракта :mod:`server.protocol`):
-
-* ``exact`` — «Точный автомобиль» (режим А): один год выпуска, необязательные
-  поколение, КПП и топливо;
-* ``range`` — «Прицениться» (режим Б): диапазоны годов и объёма, КПП и топливо —
-  списки.
+Единственный режим — диапазонный (``spec.mode == "range"``, 4.6): диапазоны годов и
+объёма, КПП и топливо — списки. Точный год задаётся как «Год от» = «Год до».
+Режим «Точный автомобиль» из Client удалён; Server по-прежнему принимает
+``mode: "exact"`` (контракт :mod:`server.protocol`), но Client его не отправляет.
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
 
-MODE_EXACT = "exact"
 MODE_RANGE = "range"
 
 #: Варианты КПП/топлива, если в справочнике их нет (так они пишутся в объявлениях).
@@ -36,15 +33,8 @@ def max_year() -> int:
 class FormState:
     """Значения формы. Пустые строки/``None`` — «не выбрано / любое»."""
 
-    mode: str = MODE_EXACT
     manufacturer: str = ""
     model: str = ""
-    # режим А
-    generation: str = ""
-    year: Optional[int] = None
-    transmission: str = ""
-    fuel: str = ""
-    # режим Б
     year_from: Optional[int] = None
     year_to: Optional[int] = None
     volume_from: Optional[float] = None
@@ -56,29 +46,22 @@ class FormState:
 def form_error(state: FormState) -> Optional[str]:
     """Причина, по которой форму нельзя отправить; ``None`` — форма готова.
 
-    Обязательны марка и модель (оба режима). В режиме А нужен ещё год (он всегда
-    выбран по умолчанию), в режиме Б — корректные диапазоны.
+    Обязательны марка и модель и корректные диапазоны.
     """
     if not state.manufacturer.strip():
         return "Выберите марку"
     if not state.model.strip():
         return "Выберите модель"
-    if state.mode == MODE_EXACT:
-        if state.year is None:
-            return "Выберите год выпуска"
-    elif state.mode == MODE_RANGE:
-        if state.year_from is None or state.year_to is None:
-            return "Укажите диапазон годов"
-        if state.year_from > state.year_to:
-            return "Год «от» больше года «до»"
-        if (
-            state.volume_from is not None
-            and state.volume_to is not None
-            and state.volume_from > state.volume_to
-        ):
-            return "Объём «от» больше объёма «до»"
-    else:
-        return f"Неизвестный режим: {state.mode!r}"
+    if state.year_from is None or state.year_to is None:
+        return "Укажите диапазон годов"
+    if state.year_from > state.year_to:
+        return "Год «от» больше года «до»"
+    if (
+        state.volume_from is not None
+        and state.volume_to is not None
+        and state.volume_from > state.volume_to
+    ):
+        return "Объём «от» больше объёма «до»"
     return None
 
 
@@ -98,25 +81,18 @@ def build_spec(state: FormState) -> dict:
         raise ValueError(error)
 
     spec: dict = {
-        "mode": state.mode,
+        "mode": MODE_RANGE,
         "manufacturer": state.manufacturer.strip(),
         "model": state.model.strip(),
+        "year_from": int(state.year_from),  # type: ignore[arg-type]
+        "year_to": int(state.year_to),  # type: ignore[arg-type]
+        "transmissions": list(state.transmissions),
+        "fuels": list(state.fuels),
     }
-    if state.mode == MODE_EXACT:
-        spec["year_from"] = spec["year_to"] = int(state.year)  # type: ignore[arg-type]
-        if state.generation:
-            spec["generation"] = state.generation
-        spec["transmissions"] = [state.transmission] if state.transmission else []
-        spec["fuels"] = [state.fuel] if state.fuel else []
-    else:
-        spec["year_from"] = int(state.year_from)  # type: ignore[arg-type]
-        spec["year_to"] = int(state.year_to)  # type: ignore[arg-type]
-        spec["transmissions"] = list(state.transmissions)
-        spec["fuels"] = list(state.fuels)
-        if state.volume_from is not None:
-            spec["engine_volume_from"] = float(state.volume_from)
-        if state.volume_to is not None:
-            spec["engine_volume_to"] = float(state.volume_to)
+    if state.volume_from is not None:
+        spec["engine_volume_from"] = float(state.volume_from)
+    if state.volume_to is not None:
+        spec["engine_volume_to"] = float(state.volume_to)
     return spec
 
 

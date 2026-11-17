@@ -139,8 +139,6 @@ class ClientController(QObject):
         window.evaluate_requested.connect(self.submit)
         window.stop_requested.connect(self.stop)
         window.manufacturer_changed.connect(self.on_manufacturer_changed)
-        window.model_changed.connect(self.on_model_changed)
-        window.generation_changed.connect(self.on_generation_changed)
         window.history_selected.connect(self.on_history_selected)
         window.export_requested.connect(self.on_export_requested)
         window.settings_requested.connect(self.open_settings)
@@ -165,42 +163,8 @@ class ClientController(QObject):
         return True
 
     def on_manufacturer_changed(self, manufacturer: str) -> None:
-        """Марка выбрана: заполнить модели, сбросить зависимые поля."""
+        """Марка выбрана: заполнить список моделей (модель сбрасывается)."""
         self._window.set_models(self._reference.models(manufacturer) if manufacturer else [])
-        self.on_model_changed("")
-
-    def on_model_changed(self, model: str) -> None:
-        """Модель выбрана: заполнить поколения, КПП, топливо и годы."""
-        maker = self._window.form_state().manufacturer
-        generations = self._reference.generations(maker, model) if maker and model else []
-        self._window.set_generations([g.name for g in generations])
-        self.on_generation_changed("")
-
-    def on_generation_changed(self, generation: str) -> None:
-        """Поколение выбрано (или сброшено): обновить КПП, топливо и годы."""
-        state = self._window.form_state()
-        maker, model = state.manufacturer, state.model
-        ready = bool(maker and model)
-        trans = self._reference.transmissions(maker, model, generation) if ready else []
-        fuels = self._reference.fuels(maker, model, generation) if ready else []
-        self._window.set_transmissions(trans or list(form.TRANSMISSIONS))
-        self._window.set_fuels(fuels or list(form.FUELS))
-        self._window.set_years(self._years_for(maker, model, generation))
-
-    def _years_for(self, maker: str, model: str, generation: str) -> list[int]:
-        """Годы для режима А, новые первыми.
-
-        Пока поколение не выбрано или оно ещё выпускается, верхняя граница —
-        текущий модельный год (справочник может быть неполным).
-        """
-        top = form.max_year()
-        bounds = self._reference.year_bounds(maker, model, generation) if maker and model else None
-        if bounds is None:
-            low, high = 1990, top
-        else:
-            low, end = bounds
-            high = top if (not generation or end is None) else end
-        return list(range(high, low - 1, -1))
 
     # ------------------------------------------------------------------
     # Отправка, опрос, остановка
@@ -448,26 +412,17 @@ class ClientController(QObject):
     @staticmethod
     def _spec_from_state(state: form.FormState) -> dict:
         """Состояние формы в виде словаря, понятного :meth:`_restore_form` (без проверок)."""
-        spec: dict = {
-            "mode": state.mode,
+        return {
+            "mode": form.MODE_RANGE,
             "manufacturer": state.manufacturer,
             "model": state.model,
-            "generation": state.generation,
+            "year_from": state.year_from,
+            "year_to": state.year_to,
+            "engine_volume_from": state.volume_from or None,
+            "engine_volume_to": state.volume_to or None,
+            "transmissions": list(state.transmissions),
+            "fuels": list(state.fuels),
         }
-        if state.mode == form.MODE_RANGE:
-            spec.update(
-                year_from=state.year_from, year_to=state.year_to,
-                engine_volume_from=state.volume_from or None,
-                engine_volume_to=state.volume_to or None,
-                transmissions=list(state.transmissions), fuels=list(state.fuels),
-            )
-        else:
-            spec.update(
-                year_from=state.year,
-                transmissions=[state.transmission] if state.transmission else [],
-                fuels=[state.fuel] if state.fuel else [],
-            )
-        return spec
 
     # ------------------------------------------------------------------
     # История запросов
@@ -491,34 +446,28 @@ class ClientController(QObject):
         self._window.set_status(f"Сохранённый результат: {describe(entry)}")
 
     def _restore_form(self, spec: dict) -> None:
-        """Выставляет форму по ``spec`` каскадом: марка -> модель -> поколение -> остальное."""
+        """Выставляет форму по ``spec`` каскадом: марка -> модель -> диапазоны.
+
+        Старые записи истории с ``mode: "exact"`` (до 4.6) читаются как диапазон
+        ``год от = год до``: у них уже есть ``year_from``/``year_to`` (либо только
+        ``year_from``); поколение, если было, игнорируется, а единственные КПП и
+        топливо становятся отмеченными чекбоксами.
+        """
         window = self._window
-        exact = spec.get("mode") != form.MODE_RANGE
-        window.set_mode(form.MODE_EXACT if exact else form.MODE_RANGE)
         maker = str(spec.get("manufacturer") or "")
         window.select_manufacturer(maker)
         self.on_manufacturer_changed(maker)
-        model = str(spec.get("model") or "")
-        window.select_model(model)
-        self.on_model_changed(model)
-        generation = str(spec.get("generation") or "")
-        window.select_generation(generation)
-        self.on_generation_changed(generation)
-        transmissions = list(spec.get("transmissions") or [])
-        fuels = list(spec.get("fuels") or [])
-        if exact:
-            if spec.get("year_from") is not None:
-                window.select_year(spec["year_from"])
-            window.select_transmission(transmissions[0] if transmissions else "")
-            window.select_fuel(fuels[0] if fuels else "")
-        else:
-            window.set_range(
-                spec.get("year_from"),
-                spec.get("year_to"),
-                spec.get("engine_volume_from"),
-                spec.get("engine_volume_to"),
-            )
-            window.set_checked(transmissions, fuels)
+        window.select_model(str(spec.get("model") or ""))
+        year_from = spec.get("year_from")
+        year_to = spec.get("year_to")
+        if year_to is None:
+            year_to = year_from
+        if year_from is None:
+            year_from = year_to
+        window.set_range(
+            year_from, year_to, spec.get("engine_volume_from"), spec.get("engine_volume_to")
+        )
+        window.set_checked(list(spec.get("transmissions") or []), list(spec.get("fuels") or []))
 
     def _finish_failed(self, message: str) -> None:
         self.timer.stop()
