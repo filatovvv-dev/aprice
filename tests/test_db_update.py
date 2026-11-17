@@ -250,3 +250,107 @@ def test_failed_integrity_check_verdict_is_rejected(target, mirror, monkeypatch)
     with pytest.raises(DbUpdateError, match="целостности"):
         download_database(URL, target, get=FakeGet(FakeResponse(mirror)))
     assert names(target) == ["OLD"] and leftovers(target) == ["aprice.db"]
+
+
+# ----------------------------------------------------------------------
+# 4.5: умное обновление — проверка date.txt
+# ----------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+DATE_URL = "https://mirror.test/date.txt"
+
+
+class TextResponse(FakeResponse):
+    def __init__(self, text, status=200):
+        super().__init__(b"", status=status)
+        self.text = text
+
+
+def local_db(tmp_path, when: datetime, name="aprice.db") -> Path:
+    path = tmp_path / name
+    path.write_bytes(b"x")
+    ts = when.timestamp()
+    os.utime(path, (ts, ts))
+    return path
+
+
+LOCAL = datetime(2026, 11, 17, 12, 0, 0)
+
+
+def test_check_for_updates_same_date(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(TextResponse("2026-11-17T12:00:00"))
+    assert db_update.check_for_updates(DATE_URL, db, get=get) is False
+
+
+def test_check_for_updates_newer_remote(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(TextResponse("2026-11-17T12:00:01\n"))
+    assert db_update.check_for_updates(DATE_URL, db, get=get) is True
+
+
+def test_check_for_updates_older_remote(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(TextResponse("2026-11-16T23:59:59"))
+    assert db_update.check_for_updates(DATE_URL, db, get=get) is False
+
+
+def test_check_for_updates_missing_local_db_needs_download(tmp_path):
+    get = FakeGet(TextResponse("2020-01-01T00:00:00"))
+    assert db_update.check_for_updates(DATE_URL, tmp_path / "none.db", get=get) is True
+
+
+def test_check_for_updates_handles_timezones_and_bom(tmp_path):
+    db = local_db(tmp_path, datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc).astimezone().replace(tzinfo=None))
+    same = FakeGet(TextResponse("﻿2026-11-17T15:00:00+03:00\r\n"))  # == 12:00 UTC
+    assert db_update.check_for_updates(DATE_URL, db, get=same) is False
+    newer = FakeGet(TextResponse("2026-11-17T15:00:01+03:00"))
+    assert db_update.check_for_updates(DATE_URL, db, get=newer) is True
+
+
+def test_check_for_updates_prefers_metadata_last_update_over_mtime(tmp_path):
+    db = tmp_path / "aprice.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO metadata VALUES ('last_update', '2026-01-01T00:00:00')")
+    conn.commit()
+    conn.close()  # mtime = «сейчас» (свежий файл), но метка в базе — старая
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("2026-06-01T00:00:00"))) is True
+
+
+def test_check_for_updates_resolves_yandex_public_link(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(FakeResponse(json_data={"href": "https://downloader.disk.test/date"}),
+                  TextResponse("2027-01-01T00:00:00"))
+    assert db_update.check_for_updates("https://disk.yandex.ru/i/0AjHf2zhnKITrA", db, get=get) is True
+    assert get.urls[0].startswith(db_update.YANDEX_API)
+    assert get.urls[1] == "https://downloader.disk.test/date"
+
+
+@pytest.mark.parametrize("body", ["", "   \n", "<!DOCTYPE html><html>captcha</html>", "вчера", "x" * 5000])
+def test_check_for_updates_rejects_non_date_body(tmp_path, body):
+    db = local_db(tmp_path, LOCAL)
+    with pytest.raises(DbUpdateError):
+        db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(body)))
+
+
+def test_check_for_updates_network_error_and_bad_url(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    with pytest.raises(DbUpdateError):
+        db_update.check_for_updates(DATE_URL, db, get=FakeGet(requests.ConnectionError("нет сети")))
+    with pytest.raises(DbUpdateError):
+        db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("", status=404)))
+    with pytest.raises(DbUpdateError):
+        db_update.check_for_updates("не ссылка", db, get=FakeGet())
+
+
+def test_download_sets_mtime_to_publication_date(target, mirror):
+    ts = datetime(2026, 11, 17, 12, 0, 0).timestamp()
+    download_database(URL, target, get=FakeGet(FakeResponse(mirror)), mtime=ts)
+    assert abs(target.stat().st_mtime - ts) < 1
+
+
+def test_check_for_updates_uses_first_line_of_date_file(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(TextResponse("2026-11-17T12:00:00\n2030-01-01T00:00:00\n"))
+    assert db_update.check_for_updates(DATE_URL, db, get=get) is False

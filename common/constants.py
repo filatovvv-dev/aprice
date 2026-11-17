@@ -140,7 +140,10 @@ DEFAULT_SETTINGS: dict = {
         "max_ads_per_site": 500,
         # Зеркало справочника aprice.db (прямая ссылка или публичная ссылка
         # Яндекс.Диска); пусто — обновление отключено (4.4).
-        "db_update_url": "",
+        "db_update_url": "https://disk.yandex.ru/d/ezrSPG7rIun3tA",
+        # Ссылка на date.txt (ISO 8601) рядом с базой: Client качает базу только
+        # если дата там новее локальной (4.5). Пусто — проверка даты пропускается.
+        "db_date_url": "https://disk.yandex.ru/i/0AjHf2zhnKITrA",
         # Старше скольких дней база считается устаревшей (подсказка в настройках).
         "db_max_age_days": 30,
     },
