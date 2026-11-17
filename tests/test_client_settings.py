@@ -10,7 +10,11 @@ from PyQt6.QtWidgets import QApplication
 import client.settings_dialog as sd
 from client.db_update import DbUpdateError, UpdateResult
 from client.settings_dialog import DbUpdateThread, SettingsDialog, url_error
+from common import constants
 from common.config import Config
+
+
+DEFAULT_URL = constants.DEFAULT_SETTINGS["client"]["db_update_url"]
 
 
 def wait_for(condition, timeout: float = 5.0) -> None:
@@ -39,12 +43,13 @@ class Boxes:
     """Подмена QMessageBox: собирает тексты вместо показа окон."""
 
     def __init__(self):
-        self.critical_texts, self.info_texts = [], []
+        self.critical_texts, self.info_texts, self.info_titles = [], [], []
 
     def critical(self, parent, title, text, *a):
         self.critical_texts.append(text)
 
     def information(self, parent, title, text, *a):
+        self.info_titles.append(title)
         self.info_texts.append(text)
 
 
@@ -74,7 +79,9 @@ def dialog(qapp, config, db_file):
 
 def test_dialog_loads_defaults_from_config(dialog):
     assert dialog.values() == {"max_pages_per_site": 10, "max_ads_per_site": 500,
-                               "db_update_url": "", "db_max_age_days": 30}
+                               "db_update_url": constants.DEFAULT_SETTINGS["client"]["db_update_url"],
+                               "db_date_url": constants.DEFAULT_SETTINGS["client"]["db_date_url"],
+                               "db_max_age_days": 30}
 
 
 def test_dialog_loads_existing_values(qapp, config, db_file):
@@ -114,7 +121,7 @@ def test_invalid_url_blocks_save(dialog, config, boxes, url):
     dialog.url_edit.setText(url)
     assert dialog.save() is False
     assert "http" in boxes.critical_texts[0]
-    assert Config(config.path).load().get("client", "db_update_url") == ""
+    assert Config(config.path).load().get("client", "db_update_url") == DEFAULT_URL
     assert dialog.result() == 0
 
 
@@ -160,7 +167,8 @@ def fake_thread(outcome, record):
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
-    return lambda url, target: DbUpdateThread(url, target, downloader=downloader)
+    # date_url всегда пустой: тесты 4.4 проверяют скачивание без проверки date.txt (4.5 — ниже).
+    return lambda url, target, date_url="": DbUpdateThread(url, target, downloader=downloader)
 
 
 def test_update_success_emits_signal_and_informs(qapp, config, db_file, boxes):
@@ -185,7 +193,7 @@ def test_update_uses_unsaved_url_field(qapp, config, db_file):
     wait_for(lambda: calls)
     finish_thread(d)
     assert calls[0][0] == "https://unsaved.test/db"
-    assert Config(config.path).load().get("client", "db_update_url") == ""  # в файл не писалось
+    assert Config(config.path).load().get("client", "db_update_url") == DEFAULT_URL  # в файл не писалось
 
 
 def test_update_failure_shows_message_box(qapp, config, db_file, boxes):
@@ -246,3 +254,125 @@ def test_thread_passes_progress_and_target(tmp_path):
     thread.progressed.connect(lambda done, total: seen.append((done, total)))
     thread.run()
     assert seen == [(5, -1)]
+
+
+# ----------------------------------------------------------------------
+# 4.5: умное обновление (date.txt)
+# ----------------------------------------------------------------------
+from datetime import datetime  # noqa: E402
+
+import requests  # noqa: E402
+
+from client import db_update  # noqa: E402
+from tests.test_db_update import FakeGet, FakeResponse, TextResponse, make_db  # noqa: E402
+
+DB_URL = "https://mirror.test/aprice.db"
+DATE_URL = "https://mirror.test/date.txt"
+LOCAL_DATE = datetime(2026, 11, 17, 12, 0, 0)
+
+
+@pytest.fixture
+def smart(qapp, config, tmp_path, monkeypatch):
+    """Диалог с реальным потоком и проверкой даты; сеть подменена ``requests.get``."""
+    db = tmp_path / "aprice.db"
+    make_db(db, ("OLD",))
+    ts = LOCAL_DATE.timestamp()
+    os.utime(db, (ts, ts))
+    d = SettingsDialog(config, db_path=db)
+    d.url_edit.setText(DB_URL)
+    d.date_url_edit.setText(DATE_URL)
+
+    def install(*responses):
+        fake = FakeGet(*responses)
+        monkeypatch.setattr(db_update.requests, "get", fake)
+        return fake
+
+    d.install = install
+    return d, db
+
+
+def run_update(d, done):
+    d.start_update()
+    wait_for(done)
+    finish_thread(d)
+
+
+def test_settings_dialog_skips_download_if_up_to_date(smart, boxes):
+    d, db = smart
+    before = db.read_bytes()
+    fake = d.install(TextResponse("2026-11-17T12:00:00"))  # тот же момент, что у локальной базы
+    got = []
+    d.database_updated.connect(got.append)
+    run_update(d, lambda: boxes.info_texts)
+    assert fake.urls == [DATE_URL]  # aprice.db не запрашивался
+    assert boxes.info_titles == ["Обновления не требуются"]
+    assert boxes.info_texts == ["У вас уже установлена самая свежая версия базы."]
+    assert db.read_bytes() == before and got == [] and boxes.critical_texts == []
+    assert d.update_button.isEnabled()
+
+
+def test_settings_dialog_skips_download_if_remote_older(smart, boxes):
+    d, db = smart
+    fake = d.install(TextResponse("2026-11-01T00:00:00"))
+    run_update(d, lambda: boxes.info_texts)
+    assert fake.urls == [DATE_URL] and boxes.info_titles == ["Обновления не требуются"]
+
+
+def test_settings_dialog_downloads_if_remote_newer(smart, boxes, tmp_path):
+    d, db = smart
+    payload = make_db(tmp_path / "remote.db", ("BMW", "Audi"))
+    fake = d.install(TextResponse("2026-11-18T09:30:00"), FakeResponse(payload))
+    got = []
+    d.database_updated.connect(got.append)
+    run_update(d, lambda: got)
+    assert fake.urls == [DATE_URL, DB_URL]
+    assert got[0].manufacturers == 2
+    assert abs(db.stat().st_mtime - datetime(2026, 11, 18, 9, 30).timestamp()) < 1
+    assert "обновлена" in boxes.info_texts[0] and boxes.info_titles == ["Настройки"]
+    # повторное нажатие: дата уже совпадает — второй раз базу не качаем
+    boxes.info_texts.clear()
+    fake2 = d.install(TextResponse("2026-11-18T09:30:00"))
+    run_update(d, lambda: boxes.info_texts)
+    assert fake2.urls == [DATE_URL]
+
+
+def test_date_check_failure_is_reported_and_nothing_downloaded(smart, boxes):
+    d, db = smart
+    fake = d.install(requests.ConnectionError("нет сети"))
+    before = db.read_bytes()
+    run_update(d, lambda: boxes.critical_texts)
+    assert "нет сети" in boxes.critical_texts[0]
+    assert fake.urls == [DATE_URL] and db.read_bytes() == before and boxes.info_texts == []
+    assert d.update_button.isEnabled()
+
+
+def test_non_date_content_in_date_file_is_reported(smart, boxes):
+    d, db = smart
+    d.install(TextResponse("<html>captcha</html>"))
+    run_update(d, lambda: boxes.critical_texts)
+    assert "ISO 8601" in boxes.critical_texts[0]
+
+
+def test_empty_date_url_downloads_without_check(smart, boxes, tmp_path):
+    d, db = smart
+    d.date_url_edit.setText("")
+    payload = make_db(tmp_path / "remote.db", ("BMW",))
+    fake = d.install(FakeResponse(payload))
+    got = []
+    d.database_updated.connect(got.append)
+    run_update(d, lambda: got)
+    assert fake.urls == [DB_URL]
+
+
+def test_date_url_is_saved_and_validated(dialog, config, boxes):
+    dialog.date_url_edit.setText("  https://mirror.test/date.txt ")
+    assert dialog.save() is True
+    assert Config(config.path).load().get("client", "db_date_url") == "https://mirror.test/date.txt"
+
+
+def test_invalid_date_url_blocks_save_and_update(dialog, config, boxes):
+    dialog.date_url_edit.setText("ftp://x/date.txt")
+    assert dialog.save() is False
+    dialog.url_edit.setText("https://mirror.test/a.db")
+    dialog.start_update()
+    assert len(boxes.critical_texts) == 2 and dialog._thread is None

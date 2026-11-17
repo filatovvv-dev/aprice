@@ -5,6 +5,8 @@
 * ``max_pages_per_site``, ``max_ads_per_site`` — лимиты сбора (уходят в ``options``
   при отправке задания);
 * ``db_update_url`` — зеркало справочника ``aprice.db``;
+* ``db_date_url`` — ``date.txt`` рядом с базой (4.5): база скачивается, только если дата
+  в нём новее локальной; пусто — проверка пропускается;
 * ``db_max_age_days`` — через сколько дней база считается устаревшей (подсказка в окне).
 
 Кнопка «Обновить базу из зеркала» скачивает базу в фоне (:class:`DbUpdateThread`,
@@ -33,7 +35,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from client.db_update import DbUpdateError, UpdateResult, db_age_days, download_database
+from client.db_update import (
+    DbUpdateError,
+    UpdateResult,
+    db_age_days,
+    download_database,
+    fetch_remote_date,
+    is_remote_newer,
+    local_db_date,
+)
 from common import constants
 from common.config import Config
 
@@ -63,6 +73,7 @@ class DbUpdateThread(QThread):
     """Скачивает базу в фоновом потоке; результат — сигналами (в GUI-потоке)."""
 
     succeeded = pyqtSignal(object)  # UpdateResult
+    up_to_date = pyqtSignal()  # date.txt не новее локальной базы — скачивать не нужно (4.5)
     failed = pyqtSignal(str)
     progressed = pyqtSignal(int, int)  # скачано, всего (-1 — неизвестно)
 
@@ -72,15 +83,28 @@ class DbUpdateThread(QThread):
         target: Optional[Path] = None,
         parent=None,
         downloader: Callable[..., UpdateResult] = download_database,
+        date_url: str = "",
+        date_fetcher: Callable[..., object] = fetch_remote_date,
     ) -> None:
         super().__init__(parent)
         self._url, self._target, self._downloader = url, target, downloader
+        self._date_url, self._date_fetcher = date_url, date_fetcher
 
     def run(self) -> None:
         try:
+            extra: dict = {}
+            if self._date_url:
+                # Сначала крошечный date.txt; базу качаем, только если дата строго новее.
+                remote = self._date_fetcher(self._date_url)
+                local = local_db_date(self._target if self._target is not None else constants.DB_FILE)
+                if not is_remote_newer(remote, local):
+                    self.up_to_date.emit()
+                    return
+                extra["mtime"] = remote.timestamp()
             result = self._downloader(
                 self._url, self._target,
                 progress=lambda done, total: self.progressed.emit(done, -1 if total is None else total),
+                **extra,
             )
         except DbUpdateError as exc:
             self.failed.emit(str(exc))
@@ -102,7 +126,7 @@ class SettingsDialog(QDialog):
         config: Config,
         parent: Optional[QWidget] = None,
         db_path: Optional[Path] = None,
-        thread_factory: Callable[[str, Path], DbUpdateThread] = DbUpdateThread,
+        thread_factory: Callable[[str, Path, str], DbUpdateThread] = DbUpdateThread,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -117,6 +141,8 @@ class SettingsDialog(QDialog):
         self.max_ads_spin.setRange(*MAX_ADS_RANGE)
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://… (прямая ссылка или публичная ссылка Яндекс.Диска)")
+        self.date_url_edit = QLineEdit()
+        self.date_url_edit.setPlaceholderText("https://… ссылка на date.txt (пусто — всегда скачивать базу)")
         self.age_spin = QSpinBox()
         self.age_spin.setRange(*MAX_AGE_RANGE)
         self.db_age_label = QLabel("")
@@ -131,6 +157,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(self._row("Объявлений с площадки (максимум):", self.max_ads_spin))
         layout.addWidget(QLabel("База справочников"))
         layout.addLayout(self._row("Ссылка на зеркало:", self.url_edit))
+        layout.addLayout(self._row("Ссылка на дату обновления:", self.date_url_edit))
         layout.addLayout(self._row("Считать базу устаревшей через (дней):", self.age_spin))
         layout.addWidget(self.db_age_label)
         layout.addWidget(self.update_button)
@@ -162,6 +189,7 @@ class SettingsDialog(QDialog):
         self.max_pages_spin.setValue(int(get(SECTION, "max_pages_per_site", 10)))
         self.max_ads_spin.setValue(int(get(SECTION, "max_ads_per_site", 500)))
         self.url_edit.setText(str(get(SECTION, "db_update_url", "") or ""))
+        self.date_url_edit.setText(str(get(SECTION, "db_date_url", "") or ""))
         self.age_spin.setValue(int(get(SECTION, "db_max_age_days", 30)))
         self._refresh_age()
 
@@ -171,6 +199,7 @@ class SettingsDialog(QDialog):
             "max_pages_per_site": self.max_pages_spin.value(),
             "max_ads_per_site": self.max_ads_spin.value(),
             "db_update_url": self.url_edit.text().strip(),
+            "db_date_url": self.date_url_edit.text().strip(),
             "db_max_age_days": self.age_spin.value(),
         }
 
@@ -179,7 +208,7 @@ class SettingsDialog(QDialog):
         if self.is_updating():
             return False
         values = self.values()
-        error = url_error(values["db_update_url"])
+        error = url_error(values["db_update_url"]) or url_error(values["db_date_url"])
         if error:
             QMessageBox.critical(self, TITLE, error)
             return False
@@ -227,18 +256,32 @@ class SettingsDialog(QDialog):
         if error or not url:
             QMessageBox.critical(self, TITLE, error or "Укажите ссылку на зеркало базы.")
             return
-        self._thread = self._thread_factory(url, self._db_file())
+        date_url = self.date_url_edit.text().strip()
+        error = url_error(date_url)
+        if error:
+            QMessageBox.critical(self, TITLE, error)
+            return
+        self._thread = self._thread_factory(url, self._db_file(), date_url=date_url)
         self._thread.succeeded.connect(self._on_succeeded)
+        self._thread.up_to_date.connect(self._on_up_to_date)
         self._thread.failed.connect(self._on_failed)
         self._thread.progressed.connect(self._on_progress)
         self.update_button.setEnabled(False)
-        self.update_status_label.setText("Загрузка…")
+        self.update_status_label.setText("Проверка даты обновления…" if date_url else "Загрузка…")
         self._thread.start()
 
     def _on_progress(self, done: int, total: int) -> None:
         mb = done / 1_048_576
         self.update_status_label.setText(
             f"Загрузка… {mb:.1f} из {total / 1_048_576:.1f} МБ" if total > 0 else f"Загрузка… {mb:.1f} МБ"
+        )
+
+    def _on_up_to_date(self) -> None:
+        self.update_button.setEnabled(True)
+        self.update_status_label.setText("База актуальна.")
+        QMessageBox.information(
+            self, "Обновления не требуются",
+            "У вас уже установлена самая свежая версия базы.",
         )
 
     def _on_succeeded(self, result: UpdateResult) -> None:

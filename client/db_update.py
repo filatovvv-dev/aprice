@@ -14,6 +14,14 @@
 Яндекс.Диска (``disk.yandex.*``, ``yadi.sk``) сначала разрешаются в прямую ссылку
 через публичный API Диска.
 
+Умное обновление (4.5): рядом с базой на зеркале лежит ``date.txt`` с датой
+публикации (ISO 8601, например ``2026-11-17T12:00:00``). :func:`check_for_updates`
+сначала скачивает этот крошечный файл и сравнивает дату с локальной базой
+(``metadata.last_update``, иначе время изменения файла); базу качаем, только если
+удалённая дата **строго новее**. После скачивания время изменения файла
+выставляется равным дате публикации, поэтому сравнение остаётся корректным и для
+базы, просто скопированной с диска. Дата без часового пояса считается местным временем.
+
 Затрагивается только справочник (марки/модели); сбор объявлений — нет.
 """
 
@@ -24,6 +32,7 @@ import os
 import shutil
 import sqlite3
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -70,6 +79,102 @@ def db_age_days(path: PathLike, now: Optional[float] = None) -> Optional[int]:
     except OSError:
         return None
     return max(0, int(((now if now is not None else time.time()) - mtime) // 86400))
+
+
+MAX_DATE_BYTES = 4096
+
+
+def _parse_iso_date(text: str) -> datetime:
+    """Разбирает дату ISO 8601 из ``date.txt`` (первая непустая строка, BOM допускается)."""
+    lines = [ln.strip() for ln in (text or "").lstrip("\ufeff").splitlines() if ln.strip()]
+    if not lines:
+        raise DbUpdateError("Файл с датой обновления пуст.")
+    try:
+        return datetime.fromisoformat(lines[0])
+    except ValueError as exc:
+        raise DbUpdateError(
+            f"Файл с датой обновления содержит не дату ISO 8601: {lines[0][:40]!r}."
+        ) from exc
+
+
+def fetch_remote_date(
+    remote_date_url: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    get: Optional[Callable[..., Any]] = None,
+) -> datetime:
+    """Скачивает ``date.txt`` (публичную ссылку Яндекс.Диска разрешает через API) и разбирает дату.
+
+    Raises:
+        DbUpdateError: ссылка некорректна, сеть недоступна или в файле не дата.
+    """
+    url = _check_url(remote_date_url)
+    getter = get if get is not None else requests.get
+    direct = _resolve(url, getter, timeout)
+    try:
+        response = getter(direct, timeout=timeout)
+        response.raise_for_status()
+        text = response.text
+    except requests.RequestException as exc:
+        raise DbUpdateError(f"Не удалось получить дату обновления базы: {exc}") from exc
+    if len(text) > MAX_DATE_BYTES:  # HTML-страница вместо короткого текста
+        raise DbUpdateError("Файл с датой обновления слишком большой (получена не та страница?).")
+    return _parse_iso_date(text)
+
+
+def local_db_date(local_db_path: PathLike) -> Optional[datetime]:
+    """Дата локальной базы: ``metadata.last_update`` (ISO), иначе время изменения файла.
+
+    Returns:
+        ``None`` — файла нет.
+    """
+    path = Path(local_db_path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute("SELECT value FROM metadata WHERE key = 'last_update'").fetchone()
+        if row and row[0]:
+            return _parse_iso_date(str(row[0]))
+    except (sqlite3.Error, DbUpdateError):
+        pass  # нет таблицы/ключа/читаемой даты — берём mtime
+    finally:
+        if conn is not None:
+            conn.close()
+    return datetime.fromtimestamp(mtime)
+
+
+def is_remote_newer(remote: datetime, local: Optional[datetime]) -> bool:
+    """``True``, если ``remote`` строго новее ``local`` (нет локальной базы — тоже ``True``)."""
+    if local is None:
+        return True
+    return remote.timestamp() > local.timestamp()
+
+
+def check_for_updates(
+    remote_date_url: str,
+    local_db_path: PathLike,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    get: Optional[Callable[..., Any]] = None,
+) -> bool:
+    """Нужно ли скачивать базу: удалённая дата строго новее локальной.
+
+    Args:
+        remote_date_url: ``db_date_url`` (ссылка на ``date.txt``).
+        local_db_path: файл рабочей базы.
+
+    Returns:
+        bool: ``True`` — скачивать; ``False`` — база актуальна (дата равна или старше).
+
+    Raises:
+        DbUpdateError: дату получить не удалось (сеть, не дата в файле).
+    """
+    remote = fetch_remote_date(remote_date_url, timeout=timeout, get=get)
+    return is_remote_newer(remote, local_db_date(local_db_path))
 
 
 def _check_url(url: str) -> str:
@@ -164,6 +269,7 @@ def download_database(
     timeout: float = DEFAULT_TIMEOUT,
     progress: Optional[ProgressCb] = None,
     get: Optional[Callable[..., Any]] = None,
+    mtime: Optional[float] = None,
 ) -> UpdateResult:
     """Скачивает, проверяет и подменяет ``aprice.db`` (см. описание модуля).
 
@@ -174,6 +280,8 @@ def download_database(
         progress: ``progress(скачано_байт, всего_или_None)``.
         get: функция запроса (по умолчанию ``requests.get``, берётся в момент вызова —
             её можно подменить в тестах через ``monkeypatch``).
+        mtime: POSIX-время, которое получит файл после подмены (дата публикации
+            из ``date.txt``, 4.5); ``None`` — оставить время скачивания.
 
     Raises:
         DbUpdateError: любая причина отказа; рабочая база не изменена.
@@ -206,5 +314,10 @@ def download_database(
             pass
         except OSError:
             logger.warning("Временный файл %s не удалён", tmp)
+    if mtime is not None:
+        try:
+            os.utime(target_path, (mtime, mtime))
+        except OSError as exc:  # не критично: база уже заменена
+            logger.warning("Не удалось выставить время изменения базы: %s", exc)
     logger.info("База обновлена: %s (%d байт, марок: %d)", target_path, size, manufacturers)
     return UpdateResult(target_path, backup, size, manufacturers)
