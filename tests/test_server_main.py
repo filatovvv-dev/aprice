@@ -365,6 +365,7 @@ def test_main_init_error_shows_message_and_returns_1(qapp, monkeypatch):
 
 
 def test_main_second_instance_returns_0(qapp, monkeypatch, tmp_path):
+    monkeypatch.setattr(server_main.browser_check, "ensure_chromium", lambda *a, **k: True)
     monkeypatch.setattr(server_main, "StateStore",
                         lambda: StateStore(tmp_path / "main.db"))
     monkeypatch.setattr(server_main, "setup_logging", lambda **k: None)

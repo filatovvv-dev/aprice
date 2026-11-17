@@ -31,10 +31,11 @@ from typing import Callable, Optional
 from PyQt6.QtCore import QObject
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
+from common import paths
 from common.config import Config
 from common.logger import setup_logging
 from common.window_manager import WindowManager
-from server import protocol
+from server import browser_check, protocol
 from server.captcha_dialog import CaptchaDialog
 from server.ipc import IpcServer
 from server.progress_window import ProgressWindow
@@ -407,12 +408,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     app = create_application(sys.argv if argv is None else argv)
     server: Optional[ServerApp] = None  # ссылка живёт до конца app.exec() (MN-04)
     try:
+        paths.ensure_runtime_dirs()  # config/, logs/, data/ — рядом с .exe
         config = Config().load()
         setup_logging(component="server", config=config)
         logger.info(
             "Server starting, version=%s, python=%s, platform=%s",
             SERVER_VERSION, platform.python_version(), platform.platform(),
         )
+        # 5.1: Chromium не вшит в сборку — при первом запуске ставим его.
+        # Неудача не фатальна: сервер стартует, парсеры сообщат об ошибке сами.
+        if not browser_check.ensure_chromium():
+            logger.warning("Chromium недоступен — сбор объявлений работать не будет")
         server = ServerApp(app, config)
         if not server.start():
             logger.warning("Сервер уже запущен, выходим")
