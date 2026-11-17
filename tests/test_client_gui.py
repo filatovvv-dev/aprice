@@ -159,13 +159,13 @@ def state_db(tmp_path) -> Path:
     """Серверная база с задачей ``T1``: 2 объявления auto.ru и 1 drom.ru."""
     path = tmp_path / "state.db"
     store = StateStore(path)
-    store.save_task("T1", {"mode": "exact"}, {}, "completed")
+    store.save_task("T1", {"mode": "range"}, {}, "completed")
     store.save_ads("T1", "auto.ru", [
         {"url": "https://auto.ru/1", "price": 5_000_000, "year": 2020},
         {"url": "https://auto.ru/2", "price": 5_500_000, "year": 2020},
     ])
     store.save_ads("T1", "drom.ru", [{"url": "https://drom.ru/1.html", "price": 4_900_000}])
-    store.save_task("T2", {"mode": "exact"}, {}, "completed")
+    store.save_task("T2", {"mode": "range"}, {}, "completed")
     store.save_ads("T2", "avito.ru", [{"url": "https://avito.ru/9", "price": 1}])
     store.close()
     return path
@@ -210,10 +210,12 @@ def items(combo) -> list[str]:
 
 
 def pick_bmw_x5(window, year: Optional[str] = None) -> None:
+    """Марка BMW, модель X5; ``year`` — точный год (``год от`` = ``год до``)."""
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
     if year:
-        choose(window.year_combo, year)
+        window.year_from_spin.setValue(int(year))
+        window.year_to_spin.setValue(int(year))
 
 
 def pump_until(cond, timeout: float = 5.0) -> None:
@@ -229,28 +231,29 @@ def pump_until(cond, timeout: float = 5.0) -> None:
 # ----------------------------------------------------------------------
 # Форма (без Qt)
 # ----------------------------------------------------------------------
-def test_form_exact_spec_matches_server_contract():
-    spec = form.build_spec(FormState(
-        mode="exact", manufacturer="BMW", model="X5", generation="IV (G05)", year=2020,
-        transmission="АКПП", fuel="Бензин",
-    ))
+def test_form_has_no_exact_mode_fields():
+    """4.6: у формы нет полей режима «Точный автомобиль»."""
+    names = set(FormState.__dataclass_fields__)
+    assert names == {"manufacturer", "model", "year_from", "year_to", "volume_from",
+                     "volume_to", "transmissions", "fuels"}
+    assert not hasattr(form, "MODE_EXACT")
+
+
+def test_form_exact_year_is_a_range_with_equal_bounds():
+    """Точный год — это «Год от» = «Год до»; spec всегда с mode == range."""
+    spec = form.build_spec(FormState(manufacturer="BMW", model="X5", year_from=2020, year_to=2020,
+                                     transmissions=["АКПП"], fuels=["Бензин"]))
     assert spec == {
-        "mode": "exact", "manufacturer": "BMW", "model": "X5", "year_from": 2020,
-        "year_to": 2020, "generation": "IV (G05)", "transmissions": ["АКПП"],
-        "fuels": ["Бензин"],
+        "mode": "range", "manufacturer": "BMW", "model": "X5", "year_from": 2020,
+        "year_to": 2020, "transmissions": ["АКПП"], "fuels": ["Бензин"],
     }
     from server import protocol
-    protocol.validate_spec(spec)  # контракт Server принимает такой spec
-
-
-def test_form_exact_without_optional_fields():
-    spec = form.build_spec(FormState(mode="exact", manufacturer="BMW", model="X5", year=2019))
-    assert "generation" not in spec and spec["transmissions"] == [] and spec["fuels"] == []
+    protocol.validate_spec(spec)
 
 
 def test_form_range_spec_matches_server_contract():
     spec = form.build_spec(FormState(
-        mode="range", manufacturer="BMW", model="X5", year_from=2018, year_to=2021,
+        manufacturer="BMW", model="X5", year_from=2018, year_to=2021,
         volume_from=2.0, volume_to=3.0, transmissions=["АКПП", "Робот"], fuels=["Дизель"],
     ))
     assert spec == {
@@ -263,19 +266,19 @@ def test_form_range_spec_matches_server_contract():
 
 
 def test_form_range_without_volume_omits_keys():
-    spec = form.build_spec(FormState(mode="range", manufacturer="BMW", model="X5",
+    spec = form.build_spec(FormState(manufacturer="BMW", model="X5",
                                      year_from=2018, year_to=2018))
     assert "engine_volume_from" not in spec and "engine_volume_to" not in spec
 
 
 @pytest.mark.parametrize("state, message", [
-    (FormState(manufacturer="", model="X5", year=2020), "марку"),
-    (FormState(manufacturer="BMW", model="  ", year=2020), "модель"),
-    (FormState(manufacturer="BMW", model="X5", year=None), "год"),
-    (FormState(mode="range", manufacturer="BMW", model="X5", year_from=2021, year_to=2018), "больше"),
-    (FormState(mode="range", manufacturer="BMW", model="X5", year_from=2018, year_to=2021,
+    (FormState(manufacturer="", model="X5", year_from=2020, year_to=2020), "марку"),
+    (FormState(manufacturer="BMW", model="  ", year_from=2020, year_to=2020), "модель"),
+    (FormState(manufacturer="BMW", model="X5", year_from=None, year_to=2020), "диапазон"),
+    (FormState(manufacturer="BMW", model="X5"), "диапазон"),
+    (FormState(manufacturer="BMW", model="X5", year_from=2021, year_to=2018), "больше"),
+    (FormState(manufacturer="BMW", model="X5", year_from=2018, year_to=2021,
                volume_from=3.0, volume_to=2.0), "Объём"),
-    (FormState(mode="weird", manufacturer="BMW", model="X5"), "режим"),
 ])
 def test_form_errors(state, message):
     assert not form.is_ready(state)
@@ -295,21 +298,35 @@ def test_window_created_and_evaluate_initially_disabled(window):
     assert window.windowTitle() == gui_module.WINDOW_TITLE
     assert not window.evaluate_button.isEnabled()
     assert not window.stop_button.isEnabled()
-    assert window.radio_exact.isChecked()
 
 
-def test_switching_to_range_mode_swaps_forms(window):
-    assert window.exact_box.isVisibleTo(window) and not window.range_box.isVisibleTo(window)
-    window.radio_range.setChecked(True)
-    assert window.range_box.isVisibleTo(window) and not window.exact_box.isVisibleTo(window)
-    assert not window.radio_exact.isChecked()  # радиокнопки взаимоисключающие
-    window.radio_exact.setChecked(True)
-    assert window.exact_box.isVisibleTo(window) and not window.range_box.isVisibleTo(window)
+def test_window_has_no_mode_selection(window):
+    """4.6: ни радиокнопок, ни переключения форм, ни полей точного режима."""
+    for name in ("radio_exact", "radio_range", "exact_box", "generation_combo", "year_combo",
+                 "transmission_combo", "fuel_combo", "set_mode", "set_years", "set_generations"):
+        assert not hasattr(window, name), name
+    assert window.range_box.isVisibleTo(window)  # единственная форма — всегда видна
+    assert window.range_box.title() == "Параметры поиска"
+
+
+def test_evaluate_enabled_with_make_and_model_and_form_has_only_ranges(window):
+    """4.6: марка + модель -> «Оценить» активна; форма содержит только диапазоны."""
+    window.set_manufacturers(["BMW"])
+    window.set_models(["X5"])
+    assert not window.evaluate_button.isEnabled()
+    choose(window.manufacturer_combo, "BMW")
+    choose(window.model_combo, "X5")
+    assert window.evaluate_button.isEnabled()  # без выбора режима/года/поколения
+    assert set(vars(window.form_state())) == {
+        "manufacturer", "model", "year_from", "year_to", "volume_from", "volume_to",
+        "transmissions", "fuels"}
+    assert set(window.transmission_checks) == set(form.TRANSMISSIONS)
+    assert set(window.fuel_checks) == set(form.FUELS)
+    assert form.build_spec(window.form_state())["mode"] == "range"
 
 
 def test_evaluate_requires_manufacturer_and_model(window):
     window.set_manufacturers(["BMW", "Audi"])
-    window.set_years([2021, 2020])
     assert not window.evaluate_button.isEnabled()  # ничего не выбрано
     choose(window.manufacturer_combo, "BMW")
     assert not window.evaluate_button.isEnabled()  # нет модели
@@ -325,7 +342,6 @@ def test_range_mode_needs_valid_year_range(window):
     window.set_models(["X5"])
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
-    window.radio_range.setChecked(True)
     assert window.evaluate_button.isEnabled()
     window.year_from_spin.setValue(window.year_to_spin.value())
     window.year_to_spin.setValue(window.year_from_spin.value() - 5)
@@ -335,21 +351,17 @@ def test_range_mode_needs_valid_year_range(window):
 def test_form_state_reads_widgets(window):
     window.set_manufacturers(["BMW"])
     window.set_models(["X5"])
-    window.set_years([2021, 2020])
-    window.set_transmissions(["АКПП"])
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
-    choose(window.transmission_combo, "АКПП")
-    state = window.form_state()
-    assert (state.mode, state.manufacturer, state.model) == ("exact", "BMW", "X5")
-    assert (state.year, state.transmission, state.fuel, state.generation) == (2021, "АКПП", "", "")
-
-    window.radio_range.setChecked(True)
+    window.year_from_spin.setValue(2015)
+    window.year_to_spin.setValue(2019)
     window.transmission_checks["Робот"].setChecked(True)
     window.fuel_checks["Дизель"].setChecked(True)
     window.volume_from_spin.setValue(2.5)
     state = window.form_state()
-    assert state.mode == "range" and state.transmissions == ["Робот"] and state.fuels == ["Дизель"]
+    assert (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.year_from, state.year_to) == (2015, 2019)
+    assert state.transmissions == ["Робот"] and state.fuels == ["Дизель"]
     assert state.volume_from == 2.5 and state.volume_to is None  # 0 = не задано
 
 
@@ -366,14 +378,11 @@ def test_combos_start_with_placeholder_and_return_empty_selection(window):
     window.set_manufacturers(["BMW"])
     assert window.manufacturer_combo.itemText(0) == PLACEHOLDER
     assert window.form_state().manufacturer == ""
-    window.set_generations(["G1"])
-    assert window.generation_combo.itemText(0) == ANY_TEXT and window.form_state().generation == ""
 
 
 def test_buttons_follow_running_state_and_progress_is_indeterminate(window):
     window.set_manufacturers(["BMW"])
     window.set_models(["X5"])
-    window.set_years([2020])
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
     assert window.evaluate_button.isEnabled() and not window.stop_button.isEnabled()
@@ -391,7 +400,6 @@ def test_buttons_emit_requests(window):
     window.stop_requested.connect(lambda: seen.append("stop"))
     window.set_manufacturers(["BMW"])
     window.set_models(["X5"])
-    window.set_years([2020])
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
     window.evaluate_button.click()
@@ -475,23 +483,20 @@ def test_reference_fills_comboboxes_and_cascades(window, ctrl):
     assert items(window.model_combo) == [PLACEHOLDER]  # пока марка не выбрана
     choose(window.manufacturer_combo, "BMW")
     assert items(window.model_combo) == [PLACEHOLDER, "3 серии", "X5"]
+    assert not window.evaluate_button.isEnabled()  # модель ещё не выбрана
     choose(window.model_combo, "X5")
-    assert items(window.generation_combo) == [ANY_TEXT, "IV (G05)", "III (F15)"]
-    assert items(window.transmission_combo) == [ANY_TEXT, "АКПП"]
-    assert items(window.fuel_combo) == [ANY_TEXT, "Бензин", "Дизель"]
-    years = [int(y) for y in items(window.year_combo)]
-    assert years[0] == form.max_year() and years[-1] == 2013  # до текущего: справочник неполон
-    assert window.evaluate_button.isEnabled()  # год выбран автоматически (самый новый)
+    assert window.evaluate_button.isEnabled()  # марка + модель — достаточно (4.6)
 
 
-def test_generation_limits_years_and_options(window, ctrl):
+def test_model_selection_does_not_touch_range_form(window, ctrl):
+    """Выбор модели не меняет диапазоны и чекбоксы (поколений/годов из справочника больше нет)."""
     choose(window.manufacturer_combo, "BMW")
+    window.year_from_spin.setValue(2015)
+    window.year_to_spin.setValue(2018)
+    window.fuel_checks["Дизель"].setChecked(True)
     choose(window.model_combo, "X5")
-    choose(window.generation_combo, "III (F15)")
-    assert [int(y) for y in items(window.year_combo)] == [2018, 2017, 2016, 2015, 2014, 2013]
-    assert items(window.fuel_combo) == [ANY_TEXT, "Бензин", "Дизель"]
-    window.generation_combo.setCurrentIndex(0)  # «Любая» — годы снова до текущего
-    assert int(window.year_combo.itemText(0)) == form.max_year()
+    state = window.form_state()
+    assert (state.year_from, state.year_to, state.fuels) == (2015, 2018, ["Дизель"])
 
 
 def test_changing_manufacturer_resets_model(window, ctrl):
@@ -501,15 +506,6 @@ def test_changing_manufacturer_resets_model(window, ctrl):
     assert window.form_state().model == ""
     assert items(window.model_combo) == [PLACEHOLDER, "A4", "A6"]
     assert not window.evaluate_button.isEnabled()
-
-
-def test_model_without_reference_data_falls_back_to_static_lists(window, ctrl):
-    choose(window.manufacturer_combo, "BMW")
-    choose(window.model_combo, "3 серии")
-    assert items(window.transmission_combo) == [ANY_TEXT, *form.TRANSMISSIONS]
-    assert items(window.fuel_combo) == [ANY_TEXT, *form.FUELS]
-    assert int(window.year_combo.itemText(0)) == form.max_year()
-    assert int(window.year_combo.itemText(window.year_combo.count() - 1)) == 1990
 
 
 def test_missing_reference_db_shows_status_and_does_not_crash(window, ipc, state_db, tmp_path):
@@ -526,10 +522,10 @@ def test_missing_reference_db_shows_status_and_does_not_crash(window, ipc, state
 # ----------------------------------------------------------------------
 def test_submit_sends_spec_and_options_and_starts_polling(window, ctrl, ipc):
     pick_bmw_x5(window, "2020")
-    choose(window.transmission_combo, "АКПП")
+    window.transmission_checks["АКПП"].setChecked(True)
     window.evaluate_button.click()
     assert ipc.calls == [("submit_task", {
-        "mode": "exact", "manufacturer": "BMW", "model": "X5", "year_from": 2020,
+        "mode": "range", "manufacturer": "BMW", "model": "X5", "year_from": 2020,
         "year_to": 2020, "transmissions": ["АКПП"], "fuels": [],
     }, {"max_pages_per_site": 10, "max_ads_per_site": 500})]  # лимиты из настроек (4.4)
     assert ctrl.task_id == "T1"
@@ -541,7 +537,6 @@ def test_submit_sends_spec_and_options_and_starts_polling(window, ctrl, ipc):
 def test_submit_range_mode_spec(window, ctrl, ipc):
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
-    window.radio_range.setChecked(True)
     window.year_from_spin.setValue(2018)
     window.year_to_spin.setValue(2021)
     window.fuel_checks["Дизель"].setChecked(True)
@@ -876,13 +871,10 @@ def test_history_write_error_does_not_break_results(window, ctrl, ipc, dialogs, 
     assert dialogs.messages == [] and window.status_label.text().startswith("Готово")
 
 
-def test_history_selection_restores_exact_form_without_new_collection(window, ctrl, ipc):
-    choose(window.manufacturer_combo, "BMW")
-    choose(window.model_combo, "X5")
-    choose(window.generation_combo, "IV (G05)")
-    choose(window.year_combo, "2019")
-    choose(window.transmission_combo, "АКПП")
-    choose(window.fuel_combo, "Бензин")
+def test_history_selection_restores_form_without_new_collection(window, ctrl, ipc):
+    pick_bmw_x5(window, "2019")
+    window.transmission_checks["АКПП"].setChecked(True)
+    window.fuel_checks["Бензин"].setChecked(True)
     ipc.submit_reply = {"type": "task_accepted", "task_id": "T1", "queue_position": 0}
     ipc.status_replies = [{"type": "status", "task_id": "T1", "state": "completed"}]
     ctrl.submit()
@@ -895,15 +887,37 @@ def test_history_selection_restores_exact_form_without_new_collection(window, ct
     choose(window.history_combo, items(window.history_combo)[1])  # выбор записи
 
     state = window.form_state()
-    assert (state.mode, state.manufacturer, state.model, state.generation) == (
-        form.MODE_EXACT, "BMW", "X5", "IV (G05)")
-    assert (state.year, state.transmission, state.fuel) == (2019, "АКПП", "Бензин")
+    assert (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.year_from, state.year_to) == (2019, 2019)
+    assert (state.transmissions, state.fuels) == (["АКПП"], ["Бензин"])
     assert stat_cells(window)[0] == "4 900 000 ₽"
     assert window.count_label.text() == "Объявлений: 3"
     assert window.sites_table.rowCount() == 0
     assert ipc.calls == calls_before  # новый сбор НЕ запускался
     assert ctrl.task_id is None and not ctrl.timer.isActive()
     assert window.status_label.text().startswith("Сохранённый результат")
+
+
+@pytest.mark.parametrize("legacy_spec", [
+    {"mode": "exact", "manufacturer": "BMW", "model": "X5", "generation": "IV (G05)",
+     "year_from": 2019, "year_to": 2019, "transmissions": ["АКПП"], "fuels": ["Бензин"]},
+    {"mode": "exact", "manufacturer": "BMW", "model": "X5", "year_from": 2019,  # без year_to
+     "transmissions": ["АКПП"], "fuels": ["Бензин"]},
+    {"mode": "exact", "manufacturer": "BMW", "model": "X5", "year_to": 2019,  # без year_from
+     "transmissions": ["АКПП"], "fuels": ["Бензин"]},
+])
+def test_legacy_exact_history_entry_is_shown_as_equal_year_range(window, ctrl, history_file, legacy_spec):
+    """Старая запись истории с mode == exact не роняет Client: год от = год до."""
+    from client.history import save_to_history
+    from client.stats import calculate_stats
+    save_to_history(calculate_stats([1_000_000 + i for i in range(25)]), legacy_spec)
+    ctrl.refresh_history()
+    choose(window.history_combo, items(window.history_combo)[1])
+    state = window.form_state()
+    assert (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.year_from, state.year_to) == (2019, 2019)
+    assert (state.transmissions, state.fuels) == (["АКПП"], ["Бензин"])
+    assert window.count_label.text() == "Объявлений: 25"
 
 
 def test_history_selection_restores_range_form(window, ctrl, ipc, history_file):
@@ -916,7 +930,7 @@ def test_history_selection_restores_range_form(window, ctrl, ipc, history_file):
     ctrl.refresh_history()
     choose(window.history_combo, items(window.history_combo)[1])
     state = window.form_state()
-    assert state.mode == form.MODE_RANGE and (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.manufacturer, state.model) == ("BMW", "X5")
     assert (state.year_from, state.year_to) == (2015, 2019)
     assert (state.volume_from, state.volume_to) == (2.0, 3.5)
     assert sorted(state.transmissions) == ["АКПП", "Робот"] and state.fuels == ["Дизель"]
@@ -1034,7 +1048,7 @@ def test_history_view_clears_charts(window, ctrl, ipc):
     assert len(window.chart_widget.figure.axes) == 1  # цены в истории не хранятся
 
 
-SPEC_ACTIVE = {"mode": "exact", "manufacturer": "BMW", "model": "X5", "generation": "IV (G05)",
+SPEC_ACTIVE = {"mode": "range", "manufacturer": "BMW", "model": "X5",
                "year_from": 2019, "year_to": 2019, "transmissions": ["АКПП"], "fuels": ["Бензин"]}
 
 
@@ -1052,9 +1066,9 @@ def test_start_session_adopts_active_task(window, ctrl, ipc, session):
     assert ctrl.task_id == "T1" and ctrl.timer.isActive()
     assert window.stop_button.isEnabled() and not window.evaluate_button.isEnabled()
     state = window.form_state()
-    assert (state.manufacturer, state.model, state.generation, state.year) == (
-        "BMW", "X5", "IV (G05)", 2019)
-    assert (state.transmission, state.fuel) == ("АКПП", "Бензин")
+    assert (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.year_from, state.year_to) == (2019, 2019)
+    assert (state.transmissions, state.fuels) == (["АКПП"], ["Бензин"])
     assert "Подхвачено" in window.status_label.text()
     assert "submit_task" not in ipc.names()  # новое задание не отправляется
 
@@ -1340,19 +1354,18 @@ def add_manufacturer(path: Path, name: str) -> None:
 def test_database_update_reloads_reference_and_keeps_form(window, settings_ctrl, reference_db):
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
-    choose(window.generation_combo, "IV (G05)")
-    choose(window.year_combo, "2019")
+    window.year_from_spin.setValue(2019)
+    window.year_to_spin.setValue(2019)
     add_manufacturer(reference_db, "Zeekr")
     settings_ctrl._on_database_updated(object())
     assert "Zeekr" in items(window.manufacturer_combo)
     state = window.form_state()
-    assert (state.manufacturer, state.model, state.generation, state.year) == (
-        "BMW", "X5", "IV (G05)", 2019)
+    assert (state.manufacturer, state.model, state.year_from, state.year_to) == (
+        "BMW", "X5", 2019, 2019)
     assert window.status_label.text() == "Справочник обновлён"
 
 
 def test_database_update_keeps_range_form(window, settings_ctrl, reference_db):
-    window.set_mode(form.MODE_RANGE)
     choose(window.manufacturer_combo, "BMW")
     choose(window.model_combo, "X5")
     window.year_from_spin.setValue(2015)
@@ -1361,7 +1374,7 @@ def test_database_update_keeps_range_form(window, settings_ctrl, reference_db):
     add_manufacturer(reference_db, "Zeekr")
     settings_ctrl._on_database_updated(object())
     state = window.form_state()
-    assert state.mode == form.MODE_RANGE and (state.manufacturer, state.model) == ("BMW", "X5")
+    assert (state.manufacturer, state.model) == ("BMW", "X5")
     assert (state.year_from, state.year_to, state.volume_from) == (2015, 2019, 2.0)
 
 

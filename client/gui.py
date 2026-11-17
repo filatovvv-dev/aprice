@@ -7,8 +7,7 @@
 * читает виджеты в :class:`client.form.FormState` (:meth:`MainWindow.form_state`);
 * заполняет списки по командам контроллера (``set_*``);
 * сообщает о действиях пользователя сигналами (``evaluate_requested``,
-  ``stop_requested``, ``manufacturer_changed``, ``model_changed``,
-  ``generation_changed``).
+  ``stop_requested``, ``manufacturer_changed``).
 
 Программное заполнение списков идёт при заблокированных сигналах: смена
 выбора вызывает только пользователь.
@@ -19,7 +18,7 @@
 Подзадача 4.2: таблица статистики (:meth:`MainWindow.update_stats`, числа вида
 ``5 640 000 ₽``), красное предупреждение под таблицей и выпадающий список истории
 запросов (``history_selected``) с программным восстановлением формы (``select_*``,
-``set_mode``, ``set_range``, ``set_checked``) — всё без сигналов, как и ``set_*``.
+``set_range``, ``set_checked``) — всё без сигналов, как и ``set_*``.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ from typing import Optional
 
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -42,7 +40,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -95,8 +92,6 @@ class MainWindow(QMainWindow):
     evaluate_requested = pyqtSignal()
     stop_requested = pyqtSignal()
     manufacturer_changed = pyqtSignal(str)
-    model_changed = pyqtSignal(str)
-    generation_changed = pyqtSignal(str)
     #: Выбрана запись истории: индекс в списке, переданном в :meth:`set_history`.
     history_selected = pyqtSignal(int)
     #: Нажаты «Экспорт» (4.4) и «Настройки» (4.4).
@@ -115,9 +110,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.addWidget(self._build_vpn_banner())
         layout.addWidget(self._build_history_panel())
-        layout.addWidget(self._build_mode_panel())
         layout.addWidget(self._build_common_panel())
-        layout.addWidget(self._build_exact_panel())
         layout.addWidget(self._build_range_panel())
         layout.addWidget(self._build_action_panel())
         layout.addWidget(self._build_progress_panel())
@@ -129,7 +122,6 @@ class MainWindow(QMainWindow):
 
         self._connect_signals()
         self._start_vpn_banner(show_vpn_warning, vpn_banner_ms)
-        self._apply_mode()
         self._update_buttons()
 
     # ------------------------------------------------------------------
@@ -170,19 +162,6 @@ class MainWindow(QMainWindow):
         self._reset_combo(self.history_combo, [], HISTORY_PLACEHOLDER)
         return box
 
-    def _build_mode_panel(self) -> QWidget:
-        box = QGroupBox("Режим")
-        row = QHBoxLayout(box)
-        self.radio_exact = QRadioButton("Точный автомобиль")
-        self.radio_range = QRadioButton("Прицениться")
-        self.radio_exact.setChecked(True)
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.addButton(self.radio_exact)
-        self._mode_group.addButton(self.radio_range)
-        row.addWidget(self.radio_exact)
-        row.addWidget(self.radio_range)
-        return box
-
     def _build_common_panel(self) -> QWidget:
         box = QGroupBox("Автомобиль")
         row = QHBoxLayout(box)
@@ -194,28 +173,8 @@ class MainWindow(QMainWindow):
             self._reset_combo(combo, [], PLACEHOLDER)
         return box
 
-    def _build_exact_panel(self) -> QGroupBox:
-        self.exact_box = QGroupBox("Точный автомобиль")
-        row = QHBoxLayout(self.exact_box)
-        self.generation_combo = QComboBox()
-        self.year_combo = QComboBox()
-        self.transmission_combo = QComboBox()
-        self.fuel_combo = QComboBox()
-        for caption, combo in (
-            ("Поколение", self.generation_combo),
-            ("Год", self.year_combo),
-            ("КПП", self.transmission_combo),
-            ("Топливо", self.fuel_combo),
-        ):
-            row.addWidget(QLabel(caption))
-            row.addWidget(combo)
-        self._reset_combo(self.generation_combo, [], ANY_TEXT)
-        self._reset_combo(self.transmission_combo, list(form.TRANSMISSIONS), ANY_TEXT)
-        self._reset_combo(self.fuel_combo, list(form.FUELS), ANY_TEXT)
-        return self.exact_box
-
     def _build_range_panel(self) -> QGroupBox:
-        self.range_box = QGroupBox("Прицениться")
+        self.range_box = QGroupBox("Параметры поиска")
         outer = QVBoxLayout(self.range_box)
 
         years = QHBoxLayout()
@@ -303,17 +262,10 @@ class MainWindow(QMainWindow):
         return box
 
     def _connect_signals(self) -> None:
-        self.radio_exact.toggled.connect(self._on_mode_toggled)
         self.manufacturer_combo.currentIndexChanged.connect(
             lambda _i: self.manufacturer_changed.emit(self._selected(self.manufacturer_combo))
         )
-        self.model_combo.currentIndexChanged.connect(
-            lambda _i: self.model_changed.emit(self._selected(self.model_combo))
-        )
-        self.generation_combo.currentIndexChanged.connect(
-            lambda _i: self.generation_changed.emit(self._selected(self.generation_combo))
-        )
-        for combo in (self.manufacturer_combo, self.model_combo, self.year_combo):
+        for combo in (self.manufacturer_combo, self.model_combo):
             combo.currentIndexChanged.connect(lambda _i: self._update_buttons())
         for spin in (self.year_from_spin, self.year_to_spin):
             spin.valueChanged.connect(lambda _v: self._update_buttons())
@@ -328,32 +280,15 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(lambda _checked=False: self.stop_requested.emit())
 
     # ------------------------------------------------------------------
-    # Режимы и состояние формы
+    # Состояние формы
     # ------------------------------------------------------------------
-    def _on_mode_toggled(self, _checked: bool) -> None:
-        self._apply_mode()
-        self._update_buttons()
-
-    def _apply_mode(self) -> None:
-        """Режим А — комбобоксы, режим Б — диапазоны и чекбоксы."""
-        exact = self.radio_exact.isChecked()
-        self.exact_box.setVisible(exact)
-        self.range_box.setVisible(not exact)
-
     def form_state(self) -> FormState:
         """Текущие значения формы."""
-        exact = self.radio_exact.isChecked()
-        year_text = self.year_combo.currentText()
         volume_from = self.volume_from_spin.value()
         volume_to = self.volume_to_spin.value()
         return FormState(
-            mode=form.MODE_EXACT if exact else form.MODE_RANGE,
             manufacturer=self._selected(self.manufacturer_combo),
             model=self._selected(self.model_combo),
-            generation=self._selected(self.generation_combo),
-            year=int(year_text) if year_text.isdigit() else None,
-            transmission=self._selected(self.transmission_combo),
-            fuel=self._selected(self.fuel_combo),
             year_from=self.year_from_spin.value(),
             year_to=self.year_to_spin.value(),
             volume_from=volume_from if volume_from > 0 else None,
@@ -377,20 +312,6 @@ class MainWindow(QMainWindow):
 
     def set_models(self, names: list[str]) -> None:
         self._reset_combo(self.model_combo, names, PLACEHOLDER)
-        self._update_buttons()
-
-    def set_generations(self, names: list[str]) -> None:
-        self._reset_combo(self.generation_combo, names, ANY_TEXT)
-
-    def set_transmissions(self, names: list[str]) -> None:
-        self._reset_combo(self.transmission_combo, names, ANY_TEXT)
-
-    def set_fuels(self, names: list[str]) -> None:
-        self._reset_combo(self.fuel_combo, names, ANY_TEXT)
-
-    def set_years(self, years: list[int]) -> None:
-        """Заполняет годы режима А; выбран первый (самый новый)."""
-        self._reset_combo(self.year_combo, [str(y) for y in years], None)
         self._update_buttons()
 
     def set_status(self, text: str) -> None:
@@ -464,27 +385,11 @@ class MainWindow(QMainWindow):
         self._reset_combo(self.history_combo, labels, HISTORY_PLACEHOLDER)
         self._update_buttons()
 
-    def set_mode(self, mode: str) -> None:
-        """Переключает режим (А/Б) программно."""
-        (self.radio_exact if mode == form.MODE_EXACT else self.radio_range).setChecked(True)
-
     def select_manufacturer(self, name: str) -> bool:
         return self._select(self.manufacturer_combo, name)
 
     def select_model(self, name: str) -> bool:
         return self._select(self.model_combo, name)
-
-    def select_generation(self, name: str) -> bool:
-        return self._select(self.generation_combo, name)
-
-    def select_year(self, year: int) -> bool:
-        return self._select(self.year_combo, str(year))
-
-    def select_transmission(self, name: str) -> bool:
-        return self._select(self.transmission_combo, name)
-
-    def select_fuel(self, name: str) -> bool:
-        return self._select(self.fuel_combo, name)
 
     def set_range(
         self,
@@ -493,7 +398,7 @@ class MainWindow(QMainWindow):
         volume_from: Optional[float],
         volume_to: Optional[float],
     ) -> None:
-        """Диапазоны режима Б; ``None`` у объёма — граница не задана."""
+        """Диапазоны годов и объёма; ``None`` у объёма — граница не задана."""
         if year_from is not None:
             self.year_from_spin.setValue(int(year_from))
         if year_to is not None:
@@ -502,7 +407,7 @@ class MainWindow(QMainWindow):
         self.volume_to_spin.setValue(float(volume_to or 0.0))
 
     def set_checked(self, transmissions: list[str], fuels: list[str]) -> None:
-        """Отмечает чекбоксы КПП и топлива режима Б (остальные снимает)."""
+        """Отмечает чекбоксы КПП и топлива (остальные снимает)."""
         for name, check in self.transmission_checks.items():
             check.setChecked(name in transmissions)
         for name, check in self.fuel_checks.items():
