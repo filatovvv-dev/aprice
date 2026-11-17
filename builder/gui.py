@@ -43,6 +43,7 @@ from builder.database import Database
 from builder.parser import CaptchaDetectedError, CatalogParser, clear_cache
 from common import constants
 from common.config import Config
+from common.footer import CopyrightFooter
 from common.logger import QtLogEmitter
 from common.window_manager import WindowManager
 
@@ -193,6 +194,8 @@ class BuilderWindow(QMainWindow):
         font = QFont("Consolas", 9)
         self.log_view.setFont(font)
         layout.addWidget(self.log_view, stretch=1)
+        self.footer_label = CopyrightFooter("Builder", central)
+        layout.addWidget(self.footer_label)
 
         self.status_label = QLabel("", self)
         self.statusBar().addWidget(self.status_label)

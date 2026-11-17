@@ -81,7 +81,7 @@ def test_dialog_loads_defaults_from_config(dialog):
     assert dialog.values() == {"max_pages_per_site": 10, "max_ads_per_site": 500,
                                "db_update_url": constants.DEFAULT_SETTINGS["client"]["db_update_url"],
                                "db_date_url": constants.DEFAULT_SETTINGS["client"]["db_date_url"],
-                               "db_max_age_days": 30}
+                               "db_max_age_days": 180}
 
 
 def test_dialog_loads_existing_values(qapp, config, db_file):
