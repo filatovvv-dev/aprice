@@ -17,6 +17,33 @@ ROOT = Path(__file__).resolve().parent.parent
 ENV = "PLAYWRIGHT_BROWSERS_PATH"
 
 
+CHROME_REL = Path("chromium-1255") / "chrome-win" / "chrome.exe"
+
+
+@pytest.fixture
+def fake_playwright(monkeypatch):
+    """Подменяет ``sync_playwright``: без настоящего движка (5.2-fix).
+
+    Настоящий Sync API Playwright падает, если в потоке уже работает цикл asyncio
+    («Playwright Sync API inside the asyncio loop»), — так бывает в pytest. Фейк
+    повторяет правило Playwright: Chromium лежит в ``$PLAYWRIGHT_BROWSERS_PATH``,
+    поэтому тесты по-прежнему проверяют, что путь строится от ``browser/`` рядом с .exe.
+    """
+    from types import SimpleNamespace
+
+    class FakePw:
+        def __enter__(self):
+            root = Path(os.environ[ENV])
+            return SimpleNamespace(chromium=SimpleNamespace(executable_path=str(root / CHROME_REL)))
+
+        def __exit__(self, *exc):
+            return False
+
+    import playwright.sync_api as api
+
+    monkeypatch.setattr(api, "sync_playwright", lambda: FakePw())
+
+
 @pytest.fixture(autouse=True)
 def restore_env(monkeypatch):
     """Каждый тест возвращает окружение как было (переменную ставит и server.main при импорте)."""
@@ -78,8 +105,8 @@ def test_server_main_sets_env_on_import(monkeypatch):
     assert os.environ[ENV] == str(paths.BASE_DIR / "browser")
 
 
-def test_playwright_looks_for_chromium_inside_browser_dir(tmp_path):
-    """Настоящий Playwright (без браузера) ожидает chrome внутри заданного каталога."""
+def test_playwright_looks_for_chromium_inside_browser_dir(tmp_path, fake_playwright):
+    """Playwright (фейковый) ожидает chrome внутри каталога ``browser/`` рядом с .exe."""
     browsers = paths.configure_playwright_browsers_path(tmp_path)
     expected = Path(browser_check.chromium_executable_path())
     assert expected.is_relative_to(browsers), expected
@@ -89,7 +116,7 @@ def test_playwright_looks_for_chromium_inside_browser_dir(tmp_path):
     assert browser_check.chromium_installed()  # положили файл — сервер находит
 
 
-def test_moved_distribution_still_finds_chromium(tmp_path):
+def test_moved_distribution_still_finds_chromium(tmp_path, fake_playwright):
     """Перенос папки Server в другое место (browser/ внутри) — браузер по-прежнему найден."""
     first = tmp_path / "A" / "Server"
     browsers = paths.configure_playwright_browsers_path(first)
