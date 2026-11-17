@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -70,6 +71,31 @@ def ensure_runtime_dirs(base_dir: Optional[Path] = None) -> list[Path]:
         path.mkdir(parents=True, exist_ok=True)
         created.append(path)
     return created
+
+
+#: Имя переменной окружения Playwright и каталог портативного браузера (5.2).
+PLAYWRIGHT_BROWSERS_ENV = "PLAYWRIGHT_BROWSERS_PATH"
+BROWSER_DIR_NAME = "browser"
+
+
+def configure_playwright_browsers_path(base_dir: Optional[Path] = None) -> Path:
+    """Направляет Playwright на ``browser/`` рядом с ``.exe`` (portable-режим, 5.2).
+
+    Без этого Playwright ищет/скачивает Chromium в ``%LOCALAPPDATA%\\ms-playwright``
+    — собранный каталог становится непереносимым, а запись туда блокируют антивирусы.
+    Вызывать нужно до первого запуска Playwright (его импорты в проекте ленивые).
+    Значение выставляется безусловно: прежнее значение переменной (например, от
+    другой установки) нарушило бы переносимость сборки.
+
+    Args:
+        base_dir: базовый каталог (по умолчанию :data:`BASE_DIR`).
+
+    Returns:
+        Path: каталог браузеров (он может ещё не существовать).
+    """
+    path = (Path(base_dir) if base_dir is not None else BASE_DIR) / BROWSER_DIR_NAME
+    os.environ[PLAYWRIGHT_BROWSERS_ENV] = str(path)
+    return path
 
 
 def bootstrap_reference_db(

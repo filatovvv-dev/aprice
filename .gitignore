@@ -5,3 +5,6 @@ data/debug/
 # История запросов Client (локальные данные пользователя)
 data/aprice_client_history.json
 data/aprice_client_history.json.tmp
+
+# Portable Chromium рядом с .exe / в корне проекта при разработке (5.2)
+/browser/
