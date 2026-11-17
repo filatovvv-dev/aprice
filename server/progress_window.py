@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from common import constants
+from common.footer import CopyrightFooter
 from common.utils import format_eta
 from common.window_manager import WindowManager
 
@@ -112,6 +113,8 @@ class ProgressWindow(QWidget):
             self.button_stop,
         ):
             layout.addWidget(widget)
+        self.footer_label = CopyrightFooter("Server", self)
+        layout.addWidget(self.footer_label)
         self.button_stop.clicked.connect(self._on_stop_clicked)
 
     def _on_stop_clicked(self) -> None:

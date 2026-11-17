@@ -46,6 +46,7 @@ from client.db_update import (
 )
 from common import constants
 from common.config import Config
+from common.footer import CopyrightFooter
 
 logger = logging.getLogger("aprice.client.settings")
 
@@ -166,6 +167,8 @@ class SettingsDialog(QDialog):
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.cancel_button)
         layout.addLayout(buttons)
+        self.footer_label = CopyrightFooter("Client", self)
+        layout.addWidget(self.footer_label)
 
         self.save_button.clicked.connect(lambda _c=False: self.save())
         self.cancel_button.clicked.connect(lambda _c=False: self.reject())
@@ -190,7 +193,7 @@ class SettingsDialog(QDialog):
         self.max_ads_spin.setValue(int(get(SECTION, "max_ads_per_site", 500)))
         self.url_edit.setText(str(get(SECTION, "db_update_url", "") or ""))
         self.date_url_edit.setText(str(get(SECTION, "db_date_url", "") or ""))
-        self.age_spin.setValue(int(get(SECTION, "db_max_age_days", 30)))
+        self.age_spin.setValue(int(get(SECTION, "db_max_age_days", 180)))
         self._refresh_age()
 
     def values(self) -> dict:

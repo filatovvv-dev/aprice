@@ -51,6 +51,7 @@ from PyQt6.QtWidgets import (
 from client import form
 from client.charts import ChartWidget
 from client.form import FormState
+from common.footer import CopyrightFooter
 
 WINDOW_TITLE = "АвтоПрайс — оценка стоимости автомобиля"
 PLACEHOLDER = "— выберите —"
@@ -119,6 +120,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_results_panel(), TAB_RESULTS)
         self.tabs.addTab(self.chart_widget, TAB_CHARTS)
         layout.addWidget(self.tabs)
+        self.footer_label = CopyrightFooter("Client", self)
+        layout.addWidget(self.footer_label)
 
         self._connect_signals()
         self._start_vpn_banner(show_vpn_warning, vpn_banner_ms)
