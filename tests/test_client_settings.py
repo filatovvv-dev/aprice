@@ -346,11 +346,25 @@ def test_date_check_failure_is_reported_and_nothing_downloaded(smart, boxes):
     assert d.update_button.isEnabled()
 
 
-def test_non_date_content_in_date_file_is_reported(smart, boxes):
+def test_unrecognized_date_means_up_to_date_without_download(smart, boxes):
+    """5.5: нераспознанная дата в date.txt — «обновление не требуется», база не качается."""
     d, db = smart
-    d.install(TextResponse("<html>captcha</html>"))
-    run_update(d, lambda: boxes.critical_texts)
-    assert "ISO 8601" in boxes.critical_texts[0]
+    before = db.read_bytes()
+    fake = d.install(TextResponse("<html>captcha</html>"))
+    run_update(d, lambda: boxes.info_texts)
+    assert fake.urls == [DATE_URL] and db.read_bytes() == before
+    assert boxes.info_titles == ["Обновления не требуются"] and boxes.critical_texts == []
+
+
+def test_russian_date_in_date_file_triggers_download(smart, boxes, tmp_path):
+    d, db = smart
+    payload = make_db(tmp_path / "remote.db", ("BMW", "Audi"))
+    fake = d.install(TextResponse("18.11.2026"), FakeResponse(payload))  # локальная — 17.11.2026 12:00
+    got = []
+    d.database_updated.connect(got.append)
+    run_update(d, lambda: got)
+    assert fake.urls == [DATE_URL, DB_URL]
+    assert abs(db.stat().st_mtime - datetime(2026, 11, 18).timestamp()) < 1
 
 
 def test_empty_date_url_downloads_without_check(smart, boxes, tmp_path):

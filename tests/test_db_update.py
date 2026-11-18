@@ -327,11 +327,19 @@ def test_check_for_updates_resolves_yandex_public_link(tmp_path):
     assert get.urls[1] == "https://downloader.disk.test/date"
 
 
-@pytest.mark.parametrize("body", ["", "   \n", "<!DOCTYPE html><html>captcha</html>", "вчера", "x" * 5000])
-def test_check_for_updates_rejects_non_date_body(tmp_path, body):
+@pytest.mark.parametrize("body", ["", "   \n", "<!DOCTYPE html><html>captcha</html>", "вчера", "32.13.2026"])
+def test_check_for_updates_unrecognized_date_means_no_update(tmp_path, body, caplog):
+    """5.5: нераспознанная дата -> warning в лог и «обновление не требуется»."""
+    db = local_db(tmp_path, LOCAL)
+    with caplog.at_level("WARNING", logger="aprice.client.db_update"):
+        assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(body))) is False
+    assert any("Дата обновления не распознана" in r.message or "пуст" in r.message for r in caplog.records)
+
+
+def test_check_for_updates_rejects_oversized_page(tmp_path):
     db = local_db(tmp_path, LOCAL)
     with pytest.raises(DbUpdateError):
-        db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(body)))
+        db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("x" * 5000)))
 
 
 def test_check_for_updates_network_error_and_bad_url(tmp_path):
@@ -354,3 +362,54 @@ def test_check_for_updates_uses_first_line_of_date_file(tmp_path):
     db = local_db(tmp_path, LOCAL)
     get = FakeGet(TextResponse("2026-11-17T12:00:00\n2030-01-01T00:00:00\n"))
     assert db_update.check_for_updates(DATE_URL, db, get=get) is False
+
+
+# ----------------------------------------------------------------------
+# 5.5: parse_date — DD.MM.YYYY и ISO 8601
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("text, expected", [
+    ("17.11.2026", datetime(2026, 11, 17)),
+    ("17.11.2026 12:30:45", datetime(2026, 11, 17, 12, 30, 45)),
+    ("  17.11.2026 \r\n", datetime(2026, 11, 17)),
+    ("\ufeff17.11.2026", datetime(2026, 11, 17)),
+    ("01.02.2026", datetime(2026, 2, 1)),  # день.месяц, а не месяц.день
+    ("2026-11-17T12:00:00", datetime(2026, 11, 17, 12)),
+    ("2026-11-17 12:00:00", datetime(2026, 11, 17, 12)),
+    ("2026-11-17", datetime(2026, 11, 17)),
+    ("17.11.2026\n2030-01-01", datetime(2026, 11, 17)),  # берётся первая строка
+])
+def test_parse_date_formats(text, expected):
+    assert db_update.parse_date(text) == expected
+
+
+def test_parse_date_iso_with_offset_and_z():
+    got = db_update.parse_date("2026-11-17T15:00:00+03:00")
+    assert got.utcoffset() == timedelta(hours=3) and got.hour == 15
+    assert db_update.parse_date("2026-11-17T12:00:00Z").utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize("text", ["", "  ", "\n\n", "вчера", "2026/11/17", "17-11-2026", "32.01.2026",
+                                  "17.13.2026", "<html>", "17.11.26"])
+def test_parse_date_unrecognized_returns_none_and_warns(text, caplog):
+    with caplog.at_level("WARNING", logger="aprice.client.db_update"):
+        assert db_update.parse_date(text) is None
+    assert caplog.records  # warning записан
+
+
+def test_check_for_updates_with_russian_date(tmp_path):
+    db = local_db(tmp_path, datetime(2026, 11, 17, 0, 0, 0))
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("17.11.2026"))) is False
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("18.11.2026"))) is True
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("16.11.2026"))) is False
+    assert db_update.check_for_updates(
+        DATE_URL, db, get=FakeGet(TextResponse("17.11.2026 00:00:01"))) is True
+
+
+def test_metadata_last_update_may_be_russian_date(tmp_path):
+    db = tmp_path / "aprice.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO metadata VALUES ('last_update', '01.01.2026')")
+    conn.commit()
+    conn.close()
+    assert db_update.local_db_date(db) == datetime(2026, 1, 1)

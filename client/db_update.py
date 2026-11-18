@@ -84,17 +84,41 @@ def db_age_days(path: PathLike, now: Optional[float] = None) -> Optional[int]:
 MAX_DATE_BYTES = 4096
 
 
-def _parse_iso_date(text: str) -> datetime:
-    """Разбирает дату ISO 8601 из ``date.txt`` (первая непустая строка, BOM допускается)."""
-    lines = [ln.strip() for ln in (text or "").lstrip("\ufeff").splitlines() if ln.strip()]
+#: Форматы даты в ``date.txt`` (5.5): ISO 8601 и русский ``DD.MM.YYYY`` (с временем и без).
+DATE_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S",  # ISO 8601
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d",
+    "%d.%m.%Y %H:%M:%S",  # русский, с временем
+    "%d.%m.%Y",           # русский, без времени
+)
+
+
+def parse_date(date_str: str) -> Optional[datetime]:
+    """Разбирает дату из ``date.txt`` (первая непустая строка; BOM и пробелы допускаются).
+
+    Понимает ``DD.MM.YYYY``, ``DD.MM.YYYY HH:MM:SS`` и ISO 8601 (в том числе со
+    смещением пояса, ``Z`` и долями секунды — их разбирает ``fromisoformat``).
+
+    Returns:
+        datetime: дата; ``None`` — не распознана ни в одном формате (пишется
+        предупреждение в лог; вызывающий считает, что обновление не требуется).
+    """
+    lines = [ln.strip() for ln in (date_str or "").lstrip("\ufeff").splitlines() if ln.strip()]
     if not lines:
-        raise DbUpdateError("Файл с датой обновления пуст.")
+        logger.warning("Файл с датой обновления пуст")
+        return None
+    text = lines[0]
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
     try:
-        return datetime.fromisoformat(lines[0])
-    except ValueError as exc:
-        raise DbUpdateError(
-            f"Файл с датой обновления содержит не дату ISO 8601: {lines[0][:40]!r}."
-        ) from exc
+        return datetime.fromisoformat(text)  # ISO со смещением/«Z»/долями секунды
+    except ValueError:
+        logger.warning("Дата обновления не распознана: %r", text[:60])
+        return None
 
 
 def fetch_remote_date(
@@ -102,11 +126,14 @@ def fetch_remote_date(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     get: Optional[Callable[..., Any]] = None,
-) -> datetime:
+) -> Optional[datetime]:
     """Скачивает ``date.txt`` (публичную ссылку Яндекс.Диска разрешает через API) и разбирает дату.
 
+    Returns:
+        datetime: дата публикации; ``None`` — в файле нераспознанная дата (:func:`parse_date`).
+
     Raises:
-        DbUpdateError: ссылка некорректна, сеть недоступна или в файле не дата.
+        DbUpdateError: ссылка некорректна или сеть недоступна.
     """
     url = _check_url(remote_date_url)
     getter = get if get is not None else requests.get
@@ -119,7 +146,7 @@ def fetch_remote_date(
         raise DbUpdateError(f"Не удалось получить дату обновления базы: {exc}") from exc
     if len(text) > MAX_DATE_BYTES:  # HTML-страница вместо короткого текста
         raise DbUpdateError("Файл с датой обновления слишком большой (получена не та страница?).")
-    return _parse_iso_date(text)
+    return parse_date(text)
 
 
 def local_db_date(local_db_path: PathLike) -> Optional[datetime]:
@@ -137,10 +164,11 @@ def local_db_date(local_db_path: PathLike) -> Optional[datetime]:
     try:
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
         row = conn.execute("SELECT value FROM metadata WHERE key = 'last_update'").fetchone()
-        if row and row[0]:
-            return _parse_iso_date(str(row[0]))
-    except (sqlite3.Error, DbUpdateError):
-        pass  # нет таблицы/ключа/читаемой даты — берём mtime
+        parsed = parse_date(str(row[0])) if row and row[0] else None
+        if parsed is not None:
+            return parsed
+    except sqlite3.Error:
+        pass  # нет таблицы/ключа — берём mtime
     finally:
         if conn is not None:
             conn.close()
@@ -168,12 +196,15 @@ def check_for_updates(
         local_db_path: файл рабочей базы.
 
     Returns:
-        bool: ``True`` — скачивать; ``False`` — база актуальна (дата равна или старше).
+        bool: ``True`` — скачивать; ``False`` — база актуальна (дата равна или старше)
+        либо дата в ``date.txt`` не распознана (5.5: «обновление не требуется»).
 
     Raises:
-        DbUpdateError: дату получить не удалось (сеть, не дата в файле).
+        DbUpdateError: дату получить не удалось (сеть, ссылка).
     """
     remote = fetch_remote_date(remote_date_url, timeout=timeout, get=get)
+    if remote is None:
+        return False
     return is_remote_newer(remote, local_db_date(local_db_path))
 
 
