@@ -253,7 +253,7 @@ HIDDEN = {
 }
 
 
-def _spec_namespace(key: str) -> dict:
+def _spec_namespace(key: str, specpath: "str | None" = None) -> dict:
     """Исполняет .spec с заглушками PyInstaller и возвращает его переменные."""
     captured: dict = {}
 
@@ -268,7 +268,7 @@ def _spec_namespace(key: str) -> dict:
         return [], [], []
 
     ns = {
-        "SPECPATH": str(ROOT / "build_scripts"),
+        "SPECPATH": specpath or str(ROOT / "build_scripts"),
         "Analysis": lambda *a, **kw: captured.update(analysis=kw) or Rec(**kw),
         "PYZ": Rec, "EXE": lambda *a, **kw: captured.update(exe=kw) or Rec(**kw),
         "COLLECT": lambda *a, **kw: captured.update(coll=kw) or Rec(**kw),
@@ -285,6 +285,7 @@ def _spec_namespace(key: str) -> dict:
     sys.modules.update(pkg)
     try:
         exec(compile((ROOT / "build_scripts" / f"{key}.spec").read_text(encoding="utf-8"), f"{key}.spec", "exec"), ns)
+        captured["datas"] = ns.get("datas")
     finally:
         for k, v in saved.items():
             if v is None:

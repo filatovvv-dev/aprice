@@ -98,7 +98,8 @@ class DbUpdateThread(QThread):
                 # Сначала крошечный date.txt; базу качаем, только если дата строго новее.
                 remote = self._date_fetcher(self._date_url)
                 local = local_db_date(self._target if self._target is not None else constants.DB_FILE)
-                if not is_remote_newer(remote, local):
+                # remote is None: дата в date.txt не распознана — считаем, что обновление не нужно
+                if remote is None or not is_remote_newer(remote, local):
                     self.up_to_date.emit()
                     return
                 extra["mtime"] = remote.timestamp()

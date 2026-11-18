@@ -13,6 +13,7 @@ from common.config import Config
 from common.logger import setup_logging
 from common.window_manager import WindowManager
 from client.controller import ClientController
+from client.first_run import ensure_database
 from client.gui import MainWindow
 
 logger = logging.getLogger("aprice.client.main")
@@ -30,6 +31,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     paths.ensure_runtime_dirs()  # config/, logs/, data/ — рядом с .exe
     config = Config().load()
     setup_logging(component="client", config=config)
+
+    # 5.5: база не вшита в дистрибутив — при первом запуске скачиваем её с зеркала.
+    # Не вышло — ошибка уже показана, основное окно не открываем (без марок/моделей оно бесполезно).
+    if not ensure_database(config):
+        logger.error("Client не запущен: нет справочника aprice.db")
+        return 1
 
     window = MainWindow(show_vpn_warning=bool(config.get("client", "show_vpn_warning", True)))
     window_manager = WindowManager(settings_filename=constants.CLIENT_WINDOW_SETTINGS_FILE)

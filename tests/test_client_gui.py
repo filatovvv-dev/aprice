@@ -753,6 +753,8 @@ def test_main_builds_window_and_controller_without_side_effects(qapp, monkeypatc
     """``main()`` собирает окно и контроллер; файлы настроек/логов не трогаются."""
     from client import main as main_module
 
+    monkeypatch.setattr(main_module, "ensure_database", lambda *a, **k: True)  # 5.5: сеть не нужна
+
     created: dict = {}
 
     class FakeWindowManager:
@@ -1008,6 +1010,8 @@ def test_vpn_banner_hides_itself_by_timer(qapp):
 
 def test_main_respects_show_vpn_warning_setting(monkeypatch, tmp_path):
     from client import main as main_module
+
+    monkeypatch.setattr(main_module, "ensure_database", lambda *a, **k: True)  # 5.5: сеть не нужна
 
     config = Config(tmp_path / "settings.json")
     config.set("client", "show_vpn_warning", False)
@@ -1402,6 +1406,8 @@ def test_dialog_signal_triggers_reload(window, settings_ctrl, reference_db):
 
 def test_main_passes_window_manager_to_controller(monkeypatch, tmp_path):
     from client import main as main_module
+
+    monkeypatch.setattr(main_module, "ensure_database", lambda *a, **k: True)  # 5.5: сеть не нужна
 
     seen: dict = {}
 

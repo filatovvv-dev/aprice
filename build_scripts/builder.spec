@@ -39,10 +39,13 @@ excludes = [
 
 # Базовая справочная база. Кладётся в ресурсы (_internal/data/aprice.db);
 # при первом запуске Builder копирует её в data/ рядом с .exe (common.paths).
+# Если файла нет — сборка НЕ падает (5.5: Client базу больше не вшивает, а скачивает
+# сам): Builder без вшитой базы создаст пустую схему и наполнит её при сборе.
 _db = os.path.join(ROOT, 'data', 'aprice.db')
-if not os.path.isfile(_db):
-    raise SystemExit('Не найден %s — положите полную базу справочников перед сборкой.' % _db)
-datas += [(_db, 'data')]   # ('data/aprice.db', 'data'), путь абсолютный
+if os.path.isfile(_db):
+    datas += [(_db, 'data')]   # ('data/aprice.db', 'data'), путь абсолютный
+else:
+    print('ВНИМАНИЕ: %s не найден — Builder будет собран без вшитой базы.' % _db)
 
 a = Analysis(
     [os.path.join(ROOT, 'builder/main.py')],
