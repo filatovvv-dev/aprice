@@ -127,7 +127,8 @@ def ensure_database(
         return True
     ui = ui if ui is not None else QtDownloadUi()
     url = str(config.get("client", "db_update_url", "") or "").strip()
-    if not url:
+    date_url = str(config.get("client", "db_date_url", "") or "").strip()
+    if not url and not date_url:
         logger.error("Базы %s нет и db_update_url не задан", target)
         ui.show_error(NO_URL_MESSAGE)
         return False
@@ -136,7 +137,9 @@ def ensure_database(
         from client.settings_dialog import DbUpdateThread
 
         def thread_factory(u: str, t: Path) -> Any:  # noqa: E306
-            return DbUpdateThread(u, t)  # без date_url: базы нет — качаем безусловно
+            # Базы нет — качаем безусловно, но ссылку берём из манифеста date.txt (2-я строка,
+            # 5.5); нет манифеста/ссылки в нём — запасной db_update_url из настроек.
+            return DbUpdateThread(u, t, date_url=date_url, force=True)
 
     ok, reason = ui.run(thread_factory(url, target))
     if ok and database_present(target):

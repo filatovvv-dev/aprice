@@ -14,6 +14,10 @@
 Яндекс.Диска (``disk.yandex.*``, ``yadi.sk``) сначала разрешаются в прямую ссылку
 через публичный API Диска.
 
+Манифест обновления (5.5): ``date.txt`` может содержать и вторую строку — актуальную
+ссылку на ``aprice.db`` (Яндекс.Диск меняет ссылку при замене файла); без неё берётся
+``db_update_url``.
+
 Умное обновление (4.5): рядом с базой на зеркале лежит ``date.txt`` с датой
 публикации (ISO 8601, например ``2026-11-17T12:00:00``). :func:`check_for_updates`
 сначала скачивает этот крошечный файл и сравнивает дату с локальной базой
@@ -121,19 +125,53 @@ def parse_date(date_str: str) -> Optional[datetime]:
         return None
 
 
-def fetch_remote_date(
+@dataclass(frozen=True)
+class Manifest:
+    """Манифест обновления (``date.txt``): дата публикации и актуальная ссылка на базу.
+
+    Формат (5.5)::
+
+        17.11.2026
+        https://disk.yandex.ru/d/новая_ссылка_на_базу
+
+    Вторая строка необязательна (старый формат из одной даты работает как раньше).
+    """
+
+    date: Optional[datetime]  # None — первая строка не распознана как дата
+    db_url: Optional[str]  # None — второй строки нет/пуста/это не ссылка
+
+
+def parse_manifest(text: str) -> Manifest:
+    """Разбирает текст ``date.txt``: 1-я непустая строка — дата, 2-я — ссылка на базу.
+
+    Пустые строки пропускаются, BOM и пробелы допускаются. Вторая строка, которая не
+    является ссылкой ``http(s)``, игнорируется с предупреждением (сработает запасная
+    ``db_update_url`` из настроек). Остальные строки не используются.
+    """
+    lines = [ln.strip() for ln in (text or "").lstrip("\ufeff").splitlines() if ln.strip()]
+    date = parse_date(lines[0]) if lines else parse_date("")
+    db_url: Optional[str] = None
+    if len(lines) > 1:
+        candidate = lines[1]
+        parsed = urlparse(candidate)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            db_url = candidate
+        else:
+            logger.warning("Вторая строка date.txt не ссылка, игнорирую: %r", candidate[:80])
+    return Manifest(date=date, db_url=db_url)
+
+
+def fetch_manifest(
     remote_date_url: str,
     *,
     timeout: float = DEFAULT_TIMEOUT,
     get: Optional[Callable[..., Any]] = None,
-) -> Optional[datetime]:
-    """Скачивает ``date.txt`` (публичную ссылку Яндекс.Диска разрешает через API) и разбирает дату.
-
-    Returns:
-        datetime: дата публикации; ``None`` — в файле нераспознанная дата (:func:`parse_date`).
+) -> Manifest:
+    """Скачивает ``date.txt`` (публичную ссылку Яндекс.Диска разрешает через API) и разбирает его.
 
     Raises:
-        DbUpdateError: ссылка некорректна или сеть недоступна.
+        DbUpdateError: ссылка некорректна, сеть недоступна или получена слишком большая
+            страница (HTML вместо короткого текста).
     """
     url = _check_url(remote_date_url)
     getter = get if get is not None else requests.get
@@ -144,9 +182,19 @@ def fetch_remote_date(
         text = response.text
     except requests.RequestException as exc:
         raise DbUpdateError(f"Не удалось получить дату обновления базы: {exc}") from exc
-    if len(text) > MAX_DATE_BYTES:  # HTML-страница вместо короткого текста
+    if len(text) > MAX_DATE_BYTES:
         raise DbUpdateError("Файл с датой обновления слишком большой (получена не та страница?).")
-    return parse_date(text)
+    return parse_manifest(text)
+
+
+def fetch_remote_date(
+    remote_date_url: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    get: Optional[Callable[..., Any]] = None,
+) -> Optional[datetime]:
+    """Дата из ``date.txt`` (первая строка манифеста); ``None`` — не распознана."""
+    return fetch_manifest(remote_date_url, timeout=timeout, get=get).date
 
 
 def local_db_date(local_db_path: PathLike) -> Optional[datetime]:
@@ -182,30 +230,58 @@ def is_remote_newer(remote: datetime, local: Optional[datetime]) -> bool:
     return remote.timestamp() > local.timestamp()
 
 
+@dataclass(frozen=True)
+class UpdateCheck:
+    """Итог проверки манифеста."""
+
+    required: bool  # нужно ли скачивать базу
+    db_url: Optional[str]  # ссылка из манифеста (None — брать db_update_url); None и если не нужно
+    date: Optional[datetime]  # дата публикации (для времени изменения скачанного файла)
+
+
+def check_manifest(
+    remote_date_url: str,
+    local_db_path: PathLike,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    get: Optional[Callable[..., Any]] = None,
+) -> UpdateCheck:
+    """Скачивает манифест и решает, нужно ли обновление (удалённая дата строго новее).
+
+    Дата не распознана → обновление не требуется (ссылка тоже не возвращается).
+
+    Raises:
+        DbUpdateError: манифест получить не удалось (сеть, ссылка).
+    """
+    manifest = fetch_manifest(remote_date_url, timeout=timeout, get=get)
+    if manifest.date is None or not is_remote_newer(manifest.date, local_db_date(local_db_path)):
+        return UpdateCheck(False, None, manifest.date)
+    return UpdateCheck(True, manifest.db_url, manifest.date)
+
+
 def check_for_updates(
     remote_date_url: str,
     local_db_path: PathLike,
     *,
     timeout: float = DEFAULT_TIMEOUT,
     get: Optional[Callable[..., Any]] = None,
-) -> bool:
-    """Нужно ли скачивать базу: удалённая дата строго новее локальной.
+) -> tuple[bool, Optional[str]]:
+    """Нужно ли скачивать базу и по какой ссылке.
 
     Args:
-        remote_date_url: ``db_date_url`` (ссылка на ``date.txt``).
+        remote_date_url: ``db_date_url`` (ссылка на ``date.txt`` — манифест обновления).
         local_db_path: файл рабочей базы.
 
     Returns:
-        bool: ``True`` — скачивать; ``False`` — база актуальна (дата равна или старше)
-        либо дата в ``date.txt`` не распознана (5.5: «обновление не требуется»).
+        tuple: ``(требуется_обновление, url_базы)``. ``url_базы`` — вторая строка
+        манифеста; ``None``, если обновление не нужно (дата равна/старше/не распознана)
+        или ссылки в манифесте нет (тогда берётся ``db_update_url`` из настроек).
 
     Raises:
-        DbUpdateError: дату получить не удалось (сеть, ссылка).
+        DbUpdateError: манифест получить не удалось (сеть, ссылка).
     """
-    remote = fetch_remote_date(remote_date_url, timeout=timeout, get=get)
-    if remote is None:
-        return False
-    return is_remote_newer(remote, local_db_date(local_db_path))
+    result = check_manifest(remote_date_url, local_db_path, timeout=timeout, get=get)
+    return result.required, result.db_url
 
 
 def _check_url(url: str) -> str:
