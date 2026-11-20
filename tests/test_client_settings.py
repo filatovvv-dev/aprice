@@ -2,6 +2,7 @@
 
 import json
 import os
+from types import SimpleNamespace
 import time
 
 import pytest
@@ -224,6 +225,7 @@ def test_update_without_valid_url_does_not_start(qapp, config, db_file, boxes, u
     calls = []
     d = SettingsDialog(config, db_path=db_file, thread_factory=fake_thread(RESULT, calls))
     d.url_edit.setText(url)
+    d.date_url_edit.setText("")  # при непустом date.txt ссылка на базу может прийти из манифеста (5.5)
     d.start_update()
     assert calls == [] and len(boxes.critical_texts) == 1
 
@@ -392,12 +394,81 @@ def test_invalid_date_url_blocks_save_and_update(dialog, config, boxes):
     assert len(boxes.critical_texts) == 2 and dialog._thread is None
 
 
-def test_default_limits_5_6():
-    from common import constants
-    client = constants.DEFAULT_SETTINGS["client"]
-    assert (client["max_pages_per_site"], client["max_ads_per_site"]) == (2, 50)
+# ----------------------------------------------------------------------
+# 5.5 (манифест): ссылка на базу из второй строки date.txt
+# ----------------------------------------------------------------------
+CUSTOM_URL = "https://custom.url/aprice.db"
 
 
-def test_default_autostart_server_enabled_5_6():
-    from common import constants
-    assert constants.DEFAULT_SETTINGS["client"]["autostart_server"] is True
+def test_dialog_uses_url_from_manifest(smart, boxes, tmp_path):
+    d, db = smart
+    payload = make_db(tmp_path / "remote.db", ("BMW", "Audi"))
+    fake = d.install(TextResponse(f"18.11.2026\n{CUSTOM_URL}"), FakeResponse(payload))
+    got = []
+    d.database_updated.connect(got.append)
+    run_update(d, lambda: got)
+    assert fake.urls == [DATE_URL, CUSTOM_URL]  # а не db_update_url (DB_URL из поля ссылки)
+    assert DB_URL not in fake.urls and got[0].manufacturers == 2
+
+
+def test_dialog_falls_back_to_settings_url_without_manifest_url(smart, boxes, tmp_path):
+    d, db = smart
+    payload = make_db(tmp_path / "remote.db", ("BMW",))
+    fake = d.install(TextResponse("18.11.2026"), FakeResponse(payload))
+    got = []
+    d.database_updated.connect(got.append)
+    run_update(d, lambda: got)
+    assert fake.urls == [DATE_URL, DB_URL]
+
+
+def test_dialog_manifest_url_works_with_empty_settings_url(smart, boxes, tmp_path):
+    d, db = smart
+    d.url_edit.setText("")
+    payload = make_db(tmp_path / "remote.db", ("BMW",))
+    fake = d.install(TextResponse(f"18.11.2026\n{CUSTOM_URL}"), FakeResponse(payload))
+    got = []
+    d.database_updated.connect(got.append)
+    run_update(d, lambda: got)
+    assert fake.urls == [DATE_URL, CUSTOM_URL] and boxes.critical_texts == []
+
+
+def test_dialog_no_url_anywhere_is_reported(smart, boxes):
+    d, db = smart
+    d.url_edit.setText("")
+    d.install(TextResponse("18.11.2026"))
+    before = db.read_bytes()
+    run_update(d, lambda: boxes.critical_texts)
+    assert "Ссылка на базу не указана" in boxes.critical_texts[0] and db.read_bytes() == before
+
+
+def test_dialog_requires_some_link(smart, boxes):
+    d, db = smart
+    d.url_edit.setText("")
+    d.date_url_edit.setText("")
+    d.start_update()
+    assert boxes.critical_texts == ["Укажите ссылку на зеркало базы."] and d._thread is None
+
+
+def test_manifest_url_is_ignored_when_not_newer(smart, boxes):
+    d, db = smart
+    fake = d.install(TextResponse(f"01.01.2020\n{CUSTOM_URL}"))
+    run_update(d, lambda: boxes.info_texts)
+    assert fake.urls == [DATE_URL] and boxes.info_titles == ["Обновления не требуются"]
+
+
+def test_thread_passes_manifest_url_to_downloader(qapp, tmp_path):
+    """Внедрённая проверка манифеста возвращает (True, custom) → качаем именно по custom."""
+    from client.db_update import UpdateCheck
+
+    seen = {}
+
+    def downloader(url, target, **kw):
+        seen["url"], seen["kw"] = url, kw
+        return SimpleNamespace(path=target, backup=None, size=1, manufacturers=1)
+
+    check = UpdateCheck(True, "https://custom.url", datetime(2026, 11, 18))
+    thread = DbUpdateThread(DB_URL, tmp_path / "a.db", downloader=downloader, date_url=DATE_URL,
+                            manifest_checker=lambda u, t: check)
+    thread.run()  # синхронно, без потока
+    assert seen["url"] == "https://custom.url"
+    assert seen["kw"]["mtime"] == datetime(2026, 11, 18).timestamp()

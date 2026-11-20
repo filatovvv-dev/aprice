@@ -40,7 +40,7 @@ from client.db_update import (
     UpdateResult,
     db_age_days,
     download_database,
-    fetch_remote_date,
+    check_manifest,
     is_remote_newer,
     local_db_date,
 )
@@ -85,26 +85,42 @@ class DbUpdateThread(QThread):
         parent=None,
         downloader: Callable[..., UpdateResult] = download_database,
         date_url: str = "",
-        date_fetcher: Callable[..., object] = fetch_remote_date,
+        manifest_checker: Callable[..., object] = check_manifest,
+        force: bool = False,
     ) -> None:
+        """``force`` — не сравнивать даты, а только взять ссылку из манифеста (первый запуск)."""
         super().__init__(parent)
         self._url, self._target, self._downloader = url, target, downloader
-        self._date_url, self._date_fetcher = date_url, date_fetcher
+        self._date_url, self._manifest_checker, self._force = date_url, manifest_checker, force
 
     def run(self) -> None:
         try:
             extra: dict = {}
+            url = self._url
             if self._date_url:
-                # Сначала крошечный date.txt; базу качаем, только если дата строго новее.
-                remote = self._date_fetcher(self._date_url)
-                local = local_db_date(self._target if self._target is not None else constants.DB_FILE)
-                # remote is None: дата в date.txt не распознана — считаем, что обновление не нужно
-                if remote is None or not is_remote_newer(remote, local):
-                    self.up_to_date.emit()
-                    return
-                extra["mtime"] = remote.timestamp()
+                # Сначала крошечный манифест date.txt: дата (скачиваем, только если строго
+                # новее) и, возможно, актуальная ссылка на базу (вторая строка, 5.5).
+                target = self._target if self._target is not None else constants.DB_FILE
+                try:
+                    check = self._manifest_checker(self._date_url, target)
+                except DbUpdateError as exc:
+                    if not self._force:
+                        raise
+                    # первый запуск: манифест недоступен — пробуем ссылку из настроек
+                    logger.warning("Манифест недоступен (%s) — использую db_update_url", exc)
+                    check = None
+                if check is not None:
+                    if not self._force and not check.required:
+                        self.up_to_date.emit()
+                        return
+                    if check.db_url:
+                        url = check.db_url
+                    if check.date is not None and (self._force or check.required):
+                        extra["mtime"] = check.date.timestamp()
+            if not url:
+                raise DbUpdateError("Ссылка на базу не указана: нет ни в date.txt, ни в настройках.")
             result = self._downloader(
-                self._url, self._target,
+                url, self._target,
                 progress=lambda done, total: self.progressed.emit(done, -1 if total is None else total),
                 **extra,
             )
@@ -256,14 +272,11 @@ class SettingsDialog(QDialog):
         if self.is_updating():
             return
         url = self.url_edit.text().strip()
-        error = url_error(url)
-        if error or not url:
-            QMessageBox.critical(self, TITLE, error or "Укажите ссылку на зеркало базы.")
-            return
         date_url = self.date_url_edit.text().strip()
-        error = url_error(date_url)
-        if error:
-            QMessageBox.critical(self, TITLE, error)
+        error = url_error(url) or url_error(date_url)
+        # ссылка на базу может прийти из манифеста — тогда пустое поле допустимо
+        if error or not (url or date_url):
+            QMessageBox.critical(self, TITLE, error or "Укажите ссылку на зеркало базы.")
             return
         self._thread = self._thread_factory(url, self._db_file(), date_url=date_url)
         self._thread.succeeded.connect(self._on_succeeded)

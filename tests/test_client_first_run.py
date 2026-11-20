@@ -15,7 +15,7 @@ from client import db_update, first_run
 from client.first_run import FAILED_MESSAGE, NO_URL_MESSAGE, ensure_database
 from client.settings_dialog import DbUpdateThread
 from common.config import Config
-from tests.test_db_update import FakeGet, FakeResponse, make_db
+from tests.test_db_update import FakeGet, FakeResponse, TextResponse, make_db
 
 URL = "https://mirror.test/aprice.db"
 
@@ -113,6 +113,7 @@ def test_reported_success_without_file_is_failure(config, tmp_path):
 
 def test_empty_url_reports_problem_without_download(config, tmp_path):
     config.set("client", "db_update_url", "  ")
+    config.set("client", "db_date_url", "")  # нет ни зеркала, ни манифеста
     ui = FakeUi()
     assert ensure_database(config, tmp_path / "aprice.db", ui, thread_factory=lambda *a: pytest.fail("нет")) is False
     assert ui.errors == [NO_URL_MESSAGE] and ui.runs == []
@@ -125,21 +126,74 @@ def test_progress_text_matches_requirement():
 # ----------------------------------------------------------------------
 # С настоящим DbUpdateThread и подменённым requests
 # ----------------------------------------------------------------------
-def test_real_thread_downloads_database_without_date_check(qapp, config, tmp_path, monkeypatch):
+DATE_URL = "https://mirror.test/date.txt"
+MANIFEST_URL = "https://new.url/aprice.db"
+
+
+def _count_manufacturers(db):
+    import sqlite3
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM manufacturers").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _first_run(config, tmp_path, monkeypatch, *responses):
+    fake = FakeGet(*responses)
+    monkeypatch.setattr(db_update.requests, "get", fake)
+    config.set("client", "db_date_url", DATE_URL)
+    db = tmp_path / "data" / "aprice.db"
+    db.parent.mkdir()
+    ui = RealThreadUi()
+    return fake, db, ui, ensure_database(config, db, ui)
+
+
+def test_first_run_uses_manifest_url(qapp, config, tmp_path, monkeypatch):
+    payload = make_db(tmp_path / "remote.db", ("BMW", "Audi", "Chery"))
+    fake, db, ui, ok = _first_run(
+        config, tmp_path, monkeypatch, TextResponse(f"17.11.2026\n{MANIFEST_URL}"), FakeResponse(payload)
+    )
+    assert ok is True and ui.errors == []
+    assert fake.urls == [DATE_URL, MANIFEST_URL]  # не db_update_url
+    assert URL not in fake.urls and _count_manufacturers(db) == 3
+
+
+def test_first_run_without_manifest_url_uses_settings_url(qapp, config, tmp_path, monkeypatch):
+    payload = make_db(tmp_path / "remote.db", ("BMW", "Audi"))
+    fake, db, ui, ok = _first_run(
+        config, tmp_path, monkeypatch, TextResponse("17.11.2026"), FakeResponse(payload)
+    )
+    assert ok is True and fake.urls == [DATE_URL, URL] and _count_manufacturers(db) == 2
+
+
+def test_first_run_manifest_unavailable_falls_back_to_settings_url(qapp, config, tmp_path, monkeypatch):
+    payload = make_db(tmp_path / "remote.db", ("BMW",))
+    fake, db, ui, ok = _first_run(
+        config, tmp_path, monkeypatch, requests.ConnectionError("нет date.txt"), FakeResponse(payload)
+    )
+    assert ok is True and fake.urls == [DATE_URL, URL] and ui.errors == []
+
+
+def test_first_run_ignores_manifest_date(qapp, config, tmp_path, monkeypatch):
+    """Базы нет вовсе: даже «старая» дата в манифесте не отменяет скачивание."""
+    payload = make_db(tmp_path / "remote.db", ("BMW",))
+    fake, db, ui, ok = _first_run(
+        config, tmp_path, monkeypatch, TextResponse(f"01.01.2000\n{MANIFEST_URL}"), FakeResponse(payload)
+    )
+    assert ok is True and fake.urls == [DATE_URL, MANIFEST_URL]
+
+
+def test_real_thread_downloads_database_without_manifest(qapp, config, tmp_path, monkeypatch):
     payload = make_db(tmp_path / "remote.db", ("BMW", "Audi", "Chery"))
     fake = FakeGet(FakeResponse(payload))
     monkeypatch.setattr(db_update.requests, "get", fake)
-    config.set("client", "db_date_url", "https://mirror.test/date.txt")
+    config.set("client", "db_date_url", "")
     db = tmp_path / "data" / "aprice.db"
     db.parent.mkdir()
     ui = RealThreadUi()
     assert ensure_database(config, db, ui) is True
-    assert fake.urls == [URL]  # date.txt не запрашивался: базы нет, качаем безусловно
-    assert ui.errors == []
-    import sqlite3
-    conn = sqlite3.connect(db)
-    assert conn.execute("SELECT COUNT(*) FROM manufacturers").fetchone()[0] == 3
-    conn.close()
+    assert fake.urls == [URL] and ui.errors == [] and _count_manufacturers(db) == 3
 
 
 @pytest.mark.parametrize("failure", [

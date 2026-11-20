@@ -280,32 +280,32 @@ LOCAL = datetime(2026, 11, 17, 12, 0, 0)
 def test_check_for_updates_same_date(tmp_path):
     db = local_db(tmp_path, LOCAL)
     get = FakeGet(TextResponse("2026-11-17T12:00:00"))
-    assert db_update.check_for_updates(DATE_URL, db, get=get) is False
+    assert db_update.check_for_updates(DATE_URL, db, get=get) == (False, None)
 
 
 def test_check_for_updates_newer_remote(tmp_path):
     db = local_db(tmp_path, LOCAL)
     get = FakeGet(TextResponse("2026-11-17T12:00:01\n"))
-    assert db_update.check_for_updates(DATE_URL, db, get=get) is True
+    assert db_update.check_for_updates(DATE_URL, db, get=get) == (True, None)
 
 
 def test_check_for_updates_older_remote(tmp_path):
     db = local_db(tmp_path, LOCAL)
     get = FakeGet(TextResponse("2026-11-16T23:59:59"))
-    assert db_update.check_for_updates(DATE_URL, db, get=get) is False
+    assert db_update.check_for_updates(DATE_URL, db, get=get) == (False, None)
 
 
 def test_check_for_updates_missing_local_db_needs_download(tmp_path):
     get = FakeGet(TextResponse("2020-01-01T00:00:00"))
-    assert db_update.check_for_updates(DATE_URL, tmp_path / "none.db", get=get) is True
+    assert db_update.check_for_updates(DATE_URL, tmp_path / "none.db", get=get) == (True, None)
 
 
 def test_check_for_updates_handles_timezones_and_bom(tmp_path):
     db = local_db(tmp_path, datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc).astimezone().replace(tzinfo=None))
     same = FakeGet(TextResponse("﻿2026-11-17T15:00:00+03:00\r\n"))  # == 12:00 UTC
-    assert db_update.check_for_updates(DATE_URL, db, get=same) is False
+    assert db_update.check_for_updates(DATE_URL, db, get=same) == (False, None)
     newer = FakeGet(TextResponse("2026-11-17T15:00:01+03:00"))
-    assert db_update.check_for_updates(DATE_URL, db, get=newer) is True
+    assert db_update.check_for_updates(DATE_URL, db, get=newer) == (True, None)
 
 
 def test_check_for_updates_prefers_metadata_last_update_over_mtime(tmp_path):
@@ -315,14 +315,14 @@ def test_check_for_updates_prefers_metadata_last_update_over_mtime(tmp_path):
     conn.execute("INSERT INTO metadata VALUES ('last_update', '2026-01-01T00:00:00')")
     conn.commit()
     conn.close()  # mtime = «сейчас» (свежий файл), но метка в базе — старая
-    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("2026-06-01T00:00:00"))) is True
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("2026-06-01T00:00:00"))) == (True, None)
 
 
 def test_check_for_updates_resolves_yandex_public_link(tmp_path):
     db = local_db(tmp_path, LOCAL)
     get = FakeGet(FakeResponse(json_data={"href": "https://downloader.disk.test/date"}),
                   TextResponse("2027-01-01T00:00:00"))
-    assert db_update.check_for_updates("https://disk.yandex.ru/i/0AjHf2zhnKITrA", db, get=get) is True
+    assert db_update.check_for_updates("https://disk.yandex.ru/i/0AjHf2zhnKITrA", db, get=get) == (True, None)
     assert get.urls[0].startswith(db_update.YANDEX_API)
     assert get.urls[1] == "https://downloader.disk.test/date"
 
@@ -332,7 +332,7 @@ def test_check_for_updates_unrecognized_date_means_no_update(tmp_path, body, cap
     """5.5: нераспознанная дата -> warning в лог и «обновление не требуется»."""
     db = local_db(tmp_path, LOCAL)
     with caplog.at_level("WARNING", logger="aprice.client.db_update"):
-        assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(body))) is False
+        assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(body))) == (False, None)
     assert any("Дата обновления не распознана" in r.message or "пуст" in r.message for r in caplog.records)
 
 
@@ -361,7 +361,7 @@ def test_download_sets_mtime_to_publication_date(target, mirror):
 def test_check_for_updates_uses_first_line_of_date_file(tmp_path):
     db = local_db(tmp_path, LOCAL)
     get = FakeGet(TextResponse("2026-11-17T12:00:00\n2030-01-01T00:00:00\n"))
-    assert db_update.check_for_updates(DATE_URL, db, get=get) is False
+    assert db_update.check_for_updates(DATE_URL, db, get=get) == (False, None)
 
 
 # ----------------------------------------------------------------------
@@ -398,11 +398,11 @@ def test_parse_date_unrecognized_returns_none_and_warns(text, caplog):
 
 def test_check_for_updates_with_russian_date(tmp_path):
     db = local_db(tmp_path, datetime(2026, 11, 17, 0, 0, 0))
-    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("17.11.2026"))) is False
-    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("18.11.2026"))) is True
-    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("16.11.2026"))) is False
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("17.11.2026"))) == (False, None)
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("18.11.2026"))) == (True, None)
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("16.11.2026"))) == (False, None)
     assert db_update.check_for_updates(
-        DATE_URL, db, get=FakeGet(TextResponse("17.11.2026 00:00:01"))) is True
+        DATE_URL, db, get=FakeGet(TextResponse("17.11.2026 00:00:01"))) == (True, None)
 
 
 def test_metadata_last_update_may_be_russian_date(tmp_path):
@@ -413,3 +413,73 @@ def test_metadata_last_update_may_be_russian_date(tmp_path):
     conn.commit()
     conn.close()
     assert db_update.local_db_date(db) == datetime(2026, 1, 1)
+
+
+# ----------------------------------------------------------------------
+# 5.5 (манифест): вторая строка date.txt — актуальная ссылка на базу
+# ----------------------------------------------------------------------
+NEW_URL = "https://new.url/db"
+
+
+def test_manifest_with_url(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(TextResponse(f"18.11.2026\n{NEW_URL}"))  # локальная — 17.11.2026 12:00 → новее
+    assert db_update.check_for_updates(DATE_URL, db, get=get) == (True, NEW_URL)
+
+
+def test_manifest_without_url(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse("18.11.2026"))) == (True, None)
+    assert db_update.check_for_updates(
+        DATE_URL, db, get=FakeGet(TextResponse("18.11.2026\n   \n"))) == (True, None)  # пустая 2-я строка
+
+
+def test_manifest_same_date(tmp_path):
+    db = local_db(tmp_path, datetime(2026, 11, 17))
+    get = FakeGet(TextResponse(f"17.11.2026\n{NEW_URL}"))
+    assert db_update.check_for_updates(DATE_URL, db, get=get) == (False, None)  # ссылку не отдаём
+    older = FakeGet(TextResponse(f"16.11.2026\n{NEW_URL}"))
+    assert db_update.check_for_updates(DATE_URL, db, get=older) == (False, None)
+
+
+@pytest.mark.parametrize("text", ["мусор\n" + NEW_URL, "", "<html>x</html>", "32.13.2026\n" + NEW_URL])
+def test_manifest_invalid_date(tmp_path, text):
+    db = local_db(tmp_path, LOCAL)
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(text))) == (False, None)
+
+
+@pytest.mark.parametrize("second", ["не ссылка", "ftp://x/db", "javascript:alert(1)", "//x/db", "http://"])
+def test_manifest_second_line_must_be_http_url(tmp_path, second, caplog):
+    db = local_db(tmp_path, LOCAL)
+    with caplog.at_level("WARNING", logger="aprice.client.db_update"):
+        got = db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(f"18.11.2026\n{second}")))
+    assert got == (True, None)  # нельзя «подсунуть» не-ссылку: запасной db_update_url
+    assert any("не ссылка" in r.message for r in caplog.records)
+
+
+def test_manifest_tolerates_bom_blank_lines_crlf_and_extra_lines(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    text = f"\ufeff\r\n18.11.2026\r\n\r\n  {NEW_URL}  \r\nлишняя строка\r\n"
+    assert db_update.check_for_updates(DATE_URL, db, get=FakeGet(TextResponse(text))) == (True, NEW_URL)
+
+
+def test_manifest_with_iso_date_and_url(tmp_path):
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(TextResponse(f"2026-11-18T09:00:00\n{NEW_URL}"))
+    assert db_update.check_for_updates(DATE_URL, db, get=get) == (True, NEW_URL)
+
+
+def test_manifest_url_is_resolved_via_yandex_for_date_file_only(tmp_path):
+    """Ссылка на базу из манифеста не запрашивается при проверке — только date.txt."""
+    db = local_db(tmp_path, LOCAL)
+    get = FakeGet(TextResponse(f"18.11.2026\n{NEW_URL}"))
+    db_update.check_for_updates(DATE_URL, db, get=get)
+    assert get.urls == [DATE_URL]
+
+
+def test_parse_manifest_fields():
+    m = db_update.parse_manifest(f"17.11.2026\n{NEW_URL}")
+    assert m.date == datetime(2026, 11, 17) and m.db_url == NEW_URL
+    assert db_update.parse_manifest("17.11.2026") == db_update.Manifest(datetime(2026, 11, 17), None)
+    bad = db_update.parse_manifest(f"мусор\n{NEW_URL}")
+    assert bad.date is None and bad.db_url == NEW_URL  # URL нужен первому запуску даже при мусорной дате
