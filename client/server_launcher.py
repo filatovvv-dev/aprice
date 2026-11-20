@@ -75,7 +75,9 @@ def start_server(command: Sequence[str], cwd: Path, popen: Callable[..., object]
                     "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)  # скрыто: без консольного окна
         )
     else:
         kwargs["start_new_session"] = True

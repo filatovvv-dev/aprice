@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
@@ -28,10 +31,11 @@ NOT_FOUND_MESSAGE = (
 )
 INSTALL_TITLE = "АвтоПрайс — установка браузера"
 INSTALL_PROGRESS_TEXT = (
-    "Первый запуск: скачивается браузер Chromium (около 150 МБ).\n"
-    "Пожалуйста, подождите — это происходит один раз."
+    "Установка Chromium...\n"
+    "Первый запуск: скачивается браузер (около 150 МБ). Это происходит один раз."
 )
 INSTALL_TIMEOUT_SEC = 1800  # 30 минут на медленном канале
+INSTALL_INDETERMINATE_TEXT = "Установка Chromium..."  # если проценты разобрать не удалось
 
 # --- Ускорение загрузки Chromium (5.6) --------------------------------------------
 #: Зеркало Playwright по умолчанию: быстрее официального CDN во многих сетях.
@@ -142,7 +146,138 @@ def _base_install_command() -> tuple[list[str], dict[str, str]]:
         return ["playwright", "install", "chromium"], env
 
 
-def _run_install(runner: Callable[..., "subprocess.CompletedProcess"], mirror: Optional[str]) -> tuple[bool, str]:
+# --- Прогресс установки (5.6) ------------------------------------------------------
+_PERCENT_RE = re.compile(r"(?<![\d.])(\d{1,3})\s*%")
+_TOTAL_RE = re.compile(r"of\s+([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB)", re.IGNORECASE)
+_SPEED_RE = re.compile(r"([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB)\s*/\s*s", re.IGNORECASE)
+_UNIT_MB = {"kib": 1 / 1024, "kb": 1 / 1024, "mib": 1.0, "mb": 1.0, "gib": 1024.0, "gb": 1024.0}
+
+
+def _to_mb(value: str, unit: str) -> float:
+    return float(value) * _UNIT_MB[unit.lower()]
+
+
+def format_speed(mb_per_s: float) -> str:
+    """``1.2 MB/s`` (либо ``850 KB/s`` для малых скоростей)."""
+    if mb_per_s >= 1:
+        return f"{mb_per_s:.1f} MB/s"
+    return f"{mb_per_s * 1024:.0f} KB/s"
+
+
+class ProgressParser:
+    """Разбирает вывод ``playwright install``: проценты и скорость.
+
+    Понимает строки вида ``Downloading Chromium ... 45% 1.2 MB/s`` и
+    ``|■■■■    |  45% of 150.2 MiB``. Если скорость в строке не указана, она считается
+    по доле от общего размера и прошедшему времени. Строки без процентов игнорируются.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        """Запоминает момент начала загрузки (для расчёта скорости)."""
+        self._clock = clock
+        self._start: Optional[float] = None
+        self._last_percent = -1
+
+    def feed(self, text: str) -> Optional[tuple[int, Optional[str]]]:
+        """Обрабатывает фрагмент вывода.
+
+        Returns:
+            ``(процент, скорость_или_None)`` либо ``None``, если процентов нет или
+            значение не изменилось.
+        """
+        found = _PERCENT_RE.findall(text)
+        if not found:
+            return None
+        percent = int(found[-1])
+        if not 0 <= percent <= 100 or percent == self._last_percent:
+            return None
+        now = self._clock()
+        if self._start is None:
+            self._start = now
+        self._last_percent = percent
+        speed: Optional[str] = None
+        match = _SPEED_RE.search(text)
+        if match:
+            speed = format_speed(_to_mb(match.group(1), match.group(2)))
+        else:
+            total = _TOTAL_RE.search(text)
+            elapsed = now - self._start
+            if total and elapsed > 0 and percent > 0:
+                speed = format_speed(_to_mb(total.group(1), total.group(2)) * percent / 100 / elapsed)
+        return percent, speed
+
+
+ProgressCallback = Callable[[Optional[int], Optional[str]], None]
+
+
+def run_streaming(
+    argv: list[str],
+    *,
+    on_progress: Optional[ProgressCallback] = None,
+    timeout: float = INSTALL_TIMEOUT_SEC,
+    popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
+    **kwargs,
+) -> "subprocess.CompletedProcess":
+    """Запускает процесс через ``Popen`` и разбирает его вывод на проценты/скорость.
+
+    stderr объединяется со stdout (Playwright пишет прогресс то в один, то в другой поток;
+    строки прогресса разделяются ``\\r``). ``on_progress(percent, speed)`` вызывается из
+    потока чтения при каждом изменении процента.
+
+    Returns:
+        :class:`subprocess.CompletedProcess` с объединённым выводом в ``stdout``.
+
+    Raises:
+        subprocess.TimeoutExpired: время вышло (процесс убит).
+    """
+    kwargs.pop("capture_output", None)
+    kwargs.pop("text", None)
+    proc = popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+    parser = ProgressParser()
+    chunks: list[str] = []
+
+    def reader() -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        buffer = ""
+        while True:
+            data = stream.read1(1024) if hasattr(stream, "read1") else stream.read(1024)
+            if not data:
+                break
+            buffer += data.decode("utf-8", errors="replace")
+            *parts, buffer = re.split(r"[\r\n]", buffer)
+            for part in parts:
+                if not part.strip():
+                    continue
+                chunks.append(part)
+                if on_progress is not None:
+                    try:
+                        update = parser.feed(part)
+                        if update is not None:
+                            on_progress(update[0], update[1])
+                    except Exception:  # noqa: BLE001 - прогресс не должен ронять установку
+                        logger.debug("Не удалось разобрать строку прогресса", exc_info=True)
+        if buffer.strip():
+            chunks.append(buffer)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        thread.join(5)
+        raise
+    thread.join(10)
+    return subprocess.CompletedProcess(argv, code, stdout="\n".join(chunks), stderr="")
+
+
+def _run_install(
+    runner: Callable[..., "subprocess.CompletedProcess"],
+    mirror: Optional[str],
+    on_progress: Optional[ProgressCallback] = None,
+) -> tuple[bool, str]:
     """Один запуск ``playwright install chromium`` (с зеркалом или без)."""
     argv, env = build_install_command(mirror)
     kwargs: dict = {
@@ -153,6 +288,8 @@ def _run_install(runner: Callable[..., "subprocess.CompletedProcess"], mirror: O
     }
     if sys.platform == "win32":  # без мигающего консольного окна
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if on_progress is not None:
+        kwargs["on_progress"] = on_progress
     source = mirror or "официальный CDN"
     try:
         result = runner(argv, **kwargs)
@@ -168,8 +305,9 @@ def _run_install(runner: Callable[..., "subprocess.CompletedProcess"], mirror: O
 
 
 def install_chromium(
-    runner: Callable[..., "subprocess.CompletedProcess"] = subprocess.run,
+    runner: Callable[..., "subprocess.CompletedProcess"] = run_streaming,
     environ: Optional[dict] = None,
+    on_progress: Optional[ProgressCallback] = None,
 ) -> tuple[bool, str]:
     """Устанавливает Chromium (``playwright install chromium``).
 
@@ -179,16 +317,20 @@ def install_chromium(
     Args:
         runner: функция запуска процесса (подменяется в тестах).
         environ: окружение для выбора зеркала (по умолчанию ``os.environ``).
+        on_progress: ``(процент, скорость)`` — обновление индикатора; при откате на
+            CDN процент начинается заново.
 
     Returns:
         tuple: ``(успех, подробности_для_лога)``.
     """
     mirror = mirror_url(environ)
-    ok, details = _run_install(runner, mirror)
+    ok, details = _run_install(runner, mirror, on_progress)
     if ok or mirror is None:
         return ok, details
     logger.warning("Зеркало %s не сработало — повторяю с официального CDN", mirror)
-    ok_cdn, details_cdn = _run_install(runner, None)
+    if on_progress is not None:
+        on_progress(None, None)  # сброс: снова «Установка Chromium...»
+    ok_cdn, details_cdn = _run_install(runner, None, on_progress)
     return ok_cdn, details_cdn if ok_cdn else f"{details}\n{details_cdn}".strip()
 
 
@@ -202,12 +344,31 @@ class InstallUi(Protocol):
         """Показывает сообщение об ошибке."""
 
 
+def progress_text(percent: Optional[int], speed: Optional[str]) -> str:
+    """Текст под индикатором: ``Скачивание Chromium: 45% · 1.2 MB/s`` либо «Установка Chromium...»."""
+    if percent is None:
+        return INSTALL_INDETERMINATE_TEXT
+    return f"Скачивание Chromium: {percent}%" + (f" · {speed}" if speed else "")
+
+
 class QtInstallUi:
-    """Индикатор на ``QProgressDialog``: работа идёт в ``QThread``, окно — «занято»."""
+    """Диалог установки: ``QProgressDialog`` (``QProgressBar`` + ``QLabel``), работа в ``QThread``.
+
+    Пока проценты неизвестны — индикатор «занят» (indeterminate) с текстом
+    «Установка Chromium...»; как только из вывода разобран процент — полоса
+    переключается на 0–100 и показывает процент и скорость.
+    """
 
     def __init__(self, parent=None) -> None:
         """Сохраняет родительский виджет (может быть ``None``)."""
         self._parent = parent
+        self._emit_progress: Optional[Callable[[int, str], None]] = None
+
+    def report_progress(self, percent: Optional[int], speed: Optional[str]) -> None:
+        """Потокобезопасно передаёт прогресс в окно (вызывается из рабочего потока)."""
+        emit = self._emit_progress
+        if emit is not None:
+            emit(-1 if percent is None else int(percent), speed or "")
 
     def run(self, work: Callable[[], tuple[bool, str]]) -> Optional[tuple[bool, str]]:
         """Показывает ``QProgressDialog`` и ждёт завершения ``work`` в потоке."""
@@ -216,6 +377,7 @@ class QtInstallUi:
 
         class _Worker(QThread):
             done = pyqtSignal(bool, str)
+            progress = pyqtSignal(int, str)
 
             def run(self) -> None:  # noqa: D102
                 try:
@@ -237,15 +399,28 @@ class QtInstallUi:
         outcome: list[tuple[bool, str]] = []
         worker = _Worker()
 
+        def _progress(percent: int, speed: str) -> None:
+            if percent < 0:  # разобрать не удалось / сброс: indeterminate
+                dialog.setRange(0, 0)
+                dialog.setLabelText(INSTALL_INDETERMINATE_TEXT)
+                return
+            if dialog.maximum() != 100:
+                dialog.setRange(0, 100)
+            dialog.setValue(percent)
+            dialog.setLabelText(progress_text(percent, speed or None))
+
         def _finished(ok: bool, details: str) -> None:
             outcome.append((ok, details))
             loop.quit()
 
+        worker.progress.connect(_progress)  # сигнал из рабочего потока → слот в GUI-потоке
         worker.done.connect(_finished)
+        self._emit_progress = worker.progress.emit
         dialog.show()
         worker.start()
         loop.exec()
         worker.wait()
+        self._emit_progress = None
         dialog.close()
         return outcome[0] if outcome else None
 
@@ -277,7 +452,10 @@ def ensure_chromium(
         return True
     logger.info("Chromium не найден — запускаю установку")
     ui = ui if ui is not None else QtInstallUi()
-    result = ui.run(installer)
+    report = getattr(ui, "report_progress", None)
+    # Индикатор умеет показывать проценты — передаём установщику callback прогресса.
+    work = (lambda: installer(on_progress=report)) if callable(report) else installer
+    result = ui.run(work)
     if result is not None and result[0] and is_installed():
         return True
     hint = not_found_message()

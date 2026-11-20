@@ -187,3 +187,12 @@ def test_server_exits_with_session_logic_exists():
     src = Path(__file__).resolve().parent.parent / "server" / "main.py"
     text = src.read_text(encoding="utf-8")
     assert "has_active_tasks()" in text and "self._app.quit()" in text
+
+
+def test_start_server_is_hidden_on_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(sl.sys, "platform", "win32")
+    for name, value in (("DETACHED_PROCESS", 0x8), ("CREATE_NEW_PROCESS_GROUP", 0x200), ("CREATE_NO_WINDOW", 0x08000000)):
+        monkeypatch.setattr(subprocess, name, value, raising=False)
+    seen = {}
+    sl.start_server(["srv"], tmp_path, popen=lambda argv, **kw: seen.update(kw))
+    assert seen["creationflags"] & 0x08000000 and seen["creationflags"] & 0x8
