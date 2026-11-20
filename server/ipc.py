@@ -145,6 +145,23 @@ class IpcServer(QObject):
         """Фактический порт прослушивания (важен при ``port=0``)."""
         return int(self._server.serverPort())
 
+    def is_port_in_use(self, timeout: float = 0.3) -> bool:
+        """``True``, если по адресу сервера уже кто-то принимает подключения (5.7).
+
+        Используется до :meth:`start`, чтобы второй экземпляр не показывал иконку в трее.
+        Свой же запущенный сервер тоже считается «занятым» портом.
+        """
+        if not self._port:  # порт 0 — «любой свободный» (автотесты), занят быть не может
+            return False
+        try:
+            with socket.create_connection((self._host_addr_str(), self._port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _host_addr_str(self) -> str:
+        return "127.0.0.1" if self._host in ("", "localhost") else str(self._host)
+
     @property
     def running(self) -> bool:
         """True, если сервер запущен."""

@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from client.db_update import (
+    DbNetworkError,
     DbUpdateError,
     UpdateResult,
     db_age_days,
@@ -92,8 +93,11 @@ class DbUpdateThread(QThread):
         super().__init__(parent)
         self._url, self._target, self._downloader = url, target, downloader
         self._date_url, self._manifest_checker, self._force = date_url, manifest_checker, force
+        #: Последняя ошибка — сетевая (нет интернета/VPN): первый запуск предложит «Повторить».
+        self.network_error = False
 
     def run(self) -> None:
+        self.network_error = False
         try:
             extra: dict = {}
             url = self._url
@@ -125,6 +129,7 @@ class DbUpdateThread(QThread):
                 **extra,
             )
         except DbUpdateError as exc:
+            self.network_error = isinstance(exc, DbNetworkError)  # 5.7: можно предложить «Повторить»
             self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001 — поток не должен падать молча
             logger.exception("Непредвиденная ошибка обновления базы")

@@ -66,6 +66,25 @@ class DbUpdateError(Exception):
     """Обновление не выполнено; текст пригоден для показа пользователю."""
 
 
+class DbNetworkError(DbUpdateError):
+    """Сеть недоступна (нет интернета, выключен VPN, обрыв, таймаут) — можно повторить (5.7)."""
+
+
+#: Что считать сетевой ошибкой: ``requests`` и «сырые» сокетные исключения (обрыв посреди
+#: потока иногда приходит как ``ConnectionResetError`` / ``TimeoutError``, а не как requests).
+NETWORK_ERRORS = (requests.RequestException, ConnectionError, TimeoutError)
+
+
+def _network_failure(prefix: str, exc: BaseException) -> DbUpdateError:
+    """Ошибка запроса → :class:`DbNetworkError` (повтор имеет смысл) либо обычная ошибка.
+
+    HTTP-ответ с кодом 4xx/5xx (``HTTPError``) — это работающая сеть и неверная/закрытая
+    ссылка: «проверьте интернет» тут вводило бы в заблуждение, повтор не поможет.
+    """
+    cls = DbUpdateError if isinstance(exc, requests.HTTPError) else DbNetworkError
+    return cls(f"{prefix}: {exc}")
+
+
 @dataclass(frozen=True)
 class UpdateResult:
     """Итог успешного обновления."""
@@ -180,8 +199,8 @@ def fetch_manifest(
         response = getter(direct, timeout=timeout)
         response.raise_for_status()
         text = response.text
-    except requests.RequestException as exc:
-        raise DbUpdateError(f"Не удалось получить дату обновления базы: {exc}") from exc
+    except NETWORK_ERRORS as exc:
+        raise _network_failure("Не удалось получить дату обновления базы", exc) from exc
     if len(text) > MAX_DATE_BYTES:
         raise DbUpdateError("Файл с датой обновления слишком большой (получена не та страница?).")
     return parse_manifest(text)
@@ -300,8 +319,11 @@ def _resolve(url: str, get: Callable[..., Any], timeout: float) -> str:
         response = get(YANDEX_API + quote(url, safe=""), timeout=timeout)
         response.raise_for_status()
         href = response.json().get("href")
-    except (requests.RequestException, ValueError) as exc:
+    except ValueError as exc:  # не JSON / неверный URL — не сетевая проблема (первым: JSONDecodeError
+        # у requests одновременно и RequestException)
         raise DbUpdateError(f"Не удалось получить ссылку на скачивание с Яндекс.Диска: {exc}") from exc
+    except NETWORK_ERRORS as exc:
+        raise _network_failure("Не удалось получить ссылку на скачивание с Яндекс.Диска", exc) from exc
     if not isinstance(href, str) or not href:
         raise DbUpdateError("Яндекс.Диск не вернул ссылку на скачивание (файл удалён или закрыт?).")
     return href
@@ -328,8 +350,8 @@ def _download(url: str, tmp: Path, get: Callable[..., Any], timeout: float,
                 if progress:
                     progress(done, total_int)
         return done
-    except requests.RequestException as exc:
-        raise DbUpdateError(f"Не удалось скачать базу: {exc}") from exc
+    except NETWORK_ERRORS as exc:
+        raise _network_failure("Не удалось скачать базу", exc) from exc
     except OSError as exc:
         raise DbUpdateError(f"Не удалось сохранить скачанный файл: {exc}") from exc
 

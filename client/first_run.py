@@ -27,6 +27,12 @@ NO_URL_MESSAGE = (
     "Укажите «Ссылку на зеркало» в config/settings.json (client.db_update_url) "
     "или положите aprice.db в папку data рядом с программой."
 )
+NETWORK_ERROR_MESSAGE = (
+    "Ошибка сети. Не удалось подключиться к серверу обновлений. "
+    "Проверьте интернет-соединение."
+)
+RETRY_TEXT = "Повторить"
+CANCEL_TEXT = "Отмена"
 FAILED_MESSAGE = (
     "Не удалось загрузить справочник: {reason}\n\n"
     "Проверьте подключение к интернету и запустите программу снова. "
@@ -42,6 +48,9 @@ class DownloadUi(Protocol):
 
     def show_error(self, message: str) -> None:
         """Показывает критическую ошибку."""
+
+    def ask_retry(self, message: str) -> bool:
+        """Сетевая ошибка: ``True`` — «Повторить», ``False`` — «Отмена» (5.7)."""
 
 
 class QtDownloadUi:
@@ -94,6 +103,18 @@ class QtDownloadUi:
 
         QMessageBox.critical(self._parent, TITLE, message)
 
+    def ask_retry(self, message: str) -> bool:
+        """``QMessageBox`` с кнопками «Повторить» и «Отмена»; закрытие окна = «Отмена»."""
+        from PyQt6.QtWidgets import QMessageBox
+
+        box = QMessageBox(QMessageBox.Icon.Warning, TITLE, message, parent=self._parent)
+        retry = box.addButton(RETRY_TEXT, QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton(CANCEL_TEXT, QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(retry)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is retry
+
 
 def database_present(db_file: Path) -> bool:
     """Есть ли непустой файл базы."""
@@ -141,10 +162,22 @@ def ensure_database(
             # 5.5); нет манифеста/ссылки в нём — запасной db_update_url из настроек.
             return DbUpdateThread(u, t, date_url=date_url, force=True)
 
-    ok, reason = ui.run(thread_factory(url, target))
-    if ok and database_present(target):
-        logger.info("Справочник скачан: %s", target)
-        return True
-    logger.error("Не удалось скачать справочник: %s", reason)
-    ui.show_error(FAILED_MESSAGE.format(reason=reason or "неизвестная ошибка"))
-    return False
+    while True:
+        thread = thread_factory(url, target)
+        try:
+            ok, reason = ui.run(thread)
+        except Exception as exc:  # noqa: BLE001 - сбой индикатора/потока не должен ронять программу
+            logger.exception("Сбой при скачивании справочника")
+            ok, reason = False, str(exc)
+        if ok and database_present(target):
+            logger.info("Справочник скачан: %s", target)
+            return True
+        logger.error("Не удалось скачать справочник: %s", reason)
+        if getattr(thread, "network_error", False):
+            # Нет сети / выключен VPN: предлагаем повторить, «Отмена» — штатное закрытие.
+            if ui.ask_retry(NETWORK_ERROR_MESSAGE):
+                logger.info("Повторная попытка скачивания справочника")
+                continue
+            return False
+        ui.show_error(FAILED_MESSAGE.format(reason=reason or "неизвестная ошибка"))
+        return False

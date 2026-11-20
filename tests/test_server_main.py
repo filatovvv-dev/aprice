@@ -344,11 +344,89 @@ def test_captcha_dialog_is_held_and_queued(srv):
     srv.active_captcha.accept()
 
 
+def test_captcha_resume_button_sends_resume_site(srv, monkeypatch):
+    """5.7: «Я решил, продолжить» -> TaskManager.resume_site(site, task_id)."""
+    calls = []
+    monkeypatch.setattr(srv.task_manager, "resume_site", lambda site, task_id=None: calls.append(("resume", site, task_id)))
+    monkeypatch.setattr(srv.task_manager, "skip_site", lambda site, task_id=None: calls.append(("skip", site, task_id)))
+    srv.task_manager.captcha_required.emit("t1", "avito.ru", "https://avito.ru/c")
+    dialog = srv.active_captcha
+    dialog.button_open.click()
+    assert dialog.isVisible() and calls == []  # «Открыть браузер» ничего не решает
+    dialog.button_resume.click()
+    assert calls == [("resume", "avito.ru", "t1")]
+
+
+def test_captcha_skip_button_and_close_send_skip_site(srv, monkeypatch):
+    calls = []
+    monkeypatch.setattr(srv.task_manager, "skip_site", lambda site, task_id=None: calls.append((site, task_id)))
+    srv.task_manager.captcha_required.emit("t1", "avito.ru", "https://avito.ru/c")
+    srv.active_captcha.button_skip.click()
+    assert calls == [("avito.ru", "t1")]
+    srv.task_manager.captcha_required.emit("t2", "drom.ru", "https://drom.ru/c")
+    srv.active_captcha.reject()  # крестик / Esc = пропуск
+    assert calls[-1] == ("drom.ru", "t2")
+
+
+def test_queued_captcha_keeps_its_task_id(srv, monkeypatch):
+    calls = []
+    monkeypatch.setattr(srv.task_manager, "resume_site", lambda site, task_id=None: calls.append((site, task_id)))
+    srv.task_manager.captcha_required.emit("t1", "auto.ru", "https://auto.ru/c")
+    srv.task_manager.captcha_required.emit("t2", "drom.ru", "https://drom.ru/c")
+    srv.active_captcha.accept()
+    srv.active_captcha.button_resume.click()
+    assert calls == [("drom.ru", "t2")]
+
+
 def test_captcha_open_browser_uses_injected_opener(srv, opened_urls):
     srv.task_manager.captcha_required.emit("t", "auto.ru", "https://auto.ru/c")
     srv.active_captcha.open_browser_requested.emit("https://auto.ru/c")
     assert opened_urls == ["https://auto.ru/c"]
     srv.active_captcha.accept()
+
+
+# ----------------------------------------------------------------------
+# 5.7: иконка в трее — сразу при запуске
+# ----------------------------------------------------------------------
+def make_app(qapp, store, wm, tmp_path, port=0):
+    return ServerApp(qapp, Config(tmp_path / "settings.json"), state_store=store,
+                     ipc_server=IpcServer(port=port, timeout_sec=5.0), window_manager=wm,
+                     open_url=lambda u: None, on_already_running=lambda: None)
+
+
+def test_tray_is_shown_before_start(qapp, store, wm, tmp_path):
+    """5.7: show_tray_early() показывает иконку ДО start() (до IPC и TaskManager-цикла)."""
+    app = make_app(qapp, store, wm, tmp_path)
+    assert app.tray is None and not app.guard.acquired
+    assert app.show_tray_early() is True
+    assert app.tray is not None and app.tray.isVisible()
+    assert app.tray.toolTip() == "Сервер ожидает заданий"
+    assert not app.guard.acquired  # IPC ещё не запущен
+    assert app.start() is True
+    early = app.tray
+    assert app.tray is early  # start() не пересоздаёт иконку
+    app.shutdown()
+
+
+def test_tray_show_called_before_start_in_main(qapp, monkeypatch, tmp_path):
+    order = []
+    monkeypatch.setattr(server_main.browser_check, "ensure_chromium", lambda *a, **k: order.append("chromium") or True)
+    monkeypatch.setattr(server_main, "StateStore", lambda: StateStore(tmp_path / "main.db"))
+    monkeypatch.setattr(server_main, "setup_logging", lambda **k: None)
+    monkeypatch.setattr(server_main.ServerApp, "show_tray_early", lambda self: order.append("tray") or True)
+    monkeypatch.setattr(server_main.ServerApp, "start", lambda self: order.append("start") or False)
+    assert server_main.main([]) == 0
+    assert order == ["tray", "chromium", "start"]  # иконка — до Chromium и до start()
+
+
+def test_second_instance_does_not_show_tray(qapp, store, wm, tmp_path):
+    first = make_app(qapp, store, wm, tmp_path)
+    assert first.start() is True
+    try:
+        second = make_app(qapp, store, wm, tmp_path, port=first.ipc_server.port())
+        assert second.show_tray_early() is False and second.tray is None
+    finally:
+        first.shutdown()
 
 
 # ----------------------------------------------------------------------

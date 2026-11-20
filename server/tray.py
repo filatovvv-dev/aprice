@@ -33,7 +33,7 @@ from common.utils import format_eta
 logger = logging.getLogger("aprice.server.tray")
 
 #: Подсказка в режиме ожидания (TR-02, TR-05).
-TOOLTIP_IDLE = "АвтоПрайс: ожидание заданий"
+TOOLTIP_IDLE = "Сервер ожидает заданий"
 #: Подсказка после завершения задания (TR-04).
 TOOLTIP_DONE = "АвтоПрайс: задание завершено"
 

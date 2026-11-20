@@ -204,7 +204,7 @@ def test_progress_saved_after_every_page(mgr, store):
 def test_captcha_pauses_only_that_site(mgr, store):
     """CAPTCHA: captcha_required + errors; остальные площадки продолжают."""
     rec = Recorder(mgr)
-    task_id = mgr.submit(SPEC, fast(simulate_captcha="auto.ru"))
+    task_id = mgr.submit(SPEC, fast(simulate_captcha="auto.ru", captcha_policy="skip"))
     run_to_end(rec, task_id)
 
     captchas = rec.of("captcha", task_id)
@@ -267,7 +267,7 @@ def test_mixed_failures_all_down_is_failed(mgr):
     """CAPTCHA на единственной поддерживаемой + unsupported -> failed + captcha."""
     rec = Recorder(mgr)
     task_id = mgr.submit(
-        SPEC, fast(sites=["auto.ru", "sberauto.com"], simulate_captcha="auto.ru")
+        SPEC, fast(sites=["auto.ru", "sberauto.com"], simulate_captcha="auto.ru", captcha_policy="skip")
     )
     run_to_end(rec, task_id)
     assert rec.of("captcha", task_id)
@@ -531,3 +531,106 @@ def test_bibika_is_unsupported_and_other_sites_still_collect(mgr):
     run_to_end(rec, task_id)
     assert error_kinds(mgr, task_id) == {("bibika.ru", "unsupported")}
     assert rec.of("completed", task_id) and mgr.get_task(task_id).total_ads > 0
+
+
+# ----------------------------------------------------------------------
+# 5.7. CAPTCHA: пауза площадки, «Я решил, продолжить», «Пропустить сайт»
+# ----------------------------------------------------------------------
+class FlakyCaptchaParser:
+    """Парсер: первая попытка страницы 1 даёт CAPTCHA, дальше — пустые страницы."""
+
+    def __init__(self, site: str, fail_times: int = 1) -> None:
+        self.site_name = site
+        self.fail_times = fail_times
+        self.calls: list[int] = []
+
+    def fetch_page(self, spec, options, page, stop_event):  # noqa: ANN001
+        from server.parsers.base import CaptchaDetectedError
+
+        self.calls.append(page)
+        if page == 1 and self.calls.count(1) <= self.fail_times:
+            raise CaptchaDetectedError(self.site_name, f"https://{self.site_name}/showcaptcha")
+        return []
+
+
+def captcha_events(rec: Recorder, task_id: str) -> list[tuple]:
+    return rec.of("captcha", task_id)
+
+
+def test_captcha_pauses_task_instead_of_skipping_site(mgr):
+    """5.7: CaptchaDetectedError → пауза (не пропуск), сигнал captcha_required."""
+    rec = Recorder(mgr)
+    mgr._parsers["avito.ru"] = parser = FlakyCaptchaParser("avito.ru")
+    task_id = mgr.submit(SPEC, fast(sites=["avito.ru"], pages=2, captcha_resume_delay=0.05))
+    pump_until(lambda: captcha_events(rec, task_id))
+    assert captcha_events(rec, task_id)[0][2:] == ("avito.ru", "https://avito.ru/showcaptcha")
+    assert mgr.is_paused(task_id) and mgr.captcha_waiting(task_id) == {"avito.ru": "https://avito.ru/showcaptcha"}
+    assert "avito.ru" not in mgr.get_task(task_id).failed_sites  # НЕ пропущена
+    time.sleep(0.3)
+    QApplication.processEvents()
+    assert not rec.finished(task_id) and parser.calls == [1]  # стоит на месте
+    mgr.stop(task_id)
+    run_to_end(rec, task_id)
+
+
+def test_resume_site_retries_same_page_and_continues(mgr):
+    rec = Recorder(mgr)
+    mgr._parsers["avito.ru"] = parser = FlakyCaptchaParser("avito.ru")
+    task_id = mgr.submit(SPEC, fast(sites=["avito.ru"], pages=2, captcha_resume_delay=0.05))
+    pump_until(lambda: captcha_events(rec, task_id))
+    assert mgr.resume_site("avito.ru", task_id) is True
+    run_to_end(rec, task_id)
+    assert parser.calls == [1, 1, 2]  # та же страница 1 повторена, затем страница 2
+    task = mgr.get_task(task_id)
+    assert "avito.ru" not in task.failed_sites and task.per_site["avito.ru"]["pages_done"] == 2
+    assert rec.of("completed", task_id) and not mgr.is_paused(task_id)
+
+
+def test_resume_waits_before_retry(mgr):
+    rec = Recorder(mgr)
+    mgr._parsers["avito.ru"] = parser = FlakyCaptchaParser("avito.ru")
+    task_id = mgr.submit(SPEC, fast(sites=["avito.ru"], pages=1, captcha_resume_delay=0.6))
+    pump_until(lambda: captcha_events(rec, task_id))
+    start = time.monotonic()
+    mgr.resume_site("avito.ru")
+    run_to_end(rec, task_id)
+    assert time.monotonic() - start >= 0.55 and parser.calls == [1, 1]
+
+
+def test_captcha_again_after_resume_pauses_again(mgr):
+    rec = Recorder(mgr)
+    mgr._parsers["avito.ru"] = parser = FlakyCaptchaParser("avito.ru", fail_times=2)
+    task_id = mgr.submit(SPEC, fast(sites=["avito.ru"], pages=1, captcha_resume_delay=0.05))
+    pump_until(lambda: len(captcha_events(rec, task_id)) == 1)
+    mgr.resume_site("avito.ru")
+    pump_until(lambda: len(captcha_events(rec, task_id)) == 2)  # капча не решена — снова пауза
+    mgr.resume_site("avito.ru")
+    run_to_end(rec, task_id)
+    assert parser.calls == [1, 1, 1] and rec.of("completed", task_id)
+
+
+def test_skip_site_moves_on_to_next_site(mgr):
+    rec = Recorder(mgr)
+    mgr._parsers["avito.ru"] = FlakyCaptchaParser("avito.ru", fail_times=99)
+    task_id = mgr.submit(SPEC, fast(sites=["avito.ru", "auto.ru"], pages=2, captcha_resume_delay=0.05))
+    pump_until(lambda: captcha_events(rec, task_id))
+    assert mgr.skip_site("avito.ru", task_id) is True
+    run_to_end(rec, task_id)
+    task = mgr.get_task(task_id)
+    assert task.failed_sites == {"avito.ru": "captcha"}
+    assert task.per_site["auto.ru"]["pages_done"] == 2 and rec.of("completed", task_id)
+    assert len([e for e in task.errors if e.get("kind") == "captcha"]) == 1
+
+
+def test_stop_during_captcha_wait_stops_task(mgr):
+    rec = Recorder(mgr)
+    mgr._parsers["avito.ru"] = FlakyCaptchaParser("avito.ru", fail_times=99)
+    task_id = mgr.submit(SPEC, fast(sites=["avito.ru"], pages=2))
+    pump_until(lambda: captcha_events(rec, task_id))
+    assert mgr.stop(task_id) is True
+    run_to_end(rec, task_id)
+    assert rec.of("stopped", task_id) and not mgr.is_paused(task_id)
+
+
+def test_resume_without_waiting_site_returns_false(mgr):
+    assert mgr.resume_site("avito.ru") is False and mgr.skip_site("avito.ru") is False
