@@ -88,8 +88,8 @@ APrice/
 ├── client/                     # APrice-Client
 ├── common/                     # config, logger, window_manager, constants, paths
 │   └── paths.py                # BASE_DIR (каталог .exe / корень проекта), копирование aprice.db
-├── build.py                    # сборка всех трёх .exe (PyInstaller, onedir)
-├── build_scripts/              # builder.spec, server.spec, client.spec
+├── build.py                    # сборка: единый dist/ (3 .exe + общий _internal); --separate — три папки
+├── build_scripts/              # aprice.spec (единая), builder.spec/server.spec/client.spec (--separate)
 │   └── constants.py            # + константы IPC и Server (подготовка к задаче №3)
 ├── data/aprice.db              # справочная база (схема v2)
 ├── data/aprice.db.bak-v1       # резервная копия БД перед миграцией v1→v2
@@ -282,7 +282,7 @@ Server читает секцию `server` из `config/settings.json`:
   Столбцы: `Площадка, Марка, Модель, Год, Цена, Пробег, Ссылка`. Доступна после сбора;
   для записи из истории объявления не хранятся, экспортировать нечего.
 * **Настройки (4.4)** — кнопка «Настройки», секция `client` в `config/settings.json`:
-  `max_pages_per_site` (10), `max_ads_per_site` (500) — уходят Server в `options` при каждом
+  `max_pages_per_site` (2), `max_ads_per_site` (50) — уходят Server в `options` при каждом
   задании; `db_update_url`, `db_date_url` (по умолчанию — ссылки Яндекс.Диска), `db_max_age_days` (180 — полгода) —
   зеркало справочника, ссылка на `date.txt` и порог «база устарела». Положение окна запоминает `WindowManager` (`settings_dialog`).
 * **Обновление базы из зеркала (4.4)** — «Обновить базу из зеркала» в настройках скачивает
@@ -351,9 +351,22 @@ CoScore, 2026». По клику на него проверяется сайт <
 
 ## Сборка и развёртывание (этап 5)
 
-Распространяются **три независимые папки** (PyInstaller, режим `--onedir`):
-`dist/Builder/APrice-Builder.exe`, `dist/Server/APrice-Server.exe`,
-`dist/Client/APrice-Client.exe`. Python на машине пользователя не нужен.
+Распространяется **одна папка `dist/`** (PyInstaller, режим `--onedir`, 5.6) с тремя
+`.exe` и **общим** каталогом библиотек `_internal`:
+
+```
+dist/
+  APrice-Client.exe
+  APrice-Server.exe
+  APrice-Builder.exe
+  _internal/        (Qt, Python и пр. — один раз на все три программы)
+  config/ logs/ data/ browser/   (создаются при работе, общие для всех трёх)
+  README.md  requirements.txt
+```
+
+Python на машине пользователя не нужен. Общие `config\`, `logs\`, `data\`, `browser\`
+лежат рядом с `.exe`, поэтому Client и Server используют одни и те же настройки и один
+Chromium.
 
 ### Для разработчика: как собрать
 
@@ -366,10 +379,18 @@ pip install -r requirements.txt pyinstaller
 python build.py
 ```
 
-`build.py` очищает `dist/` и `build/`, по очереди собирает
-`build_scripts/builder.spec`, `server.spec`, `client.spec`
-(`--clean --noconfirm`), копирует `README.md` и `requirements.txt` в `dist/` и
-выводит «Сборка завершена. Файлы в dist/».
+`build.py` очищает `dist/` и `build/`, запускает PyInstaller для единой спецификации
+`build_scripts/aprice.spec` (`--clean --noconfirm`; три `Analysis` и три `EXE` в одном
+`COLLECT` — штатный приём «несколько exe в одной папке»), переносит `dist/APrice/*` в
+`dist/`, копирует `README.md` и `requirements.txt` и выводит «Сборка завершена. Файлы в
+dist/». У каждого компонента остались свои hiddenimports/excludes, поэтому состав
+`_internal` — объединение трёх наборов (общие DLL Qt лежат один раз).
+
+**Запасной вариант.** Если единая сборка на вашей машине не получилась (конфликт
+библиотек и т.п.), выполните `python build.py --separate`: прежняя раскладка
+`dist/{Builder,Server,Client}` из `builder.spec`, `server.spec`, `client.spec` (у каждого
+свой `_internal`). Автозапуск Server из Client (см. ниже) находит `APrice-Server.exe` и в
+этой раскладке (`..\Server`).
 
 * `builder.spec` вшивает в Builder `data/aprice.db`, если он лежит в корне проекта; если
   файла нет, сборка **не падает** (выводится предупреждение, Builder соберётся без вшитой
@@ -388,7 +409,14 @@ python build.py
 
 ### Для пользователя: как запускать
 
-1. Запустите **`APrice-Server.exe`** — окно не появится, приложение свернётся в
+0. Достаточно запустить **`APrice-Client.exe`**: если Server ещё не работает, Client сам
+   запускает `APrice-Server.exe` из своей папки (5.6) и ждёт, пока тот начнёт принимать
+   подключения (до 30 с; при первом запуске может уйти дольше из-за установки Chromium —
+   тогда сеанс откроется при первой оценке). При закрытии Client Server завершается сам,
+   если нет активного задания; при активном задании остаётся работать (его подхватит
+   следующий запуск Client). Отключить автозапуск: `client.autostart_server = false` в
+   `config/settings.json`.
+1. Либо запустите **`APrice-Server.exe`** вручную — окно не появится, приложение свернётся в
    трей. Браузер Chromium ищется в папке `browser\` **рядом с `.exe`** (см. ниже); если
    его там нет, при первом запуске Server скачает его автоматически (окно «Идёт
    установка браузера», нужен интернет, ~150 МБ, один раз).
@@ -404,8 +432,8 @@ python build.py
    скопируйте её в `data\` рядом с `APrice-Client.exe`; обычное обновление — кнопка
    «Настройки → Обновить базу из зеркала» в Client.
 
-Папки `config\`, `logs\` и `data\` создаются **рядом с `.exe`** каждого
-компонента (а не во временной папке PyInstaller).
+Папки `config\`, `logs\` и `data\` создаются **рядом с `.exe`** (а не во временной
+папке PyInstaller); в единой сборке это общая `dist\`.
 
 ### Chromium: portable-режим (5.2)
 
@@ -425,6 +453,31 @@ Chromium вручную и распакуйте в `browser/chromium-[верси
 Если браузер не найден, Server покажет сообщение «Chromium не найден по пути [путь].
 Установите его или положите в папку browser/ рядом с программой» (в нём указан точный
 путь, где ожидается `chrome.exe`) и продолжит работу; сбор объявлений при этом недоступен.
+
+### Ускорение загрузки Chromium (5.6)
+
+При автоматической установке Server качает Chromium **через зеркало**
+`https://npmmirror.com/mirrors/playwright` (в окружение процесса установки передаётся
+`PLAYWRIGHT_DOWNLOAD_HOST`). Если зеркало недоступно или установка с него не удалась, Server
+**автоматически повторяет** установку с официального CDN Playwright. Управление
+(переменные окружения Windows, задаются до запуска `APrice-Server.exe`):
+
+| Переменная | Значение | Эффект |
+|---|---|---|
+| `APRICE_CHROMIUM_MIRROR` | не задана | зеркало npmmirror, при сбое — официальный CDN |
+| `APRICE_CHROMIUM_MIRROR` | `off` (также `0`, `false`, `official`, `cdn`) | только официальный CDN, без зеркала |
+| `APRICE_CHROMIUM_MIRROR` | `https://my.mirror/playwright` | своё зеркало (с тем же откатом на CDN) |
+| `PLAYWRIGHT_DOWNLOAD_HOST` или `PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST` | любой адрес | выбор пользователя приоритетнее: APrice ничего не подставляет и Playwright использует ваш адрес |
+
+Пример (cmd): `set APRICE_CHROMIUM_MIRROR=off` и затем `APrice-Server.exe`.
+
+**Индикатор загрузки.** Установка идёт через `subprocess.Popen`; Server читает вывод
+`playwright install` (stdout+stderr), разбирает проценты и скорость (`45% … 1.2 MB/s`;
+если скорость в выводе не указана — считает сам) и показывает их в окне установки
+(полоса `QProgressBar` и подпись `QLabel` внутри `QProgressDialog`): «Скачивание Chromium:
+45% · 1.2 MB/s». Если проценты разобрать не удалось, окно остаётся в режиме «занято» с
+текстом «Установка Chromium...». При откате с зеркала на CDN индикатор сбрасывается в этот
+режим и начинает заново.
 
 ### Системные требования
 

@@ -134,10 +134,13 @@ DEFAULT_SETTINGS: dict = {
     "client": {
         # Жёлтая плашка «отключите VPN» при старте Клиента (4.3).
         "show_vpn_warning": True,
+        # Автозапуск APrice-Server при старте Client (5.6); false — запускать вручную.
+        "autostart_server": True,
         # Лимиты сбора, которые Client передаёт Server в options (4.4).
-        # Значения по умолчанию совпадают с server.protocol.DEFAULT_MAX_*.
-        "max_pages_per_site": 10,
-        "max_ads_per_site": 500,
+        # 5.6: по умолчанию 2 страницы / 50 объявлений (быстрая оценка); серверные
+        # DEFAULT_MAX_* в server.protocol — лишь запасной вариант, если Client лимит не прислал.
+        "max_pages_per_site": 2,
+        "max_ads_per_site": 50,
         # Зеркало справочника aprice.db (прямая ссылка или публичная ссылка
         # Яндекс.Диска); пусто — обновление отключено (4.4).
         "db_update_url": "https://disk.yandex.ru/d/ezrSPG7rIun3tA",

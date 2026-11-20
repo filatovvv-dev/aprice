@@ -226,6 +226,7 @@ def patch_main(monkeypatch, main_module, tmp_path, ensure):
     monkeypatch.setattr(main_module, "setup_logging", lambda **kw: None)
     monkeypatch.setattr(main_module.paths, "ensure_runtime_dirs", lambda *a, **k: [])
     monkeypatch.setattr(main_module, "ensure_database", ensure)
+    monkeypatch.setattr(main_module, "ensure_server", lambda *a, **k: True)  # без запуска процесса
 
     class Boom:
         def __init__(self, *a, **k):

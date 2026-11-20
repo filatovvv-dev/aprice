@@ -15,6 +15,7 @@ from common.window_manager import WindowManager
 from client.controller import ClientController
 from client.first_run import ensure_database
 from client.gui import MainWindow
+from client.server_launcher import ensure_server
 
 logger = logging.getLogger("aprice.client.main")
 
@@ -37,6 +38,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not ensure_database(config):
         logger.error("Client не запущен: нет справочника aprice.db")
         return 1
+
+    # 5.6: Server не запущен — стартуем его (ждём порт, не замораживая интерфейс).
+    ensure_server(config, on_wait=app.processEvents)
 
     window = MainWindow(show_vpn_warning=bool(config.get("client", "show_vpn_warning", True)))
     window_manager = WindowManager(settings_filename=constants.CLIENT_WINDOW_SETTINGS_FILE)

@@ -369,7 +369,7 @@ def test_build_py_steps(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(build.subprocess, "run", fake_run)
-    assert build.main(root=root) == 0
+    assert build.main(root=root, separate=True) == 0
     assert not (root / "dist" / "stale").exists()
     assert not (root / "build" / "stale").exists()
     assert [Path(c[3]).name for c in calls] == ["builder.spec", "server.spec", "client.spec"]
@@ -388,4 +388,4 @@ def test_build_py_stops_on_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(
         build.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3)
     )
-    assert build.main(root=tmp_path) != 0
+    assert build.main(root=tmp_path, separate=True) != 0
