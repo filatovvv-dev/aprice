@@ -527,7 +527,7 @@ def test_submit_sends_spec_and_options_and_starts_polling(window, ctrl, ipc):
     assert ipc.calls == [("submit_task", {
         "mode": "range", "manufacturer": "BMW", "model": "X5", "year_from": 2020,
         "year_to": 2020, "transmissions": ["АКПП"], "fuels": [],
-    }, {"max_pages_per_site": 10, "max_ads_per_site": 500})]  # лимиты из настроек (4.4)
+    }, {"max_pages_per_site": 2, "max_ads_per_site": 50})]  # лимиты из настроек (4.4)
     assert ctrl.task_id == "T1"
     assert ctrl.timer.isActive() and ctrl.timer.interval() == POLL_INTERVAL_MS == 2000
     assert window.status_label.text() == "Задание принято"
@@ -754,6 +754,7 @@ def test_main_builds_window_and_controller_without_side_effects(qapp, monkeypatc
     from client import main as main_module
 
     monkeypatch.setattr(main_module, "ensure_database", lambda *a, **k: True)  # 5.5: сеть не нужна
+    monkeypatch.setattr(main_module, "ensure_server", lambda *a, **k: True)  # 5.6: Server не запускаем
 
     created: dict = {}
 
@@ -1012,6 +1013,7 @@ def test_main_respects_show_vpn_warning_setting(monkeypatch, tmp_path):
     from client import main as main_module
 
     monkeypatch.setattr(main_module, "ensure_database", lambda *a, **k: True)  # 5.5: сеть не нужна
+    monkeypatch.setattr(main_module, "ensure_server", lambda *a, **k: True)  # 5.6: Server не запускаем
 
     config = Config(tmp_path / "settings.json")
     config.set("client", "show_vpn_warning", False)
@@ -1408,6 +1410,7 @@ def test_main_passes_window_manager_to_controller(monkeypatch, tmp_path):
     from client import main as main_module
 
     monkeypatch.setattr(main_module, "ensure_database", lambda *a, **k: True)  # 5.5: сеть не нужна
+    monkeypatch.setattr(main_module, "ensure_server", lambda *a, **k: True)  # 5.6: Server не запускаем
 
     seen: dict = {}
 

@@ -78,7 +78,7 @@ def dialog(qapp, config, db_file):
 
 
 def test_dialog_loads_defaults_from_config(dialog):
-    assert dialog.values() == {"max_pages_per_site": 10, "max_ads_per_site": 500,
+    assert dialog.values() == {"max_pages_per_site": 2, "max_ads_per_site": 50,
                                "db_update_url": constants.DEFAULT_SETTINGS["client"]["db_update_url"],
                                "db_date_url": constants.DEFAULT_SETTINGS["client"]["db_date_url"],
                                "db_max_age_days": 180}
@@ -113,7 +113,7 @@ def test_cancel_does_not_touch_config(dialog, config):
     dialog.max_pages_spin.setValue(99)
     dialog.cancel_button.click()
     assert dialog.result() == 0
-    assert Config(config.path).load().get("client", "max_pages_per_site") == 10
+    assert Config(config.path).load().get("client", "max_pages_per_site") == 2
 
 
 @pytest.mark.parametrize("url", ["ftp://x/a.db", "mirror.test/a.db", "https://"])
@@ -390,3 +390,14 @@ def test_invalid_date_url_blocks_save_and_update(dialog, config, boxes):
     dialog.url_edit.setText("https://mirror.test/a.db")
     dialog.start_update()
     assert len(boxes.critical_texts) == 2 and dialog._thread is None
+
+
+def test_default_limits_5_6():
+    from common import constants
+    client = constants.DEFAULT_SETTINGS["client"]
+    assert (client["max_pages_per_site"], client["max_ads_per_site"]) == (2, 50)
+
+
+def test_default_autostart_server_enabled_5_6():
+    from common import constants
+    assert constants.DEFAULT_SETTINGS["client"]["autostart_server"] is True

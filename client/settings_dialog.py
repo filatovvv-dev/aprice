@@ -190,8 +190,8 @@ class SettingsDialog(QDialog):
     def load_values(self) -> None:
         """Заполняет поля из конфига."""
         get = self._config.get
-        self.max_pages_spin.setValue(int(get(SECTION, "max_pages_per_site", 10)))
-        self.max_ads_spin.setValue(int(get(SECTION, "max_ads_per_site", 500)))
+        self.max_pages_spin.setValue(int(get(SECTION, "max_pages_per_site", 2)))
+        self.max_ads_spin.setValue(int(get(SECTION, "max_ads_per_site", 50)))
         self.url_edit.setText(str(get(SECTION, "db_update_url", "") or ""))
         self.date_url_edit.setText(str(get(SECTION, "db_date_url", "") or ""))
         self.age_spin.setValue(int(get(SECTION, "db_max_age_days", 180)))

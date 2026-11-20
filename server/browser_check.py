@@ -33,6 +33,16 @@ INSTALL_PROGRESS_TEXT = (
 )
 INSTALL_TIMEOUT_SEC = 1800  # 30 минут на медленном канале
 
+# --- Ускорение загрузки Chromium (5.6) --------------------------------------------
+#: Зеркало Playwright по умолчанию: быстрее официального CDN во многих сетях.
+DEFAULT_MIRROR_URL = "https://npmmirror.com/mirrors/playwright"
+#: Переменная APrice: пусто/не задана — зеркало по умолчанию; ``off``/``0``/``false``/
+#: ``official``/``cdn`` — только официальный CDN; иной текст — свой адрес зеркала.
+MIRROR_ENV = "APRICE_CHROMIUM_MIRROR"
+MIRROR_OFF_VALUES = frozenset({"off", "0", "false", "no", "official", "cdn", "none"})
+#: Собственные переменные Playwright: если пользователь задал их сам, мы их не трогаем.
+PLAYWRIGHT_HOST_VARS = ("PLAYWRIGHT_DOWNLOAD_HOST", "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST")
+
 
 def chromium_executable_path() -> str:
     """Путь, по которому Playwright ожидает Chromium (``pw.chromium.executable_path``).
@@ -79,7 +89,22 @@ def _pin_browsers_path(env: dict[str, str]) -> None:
         env["PLAYWRIGHT_BROWSERS_PATH"] = value
 
 
-def build_install_command() -> tuple[list[str], dict[str, str]]:
+def mirror_url(environ: Optional[dict] = None) -> Optional[str]:
+    """Адрес зеркала для загрузки Chromium или ``None`` (качаем с официального CDN).
+
+    ``None``, если зеркало выключено (:data:`MIRROR_ENV`) или пользователь сам задал
+    ``PLAYWRIGHT_DOWNLOAD_HOST`` / ``PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST`` — его выбор приоритетнее.
+    """
+    env = os.environ if environ is None else environ
+    if any(str(env.get(name, "")).strip() for name in PLAYWRIGHT_HOST_VARS):
+        return None
+    value = str(env.get(MIRROR_ENV, "")).strip()
+    if value.lower() in MIRROR_OFF_VALUES:
+        return None
+    return value or DEFAULT_MIRROR_URL
+
+
+def build_install_command(mirror: Optional[str] = None) -> tuple[list[str], dict[str, str]]:
     """Формирует команду установки Chromium.
 
     В собранном ``.exe`` консольной команды ``playwright`` в ``PATH`` нет, поэтому
@@ -87,9 +112,20 @@ def build_install_command() -> tuple[list[str], dict[str, str]]:
     PyInstaller кладёт в сборку через ``collect_all('playwright')``. Если драйвер
     найти не удалось, применяется прямая команда ``playwright install chromium``.
 
+    Args:
+        mirror: адрес зеркала → ``PLAYWRIGHT_DOWNLOAD_HOST`` в окружении процесса
+            (``None`` — официальный CDN).
+
     Returns:
         tuple: ``(argv, env)`` для :func:`subprocess.run`.
     """
+    argv, env = _base_install_command()
+    if mirror:
+        env["PLAYWRIGHT_DOWNLOAD_HOST"] = mirror
+    return argv, env
+
+
+def _base_install_command() -> tuple[list[str], dict[str, str]]:
     env = dict(os.environ)
     try:
         from playwright._impl._driver import compute_driver_executable, get_driver_env
@@ -106,18 +142,9 @@ def build_install_command() -> tuple[list[str], dict[str, str]]:
         return ["playwright", "install", "chromium"], env
 
 
-def install_chromium(
-    runner: Callable[..., "subprocess.CompletedProcess"] = subprocess.run,
-) -> tuple[bool, str]:
-    """Устанавливает Chromium (``playwright install chromium``).
-
-    Args:
-        runner: функция запуска процесса (подменяется в тестах).
-
-    Returns:
-        tuple: ``(успех, подробности_для_лога)``.
-    """
-    argv, env = build_install_command()
+def _run_install(runner: Callable[..., "subprocess.CompletedProcess"], mirror: Optional[str]) -> tuple[bool, str]:
+    """Один запуск ``playwright install chromium`` (с зеркалом или без)."""
+    argv, env = build_install_command(mirror)
     kwargs: dict = {
         "capture_output": True,
         "text": True,
@@ -126,17 +153,43 @@ def install_chromium(
     }
     if sys.platform == "win32":  # без мигающего консольного окна
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    source = mirror or "официальный CDN"
     try:
         result = runner(argv, **kwargs)
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.error("Запуск установки Chromium не удался: %s", exc)
+        logger.error("Запуск установки Chromium (%s) не удался: %s", source, exc)
         return False, str(exc)
     output = ((result.stdout or "") + (result.stderr or "")).strip()
     if result.returncode != 0:
-        logger.error("playwright install завершился с кодом %s: %s", result.returncode, output)
+        logger.error("playwright install (%s) завершился с кодом %s: %s", source, result.returncode, output)
         return False, output
-    logger.info("Chromium установлен")
+    logger.info("Chromium установлен (источник: %s)", source)
     return True, output
+
+
+def install_chromium(
+    runner: Callable[..., "subprocess.CompletedProcess"] = subprocess.run,
+    environ: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """Устанавливает Chromium (``playwright install chromium``).
+
+    Сначала пробует зеркало (:func:`mirror_url`); если оно недоступно или установка
+    не удалась — автоматически повторяет с официального CDN (откат, 5.6).
+
+    Args:
+        runner: функция запуска процесса (подменяется в тестах).
+        environ: окружение для выбора зеркала (по умолчанию ``os.environ``).
+
+    Returns:
+        tuple: ``(успех, подробности_для_лога)``.
+    """
+    mirror = mirror_url(environ)
+    ok, details = _run_install(runner, mirror)
+    if ok or mirror is None:
+        return ok, details
+    logger.warning("Зеркало %s не сработало — повторяю с официального CDN", mirror)
+    ok_cdn, details_cdn = _run_install(runner, None)
+    return ok_cdn, details_cdn if ok_cdn else f"{details}\n{details_cdn}".strip()
 
 
 class InstallUi(Protocol):
