@@ -18,6 +18,16 @@ from PyInstaller.utils.hooks import collect_submodules
 # SPECPATH — каталог этого .spec (build_scripts/); корень проекта — на уровень выше.
 ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
 
+# Иконка exe (6.1): build_scripts/assets/icon_*.ico создаёт generate_icons.py.
+# Нет файла — сборка не падает, exe получит стандартную иконку.
+def _icon(name):
+    path = os.path.join(ROOT, 'build_scripts', 'assets', name)
+    if os.path.isfile(path):
+        return path
+    print('ВНИМАНИЕ: иконка %s не найдена (python generate_icons.py).' % path)
+    return None
+
+
 datas, binaries, hiddenimports = [], [], []
 
 hiddenimports += [
@@ -71,6 +81,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,           # GUI-приложение без консольного окна
+    icon=_icon('icon_builder.ico'),
 )
 
 coll = COLLECT(

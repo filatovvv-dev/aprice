@@ -4,16 +4,20 @@
 
     pip install -r requirements.txt pyinstaller
     python build.py            # единый dist/: 3 exe + общий _internal (build_scripts/aprice.spec)
+    python build.py --no-installer  # без создания установщика (Inno Setup)
     python build.py --separate # запасной вариант: dist/{Builder,Server,Client}, у каждого свой _internal
 
 Скрипт:
 
+0. генерирует иконки (``generate_icons.py`` → ``build_scripts/assets/*.ico``);
 1. очищает ``dist/`` и ``build/``;
 2. запускает PyInstaller для ``aprice.spec`` (режим onedir, ``--clean --noconfirm``) и
    переносит ``dist/APrice/*`` в ``dist/``; с ``--separate`` — по очереди ``builder.spec``,
    ``server.spec``, ``client.spec`` (три отдельные папки);
 3. копирует ``README.md`` и ``requirements.txt`` в ``dist/``;
-4. сообщает «Сборка завершена. Файлы в dist/».
+4. если найден Inno Setup 6 (``ISCC.exe``), собирает установщик
+   ``dist/APrice_Setup_v<версия>.exe`` по ``build_scripts/installer.iss``; нет — пропускает;
+5. сообщает «Сборка завершена. Файлы в dist/».
 
 При ошибке PyInstaller сборка останавливается с его кодом возврата — полный лог
 остаётся в консоли (его нужно прислать для подбора ``hiddenimports``).
@@ -21,6 +25,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +44,14 @@ EXTRA_FILES: tuple[str, ...] = ("README.md", "requirements.txt")
 UNIFIED_SPEC = "aprice.spec"
 UNIFIED_FOLDER = "APrice"
 EXE_NAMES: tuple[str, ...] = tuple(exe for _, _, exe in TARGETS)
+#: скрипт Inno Setup и стандартные места ISCC.exe (6.1)
+INSTALLER_SCRIPT = "installer.iss"
+ICONS_SCRIPT = "generate_icons.py"
+ISCC_PATHS: tuple[str, ...] = (
+    r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+    r"C:\Program Files\Inno Setup 6\ISCC.exe",
+)
+INNO_DOWNLOAD_URL = "https://jrsoftware.org/isinfo.php"
 
 
 def clean(root: Path) -> None:
@@ -66,6 +80,70 @@ def find_exe(folder: Path, exe_name: str) -> Optional[Path]:
         if candidate.is_file():
             return candidate
     return None
+
+
+def generate_icons(root: Path) -> bool:
+    """Обновляет иконки перед сборкой (``generate_icons.py``).
+
+    Нет скрипта или Pillow — только предупреждение: готовые ``.ico`` (если лежат в
+    ``build_scripts/assets``) остаются, а spec-файлы переживают их отсутствие.
+
+    Returns:
+        bool: ``True``, если иконки созданы заново.
+    """
+    script = root / ICONS_SCRIPT
+    if not script.is_file():
+        print(f"Предупреждение: {ICONS_SCRIPT} не найден, иконки не обновлены.", file=sys.stderr)
+        return False
+    code = subprocess.run([sys.executable, str(script)], cwd=root).returncode
+    if code != 0:
+        print("Предупреждение: иконки не созданы (pip install -r requirements-dev.txt); "
+              "сборка продолжится с имеющимися.", file=sys.stderr)
+        return False
+    return True
+
+
+def find_iscc(paths: Optional[tuple[str, ...]] = None) -> Optional[str]:
+    """Ищет ``ISCC.exe`` (Inno Setup 6): стандартные пути, затем ``PATH``."""
+    for candidate in (paths if paths is not None else ISCC_PATHS):
+        if os.path.exists(candidate):
+            return candidate
+    return shutil.which("ISCC") or shutil.which("ISCC.exe")
+
+
+def installer_version(script: Path) -> str:
+    """Читает ``#define MyAppVersion`` из ``installer.iss`` (для сообщения)."""
+    try:
+        text = script.read_text(encoding="utf-8-sig")
+    except OSError:
+        return "?"
+    match = re.search(r'#define\s+MyAppVersion\s+"([^"]+)"', text)
+    return match.group(1) if match else "?"
+
+
+def build_installer(root: Path, iscc: Optional[str] = None) -> int:
+    """Собирает установщик через Inno Setup; нет компилятора — подсказка и ``0``.
+
+    Returns:
+        int: ``0`` — готово или пропущено, иначе код ISCC.
+    """
+    script = root / "build_scripts" / INSTALLER_SCRIPT
+    iscc = iscc or find_iscc()
+    if iscc is None:
+        print("Inno Setup не найден. Пропускаю создание инсталлятора.")
+        print(f"Скачайте Inno Setup 6 с {INNO_DOWNLOAD_URL} и запустите "
+              f"build_scripts/{INSTALLER_SCRIPT} вручную.")
+        return 0
+    if not script.is_file():
+        print(f"Предупреждение: {script} не найден, установщик пропущен.", file=sys.stderr)
+        return 0
+    print("Запуск Inno Setup...")
+    code = subprocess.run([iscc, str(script)], cwd=root).returncode
+    if code != 0:
+        print(f"ОШИБКА: Inno Setup завершился с кодом {code}.", file=sys.stderr)
+        return code
+    print(f"Инсталлятор успешно создан в dist/APrice_Setup_v{installer_version(script)}.exe")
+    return 0
 
 
 def flatten_unified(dist: Path, folder: str = UNIFIED_FOLDER) -> None:
@@ -116,12 +194,14 @@ def build_separate(root: Path, specs_dir: Path) -> int:
     return 0
 
 
-def main(root: Optional[Path] = None, separate: bool = False) -> int:
+def main(root: Optional[Path] = None, separate: bool = False, installer: bool = True) -> int:
     """Выполняет полную сборку.
 
     Args:
         root: корень проекта (по умолчанию — каталог этого файла).
         separate: ``True`` — старая раскладка из трёх папок (запасной вариант).
+        installer: ``False`` — не создавать установщик Inno Setup. В режиме
+            ``separate`` установщик не создаётся (он рассчитан на единый ``dist/``).
 
     Returns:
         int: ``0`` при успехе, иначе код ошибки.
@@ -129,6 +209,9 @@ def main(root: Optional[Path] = None, separate: bool = False) -> int:
     root = Path(root) if root is not None else Path(__file__).resolve().parent
     specs_dir = root / "build_scripts"
 
+    # APRICE_NO_INSTALLER=1 — то же, что --no-installer (удобно для CI и тестов).
+    installer = installer and not os.environ.get("APRICE_NO_INSTALLER")
+    generate_icons(root)
     clean(root)
     code = build_separate(root, specs_dir) if separate else build_unified(root, specs_dir)
     if code != 0:
@@ -142,9 +225,17 @@ def main(root: Optional[Path] = None, separate: bool = False) -> int:
         else:
             print(f"Предупреждение: {name} не найден, пропущен.", file=sys.stderr)
 
+    if installer and not separate:
+        code = build_installer(root)
+        if code != 0:
+            return code
+    elif installer and separate:
+        print("Установщик не создаётся в режиме --separate (нужен единый dist/).")
+
     print("\nСборка завершена. Файлы в dist/")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(separate="--separate" in sys.argv[1:]))
+    _args = sys.argv[1:]
+    sys.exit(main(separate="--separate" in _args, installer="--no-installer" not in _args))
