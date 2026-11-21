@@ -75,3 +75,9 @@ def chart_canvas(monkeypatch):
     from client import charts
 
     monkeypatch.setattr(charts, "_make_canvas", lambda figure: QWidget())
+
+
+@pytest.fixture(autouse=True)
+def _no_installer_in_tests(monkeypatch):
+    """6.1: тесты build.py не должны запускать Inno Setup, даже если он установлен."""
+    monkeypatch.setenv("APRICE_NO_INSTALLER", "1")

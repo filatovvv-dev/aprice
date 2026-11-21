@@ -28,6 +28,16 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 # SPECPATH — каталог этого .spec (build_scripts/); корень проекта — на уровень выше.
 ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
 
+# Иконка exe (6.1): build_scripts/assets/icon_*.ico создаёт generate_icons.py.
+# Нет файла — сборка не падает, exe получит стандартную иконку.
+def _icon(name):
+    path = os.path.join(ROOT, 'build_scripts', 'assets', name)
+    if os.path.isfile(path):
+        return path
+    print('ВНИМАНИЕ: иконка %s не найдена (python generate_icons.py).' % path)
+    return None
+
+
 # Ненужные модули Qt не тянем (пакет PyQt6 целиком не собираем); чужие биндинги конфликтуют с PyQt6.
 COMMON_EXCLUDES = [
     'PyQt5', 'PySide2', 'PySide6', 'tkinter', 'pytest', 'IPython',
@@ -42,6 +52,8 @@ if os.path.isfile(_db):
     _builder_datas += [(_db, 'data')]   # ('data/aprice.db', 'data'), путь абсолютный
 else:
     print('ВНИМАНИЕ: %s не найден — Builder будет собран без вшитой базы.' % _db)
+
+ICONS = {'APrice-Builder': 'icon_builder.ico', 'APrice-Server': 'icon_server.ico', 'APrice-Client': 'icon_client.ico'}
 
 #: компонент -> (имя exe, точка входа, пакеты проекта, hiddenimports, collect_all, excludes, datas)
 COMPONENTS = [
@@ -91,6 +103,7 @@ for name, entry, pkgs, hidden, collected, excludes, extra_datas in COMPONENTS:
         strip=False,
         upx=False,
         console=False,           # GUI-приложение без консольного окна
+        icon=_icon(ICONS[name]),  # 6.1: у каждого exe своя иконка
     )
     collect_args += [exe, a.binaries, a.datas]
 

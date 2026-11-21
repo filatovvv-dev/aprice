@@ -407,6 +407,34 @@ dist/». У каждого компонента остались свои hidden
   API cars-base.ru).
 * Chromium в сборку **не** входит (иначе +200 МБ): Server скачивает его сам.
 
+### Создание установщика (6.1)
+
+Установщик собирается программой **Inno Setup 6**; скрипт — `build_scripts/installer.iss`.
+
+1. Скачайте и установите [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+2. Запустите `python build.py`. Если `ISCC.exe` найден (стандартные папки
+   `C:\Program Files (x86)\Inno Setup 6` / `C:\Program Files\Inno Setup 6` или `PATH`),
+   установщик создастся автоматически: `dist\APrice_Setup_v1.0.0.exe`. Если Inno Setup не
+   найден, сборка завершится как обычно, а установщик можно собрать вручную:
+   `ISCC.exe build_scripts\installer.iss` (после `python build.py`).
+
+Что делает `build.py` дополнительно: в самом начале запускает `generate_icons.py` (Pillow,
+`pip install -r requirements-dev.txt`) — он создаёт три иконки в `build_scripts/assets/`:
+`icon_client.ico` (синяя, «AP»), `icon_server.ico` (красная, «S»), `icon_builder.ico`
+(зелёная, «B»); их подхватывают `.spec`-файлы (`icon=`), и у каждого `.exe` своя иконка. Без
+Pillow сборка продолжается с уже лежащими в репозитории `.ico`. Ключи: `--no-installer`
+(или переменная `APRICE_NO_INSTALLER=1`) — не собирать установщик; `--separate` —
+раздельная сборка (установщик в ней не создаётся: он рассчитан на единый `dist/`).
+
+Установщик ставит всё содержимое `dist\` (три `.exe` и общий `_internal`) в
+`C:\Program Files\APrice`, создаёт ярлык «АвтоПрайс — Оценка авто» на Рабочем столе (можно
+отключить в мастере), ярлыки Client и Builder в меню «Пуск» и предлагает запустить
+АвтоПрайс. Версия задаётся в `installer.iss` (`#define MyAppVersion`). Так как программы
+пишут `config\`, `logs\`, `data\`, `browser\` рядом с `.exe`, установщик выдаёт группе
+«Пользователи» право записи в эти четыре папки (иначе в Program Files работа без прав
+администратора невозможна). При удалении `browser\` и `logs\` стираются, `config\` и
+`data\` (настройки, история, база) сохраняются.
+
 ### Для пользователя: как запускать
 
 0. Достаточно запустить **`APrice-Client.exe`**: если Server ещё не работает, Client сам
