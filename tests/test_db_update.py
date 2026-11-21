@@ -483,3 +483,64 @@ def test_parse_manifest_fields():
     assert db_update.parse_manifest("17.11.2026") == db_update.Manifest(datetime(2026, 11, 17), None)
     bad = db_update.parse_manifest(f"мусор\n{NEW_URL}")
     assert bad.date is None and bad.db_url == NEW_URL  # URL нужен первому запуску даже при мусорной дате
+
+
+# ----------------------------------------------------------------------
+# 5.7: классификация сетевых ошибок
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("exc", [
+    requests.ConnectionError("нет сети"), requests.Timeout("таймаут"), ConnectionResetError("обрыв"),
+    TimeoutError("таймаут сокета"),
+])
+def test_network_failures_become_db_network_error(tmp_path, exc):
+    with pytest.raises(db_update.DbNetworkError):
+        db_update.download_database("https://mirror.test/a.db", tmp_path / "a.db", get=FakeGet(exc))
+    with pytest.raises(db_update.DbNetworkError):
+        db_update.check_for_updates("https://mirror.test/date.txt", tmp_path / "a.db", get=FakeGet(exc))
+
+
+def test_network_failure_while_resolving_yandex_link(tmp_path):
+    with pytest.raises(db_update.DbNetworkError):
+        db_update.download_database("https://disk.yandex.ru/d/abc", tmp_path / "a.db",
+                                    get=FakeGet(requests.ConnectionError("нет сети")))
+
+
+def test_connection_drop_midstream_is_network_error(tmp_path):
+    class Dropping(FakeResponse):
+        def iter_content(self, chunk_size=1):
+            yield b"abc"
+            raise ConnectionResetError("обрыв посреди загрузки")
+
+    with pytest.raises(db_update.DbNetworkError):
+        db_update.download_database("https://mirror.test/a.db", tmp_path / "a.db", get=FakeGet(Dropping(b"abc")))
+    assert not list(tmp_path.glob("*.download"))
+
+
+def test_http_error_is_plain_update_error(tmp_path):
+    class Gone(FakeResponse):
+        def raise_for_status(self):
+            raise requests.HTTPError("404")
+
+    with pytest.raises(db_update.DbUpdateError) as info:
+        db_update.download_database("https://mirror.test/a.db", tmp_path / "a.db", get=FakeGet(Gone(b"")))
+    assert not isinstance(info.value, db_update.DbNetworkError)
+
+
+def test_thread_flags_network_error(qapp, tmp_path):
+    from client.settings_dialog import DbUpdateThread
+
+    def downloader(url, target, **kw):
+        raise db_update.DbNetworkError("нет сети")
+
+    t = DbUpdateThread("https://m/a.db", tmp_path / "a.db", downloader=downloader)
+    got = []
+    t.failed.connect(got.append)
+    t.run()
+    assert t.network_error is True and got == ["нет сети"]
+
+    def plain(url, target, **kw):
+        raise db_update.DbUpdateError("битый файл")
+
+    t2 = DbUpdateThread("https://m/a.db", tmp_path / "a.db", downloader=plain)
+    t2.run()
+    assert t2.network_error is False

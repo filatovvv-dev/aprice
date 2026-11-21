@@ -33,6 +33,11 @@ class FakeUi:
     def show_error(self, message):
         self.errors.append(message)
 
+    def ask_retry(self, message):
+        self.retry_prompts = getattr(self, "retry_prompts", []) + [message]
+        answers = getattr(self, "retry_answers", [])
+        return answers.pop(0) if answers else False
+
 
 @pytest.fixture
 def config(tmp_path):
@@ -61,6 +66,11 @@ class RealThreadUi:
 
     def show_error(self, message):
         self.errors.append(message)
+
+    def ask_retry(self, message):
+        self.retry_prompts = getattr(self, "retry_prompts", []) + [message]
+        answers = getattr(self, "retry_answers", [])
+        return answers.pop(0) if answers else False
 
 
 # ----------------------------------------------------------------------
@@ -199,14 +209,64 @@ def test_real_thread_downloads_database_without_manifest(qapp, config, tmp_path,
 @pytest.mark.parametrize("failure", [
     requests.ConnectionError("нет сети"),
     requests.Timeout("таймаут"),
+    ConnectionResetError("обрыв"),
 ])
-def test_real_thread_network_failure_blocks_start(qapp, config, tmp_path, monkeypatch, failure):
-    monkeypatch.setattr(db_update.requests, "get", FakeGet(failure))
+def test_real_thread_network_failure_offers_retry_and_cancel_closes_cleanly(
+        qapp, config, tmp_path, monkeypatch, failure):
+    """5.7: нет сети/VPN → «Ошибка сети…» с «Повторить/Отмена»; «Отмена» — штатный выход."""
+    from client.first_run import NETWORK_ERROR_MESSAGE
+
+    fake = FakeGet(failure, failure)  # манифест и запасная ссылка
+    monkeypatch.setattr(db_update.requests, "get", fake)
     db = tmp_path / "aprice.db"
     ui = RealThreadUi()
+    ui.retry_answers = [False]
     assert ensure_database(config, db, ui) is False
-    assert not db.exists() and not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob("*.part"))
-    assert len(ui.errors) == 1 and "Проверьте подключение" in ui.errors[0]
+    assert not db.exists() and not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob("*.download"))
+    assert ui.retry_prompts == [NETWORK_ERROR_MESSAGE] and ui.errors == []
+
+
+def test_network_error_message_text():
+    from client.first_run import NETWORK_ERROR_MESSAGE, RETRY_TEXT, CANCEL_TEXT
+
+    assert NETWORK_ERROR_MESSAGE == ("Ошибка сети. Не удалось подключиться к серверу обновлений. "
+                                     "Проверьте интернет-соединение.")
+    assert (RETRY_TEXT, CANCEL_TEXT) == ("Повторить", "Отмена")
+
+
+def test_retry_after_network_error_downloads_database(qapp, config, tmp_path, monkeypatch):
+    payload = make_db(tmp_path / "remote.db", ("BMW", "Audi"))
+    err = requests.ConnectionError("VPN выключен")
+    fake = FakeGet(err, err, TextResponse("17.11.2026"), FakeResponse(payload))
+    monkeypatch.setattr(db_update.requests, "get", fake)
+    db = tmp_path / "data" / "aprice.db"
+    db.parent.mkdir()
+    ui = RealThreadUi()
+    ui.retry_answers = [True]  # «Повторить»
+    assert ensure_database(config, db, ui) is True
+    assert len(ui.retry_prompts) == 1 and ui.errors == [] and _count_manufacturers(db) == 2
+
+
+def test_retry_can_be_repeated_until_cancel(qapp, config, tmp_path, monkeypatch):
+    err = requests.ConnectionError("нет сети")
+    monkeypatch.setattr(db_update.requests, "get", FakeGet(*([err] * 6)))
+    ui = RealThreadUi()
+    ui.retry_answers = [True, True, False]
+    assert ensure_database(config, tmp_path / "aprice.db", ui) is False
+    assert len(ui.retry_prompts) == 3 and ui.errors == []
+
+
+def test_http_error_is_not_a_network_error_and_shows_plain_error(qapp, config, tmp_path, monkeypatch):
+    """404 на ссылке — сеть работает: без «Повторить», обычное сообщение об ошибке."""
+    class NotFound(FakeResponse):
+        def raise_for_status(self):
+            raise requests.HTTPError("404 Not Found")
+
+    monkeypatch.setattr(db_update.requests, "get", FakeGet(requests.ConnectionError("x"), NotFound(b"")))
+    ui = RealThreadUi()
+    assert ensure_database(config, tmp_path / "aprice.db", ui) is False
+    assert getattr(ui, "retry_prompts", []) == []
+    assert len(ui.errors) == 1 and "404" in ui.errors[0]
 
 
 def test_real_thread_broken_file_blocks_start(qapp, config, tmp_path, monkeypatch):
@@ -215,6 +275,21 @@ def test_real_thread_broken_file_blocks_start(qapp, config, tmp_path, monkeypatc
     ui = RealThreadUi()
     assert ensure_database(config, db, ui) is False
     assert not db.exists() and len(ui.errors) == 1
+
+
+def test_main_returns_1_without_traceback_when_ensure_database_raises(qapp, monkeypatch, tmp_path):
+    """5.7: непредвиденное исключение при подготовке базы → сообщение и код 1, не падение."""
+    from client import main as main_module
+
+    def boom(cfg):
+        raise RuntimeError("что-то сломалось")
+
+    created = patch_main(monkeypatch, main_module, tmp_path, boom)
+    shown = []
+    monkeypatch.setattr(main_module, "_show_fatal", shown.append)
+    monkeypatch.setattr(QApplication, "exec", lambda self: pytest.fail("цикл событий не должен стартовать"))
+    assert main_module.main(["aprice-client"]) == 1
+    assert created == [] and len(shown) == 1 and "что-то сломалось" in shown[0]
 
 
 # ----------------------------------------------------------------------

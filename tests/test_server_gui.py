@@ -116,7 +116,7 @@ RUNNING_STATUS = {
 # ----------------------------------------------------------------------
 def test_tray_initial_tooltip_and_icon(tray):
     """TR-01/TR-02: иконка не пустая, подсказка — «ожидание заданий»."""
-    assert tray.toolTip() == TOOLTIP_IDLE == "АвтоПрайс: ожидание заданий"
+    assert tray.toolTip() == TOOLTIP_IDLE == "Сервер ожидает заданий"
     assert not tray.icon().isNull()
     assert not tray.icon().pixmap(32, 32).isNull()
 
@@ -353,13 +353,14 @@ def dialog(qapp, wm):
 
 
 def test_captcha_dialog_texts_and_buttons(dialog):
-    """CD-02/CD-03/CD-06: тексты, кнопки и немодальность."""
+    """CD-02/CD-03/CD-06 (+5.7): тексты, три кнопки и немодальность."""
     assert dialog.windowTitle() == "Обнаружена CAPTCHA"
     assert dialog.text() == (
-        "На площадке auto.ru требуется прохождение CAPTCHA.\n"
-        "Открыть страницу в браузере?"
+        "На площадке auto.ru требуется CAPTCHA.\n"
+        "Откройте браузер, решите её, а затем нажмите «Я решил, продолжить»."
     )
     assert dialog.button_open.text() == "Открыть браузер"
+    assert dialog.button_resume.text() == "Я решил, продолжить"
     assert dialog.button_skip.text() == "Пропустить сайт"
     assert dialog.isModal() is False
     assert dialog.defaultButton() is dialog.button_skip
@@ -378,24 +379,45 @@ def test_captcha_dialog_always_centered(dialog, qapp):
     assert_centered(dialog, CENTER_TOLERANCE_PX)
 
 
-def test_captcha_dialog_open_browser_emits_url(dialog):
-    """CD-04: «Открыть браузер» -> open_browser_requested(url) + accept()."""
+def test_captcha_dialog_open_browser_emits_url_and_stays_open(dialog):
+    """CD-04 (5.7): «Открыть браузер» -> open_browser_requested(url); диалог остаётся открытым."""
     opened, skipped = Spy(dialog.open_browser_requested), Spy(dialog.skip_site_requested)
+    resumed = Spy(dialog.resume_requested)
     dialog.show()
     dialog.button_open.click()
     assert opened.calls == [("https://auto.ru/captcha?x=1",)]
-    assert skipped.calls == []
-    assert not dialog.isVisible()
-    dialog.reject()  # после выбора «Открыть» пропуска быть не должно
-    assert skipped.calls == []
+    assert skipped.calls == [] and resumed.calls == []
+    assert dialog.isVisible()  # нужно, чтобы потом нажать «Я решил, продолжить»
+
+
+def test_captcha_dialog_resume_emits_once_and_closes(dialog):
+    """5.7: «Я решил, продолжить» -> resume_requested один раз, диалог закрыт, пропуска нет."""
+    resumed, skipped = Spy(dialog.resume_requested), Spy(dialog.skip_site_requested)
+    dialog.show()
+    dialog.button_open.click()
+    dialog.button_resume.click()
+    assert len(resumed.calls) == 1 and not dialog.isVisible()
+    dialog.button_resume.click()
+    dialog.reject()  # после «продолжить» пропуска быть не должно
+    assert len(resumed.calls) == 1 and skipped.calls == []
+
+
+def test_captcha_dialog_close_after_open_browser_counts_as_skip(dialog):
+    """Открыл браузер, но закрыл окно без «Я решил» — это пропуск (не застревать)."""
+    opened, skipped = Spy(dialog.open_browser_requested), Spy(dialog.skip_site_requested)
+    dialog.show()
+    dialog.button_open.click()
+    dialog.reject()
+    assert len(opened.calls) == 1 and len(skipped.calls) == 1
 
 
 def test_captcha_dialog_skip_site_emits_signal(dialog):
     """CD-05: «Пропустить сайт» -> skip_site_requested ровно один раз."""
     opened, skipped = Spy(dialog.open_browser_requested), Spy(dialog.skip_site_requested)
+    resumed = Spy(dialog.resume_requested)
     dialog.show()
     dialog.button_skip.click()
-    assert len(skipped.calls) == 1 and opened.calls == []
+    assert len(skipped.calls) == 1 and opened.calls == [] and resumed.calls == []
     assert not dialog.isVisible()
     dialog.reject()
     assert len(skipped.calls) == 1  # повторного сигнала нет

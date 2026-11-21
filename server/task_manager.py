@@ -58,6 +58,7 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from common import constants
 from common.config import Config
 from common.utils import interruptible_sleep
+from server import captcha_gate
 from server import protocol
 from server.parsers import get_parser
 from server.parsers.base import (
@@ -222,6 +223,7 @@ class TaskManager(QObject):
         self._store = state_store
         self._parsers: dict[str, BaseSiteParser] = {}  # site -> парсер (кэш)
         self._parsers_lock = threading.Lock()
+        self._captcha = captcha_gate.CaptchaGate()  # 5.7: ожидание решения CAPTCHA
         self._tasks: dict[str, Task] = {}
         self._queue: deque[str] = deque()
         self._current_id: Optional[str] = None
@@ -796,6 +798,7 @@ class TaskManager(QObject):
         kind: str,
         message: str,
         url: Optional[str] = None,
+        notify: bool = True,
     ) -> None:
         """Фиксирует ошибку площадки и приостанавливает **только её**.
 
@@ -808,8 +811,74 @@ class TaskManager(QObject):
             )
             task.failed_sites[site] = kind
         logger.warning("Задание %s: %s на %s (%s)", task.task_id, kind, site, message)
-        if kind == "captcha":
+        if kind == "captcha" and notify:
             self._sig_captcha.emit(task.task_id, site, url or "")
+
+    @staticmethod
+    def _captcha_policy(task: Task) -> str:
+        """``wait`` (по умолчанию) — пауза до решения пользователя; ``skip`` — как раньше."""
+        return "skip" if task.options.get("captcha_policy") == "skip" else "wait"
+
+    def _handle_captcha(self, task: Task, site: str, exc: CaptchaDetectedError) -> str:
+        """CAPTCHA на площадке (рабочий поток): пауза до решения пользователя (5.7).
+
+        Площадка **не пропускается**: рассылается ``captcha_required`` (диалог с кнопками
+        «Открыть браузер» / «Я решил, продолжить» / «Пропустить сайт»), поток ждёт решения.
+
+        Returns:
+            ``"retry"`` — пользователь решил капчу: пауза и повтор той же страницы;
+            ``"skip"`` — площадка пропущена (отмечена ``captcha`` в ``failed_sites``);
+            ``"stop"`` — задание остановлено во время ожидания.
+        """
+        url = getattr(exc, "url", "") or ""
+        if self._captcha_policy(task) == "skip":
+            self._record_failure(task, site, "captcha", str(exc), url)
+            return "skip"
+        with task.lock:
+            task.errors.append(
+                {"site": site, "kind": "captcha", "ts": _utc_now_iso(), "message": str(exc)}
+            )
+        self._captcha.open(task.task_id, site, url)
+        logger.warning("Задание %s: CAPTCHA на %s — пауза до решения пользователя", task.task_id, site)
+        self._sig_captcha.emit(task.task_id, site, url)
+        decision = self._captcha.wait(task.task_id, site, task.stop_event)
+        if decision is None or task.stop_event.is_set():
+            return "stop"
+        if decision == captcha_gate.SKIP:
+            with task.lock:
+                task.failed_sites[site] = "captcha"
+            logger.info("Задание %s: площадка %s пропущена пользователем", task.task_id, site)
+            return "skip"
+        delay = float(task.options.get("captcha_resume_delay", captcha_gate.RESUME_DELAY_SEC))
+        logger.info("Задание %s: CAPTCHA на %s решена — повтор через %.0f с", task.task_id, site, delay)
+        if delay > 0 and not interruptible_sleep(task.stop_event, delay):
+            return "stop"
+        return "retry"
+
+    # ---- 5.7: решения пользователя из диалога CAPTCHA (вызываются из потока GUI) ----
+    def resume_site(self, site: str, task_id: Optional[str] = None) -> bool:
+        """«Я решил, продолжить»: Server через 5 с повторяет ту же страницу площадки.
+
+        Returns:
+            bool: ``True``, если площадка действительно ждала решения.
+        """
+        return self._captcha.resume(site, task_id)
+
+    def skip_site(self, site: str, task_id: Optional[str] = None) -> bool:
+        """«Пропустить сайт»: площадка пропускается, сбор идёт дальше."""
+        return self._captcha.skip(site, task_id)
+
+    def captcha_waiting(self, task_id: Optional[str] = None) -> dict[str, str]:
+        """Площадки, ожидающие решения CAPTCHA: ``{site: url}``.
+
+        Непустой результат = задание приостановлено на этих площадках. Состояние задания
+        в замороженном контракте (``protocol.TASK_STATES``) остаётся ``running``.
+        """
+        return self._captcha.waiting(task_id)
+
+    def is_paused(self, task_id: Optional[str] = None) -> bool:
+        """``True``, если у задания есть площадка, ожидающая решения CAPTCHA."""
+        return bool(self._captcha.waiting(task_id))
 
     def _on_page_collected(
         self, task: Task, site: str, page: int, ads: list[Ad]
@@ -912,25 +981,34 @@ class TaskManager(QObject):
                     if task.stop_event.is_set():
                         return
 
-                    try:
-                        ads = parser.fetch_page(
-                            task.spec, dict(task.options), page, task.stop_event
-                        )
-                    except CaptchaDetectedError as exc:
-                        self._record_failure(task, site, "captcha", str(exc), exc.url)
-                        continue
-                    except BlockedError as exc:
-                        self._record_failure(task, site, "blocked", str(exc))
-                        continue
-                    except UnsupportedSiteError as exc:
-                        self._record_failure(task, site, "unsupported", str(exc))
-                        continue
-                    except Exception as exc:  # noqa: BLE001 - ошибка парсера
-                        logger.exception("[%s] ошибка парсера", site)
-                        self._record_failure(
-                            task, site, "error", f"{type(exc).__name__}: {exc}"
-                        )
-                        continue
+                    ads = None
+                    while True:  # повтор той же страницы после «Я решил, продолжить» (5.7)
+                        try:
+                            ads = parser.fetch_page(
+                                task.spec, dict(task.options), page, task.stop_event
+                            )
+                            break
+                        except CaptchaDetectedError as exc:
+                            action = self._handle_captcha(task, site, exc)
+                            if action == "stop":
+                                return
+                            if action == "retry":
+                                continue
+                            break  # "skip": площадка отмечена как отказавшая
+                        except BlockedError as exc:
+                            self._record_failure(task, site, "blocked", str(exc))
+                            break
+                        except UnsupportedSiteError as exc:
+                            self._record_failure(task, site, "unsupported", str(exc))
+                            break
+                        except Exception as exc:  # noqa: BLE001 - ошибка парсера
+                            logger.exception("[%s] ошибка парсера", site)
+                            self._record_failure(
+                                task, site, "error", f"{type(exc).__name__}: {exc}"
+                            )
+                            break
+                    if ads is None:
+                        continue  # площадка пропущена/отказала — к следующей
 
                     if task.stop_event.is_set() and not ads:
                         return  # остановка во время запроса, страницы нет
@@ -945,4 +1023,5 @@ class TaskManager(QObject):
                 task.errors.append({"type": type(exc).__name__, "message": str(exc)})
             task.failure_reason = f"{type(exc).__name__}: {exc}"
         finally:
+            self._captcha.release_task(task.task_id)  # никто не должен остаться ждать капчу
             self._sig_finished.emit(task.task_id)

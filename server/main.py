@@ -129,7 +129,7 @@ class ServerApp(QObject):
         self.tray: Optional[TrayIcon] = None
         self.progress_window: Optional[ProgressWindow] = None
         self._active_captcha: Optional[CaptchaDialog] = None
-        self._pending_captchas: deque[tuple[str, str]] = deque()
+        self._pending_captchas: deque[tuple[str, str, str]] = deque()  # (task_id, site, url)
 
     # ------------------------------------------------------------------
     # Запуск и остановка
@@ -138,6 +138,28 @@ class ServerApp(QObject):
     def active_captcha(self) -> Optional[CaptchaDialog]:
         """Текущий (удерживаемый от GC) диалог CAPTCHA или ``None``."""
         return self._active_captcha
+
+    def show_tray_early(self) -> bool:
+        """Создаёт и сразу показывает иконку в трее (5.7) — до Chromium, IPC и заданий.
+
+        Иконка с подсказкой «Сервер ожидает заданий» появляется в первые секунды работы,
+        а не после старта задания (установка Chromium на первом запуске длится минуты).
+        Если порт IPC уже занят (запущен другой экземпляр), иконка не создаётся — второй
+        экземпляр сразу завершится.
+
+        Returns:
+            bool: ``True`` — иконка показана (или уже была).
+        """
+        if self.tray is not None:
+            return True
+        if self.ipc_server.is_port_in_use():
+            logger.info("Порт IPC занят — иконку в трее не показываю (второй экземпляр)")
+            return False
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("Системный трей недоступен: иконка может не отображаться")
+        self.tray = TrayIcon(self.task_manager)
+        self.tray.show()
+        return True
 
     def start(self) -> bool:
         """Захватывает порт, связывает компоненты, восстанавливает задания, показывает GUI.
@@ -150,6 +172,8 @@ class ServerApp(QObject):
             окно о втором экземпляре уже показано; ``True`` — сервер работает.
         """
         if not self.guard.acquire():
+            if self.tray is not None:  # гонка: иконку успели показать, а порт занял другой процесс
+                self.tray.hide()
             return False
 
         _connect_ipc_to_task_manager(self.ipc_server, self.task_manager, logger)
@@ -167,7 +191,8 @@ class ServerApp(QObject):
         """Создаёт трей и окно прогресса; ссылки хранятся в атрибутах (MN-04)."""
         if not QSystemTrayIcon.isSystemTrayAvailable():
             logger.warning("Системный трей недоступен: иконка может не отображаться")
-        self.tray = TrayIcon(self.task_manager)
+        if self.tray is None:  # обычно уже создан show_tray_early()
+            self.tray = TrayIcon(self.task_manager)
         self.progress_window = ProgressWindow(
             self.task_manager, window_manager=self._window_manager
         )
@@ -176,7 +201,7 @@ class ServerApp(QObject):
         self.tray.stop_requested.connect(self._stop_current)
         self.tray.quit_requested.connect(self._request_quit)
         self.progress_window.stop_requested.connect(self._stop_current)
-        self.tray.show()
+        self.tray.show()  # повторный show() безопасен
 
     def _on_client_disconnected(self, peer: str = "") -> None:
         """Клиент закрылся: если заданий нет и других Клиентов нет — завершаем сервер.
@@ -237,17 +262,20 @@ class ServerApp(QObject):
         """``captcha_required`` → диалог; при открытом диалоге — в очередь."""
         if self._active_captcha is not None and self._active_captcha.isVisible():
             logger.info("CAPTCHA-диалог уже открыт; %s поставлен в очередь", site)
-            self._pending_captchas.append((site, url))
+            self._pending_captchas.append((task_id, site, url))
             return
-        self._show_captcha(site, url)
+        self._show_captcha(site, url, task_id)
 
-    def _show_captcha(self, site: str, url: str) -> None:
-        """Создаёт и показывает диалог, сохраняя ссылку на него (КРИТИЧНО: GC)."""
+    def _show_captcha(self, site: str, url: str, task_id: Optional[str] = None) -> None:
+        """Создаёт и показывает диалог, сохраняя ссылку на него (КРИТИЧНО: GC).
+
+        5.7: «Я решил, продолжить» → ``task_manager.resume_site`` (Server повторит страницу),
+        «Пропустить сайт» → ``task_manager.skip_site``.
+        """
         dialog = CaptchaDialog(site, url)
         dialog.open_browser_requested.connect(self._open_captcha_url)
-        dialog.skip_site_requested.connect(
-            lambda: logger.info("Пользователь пропустил площадку %s", site)
-        )
+        dialog.resume_requested.connect(lambda: self._resume_site(site, task_id))
+        dialog.skip_site_requested.connect(lambda: self._skip_site(site, task_id))
         dialog.finished.connect(self._on_captcha_finished)
         self._active_captcha = dialog  # до show(): ссылка живёт с момента создания
         dialog.show()
@@ -259,11 +287,21 @@ class ServerApp(QObject):
         except Exception:  # noqa: BLE001 - сбой браузера не должен ронять сервер
             logger.exception("Не удалось открыть браузер для %s", url)
 
+    def _resume_site(self, site: str, task_id: Optional[str]) -> None:
+        """«Я решил, продолжить»: команда ``resume_site`` в TaskManager."""
+        logger.info("Пользователь решил CAPTCHA на %s — продолжаем", site)
+        self.task_manager.resume_site(site, task_id)
+
+    def _skip_site(self, site: str, task_id: Optional[str]) -> None:
+        """«Пропустить сайт» (кнопка, крестик, Esc): площадка пропускается."""
+        logger.info("Пользователь пропустил площадку %s", site)
+        self.task_manager.skip_site(site, task_id)
+
     def _on_captcha_finished(self, _result: int) -> None:
         """Диалог закрыт: показываем следующую ожидающую CAPTCHA, если есть."""
         if self._pending_captchas and not self._quitted:
-            site, url = self._pending_captchas.popleft()
-            self._show_captcha(site, url)
+            task_id, site, url = self._pending_captchas.popleft()
+            self._show_captcha(site, url, task_id)
 
 
 # ----------------------------------------------------------------------
@@ -420,11 +458,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             "Server starting, version=%s, python=%s, platform=%s",
             SERVER_VERSION, platform.python_version(), platform.platform(),
         )
+        server = ServerApp(app, config)
+        # 5.7: иконка в трее — сразу, до установки Chromium и запуска IPC/заданий.
+        server.show_tray_early()
         # 5.1: Chromium не вшит в сборку — при первом запуске ставим его.
         # Неудача не фатальна: сервер стартует, парсеры сообщат об ошибке сами.
         if not browser_check.ensure_chromium():
             logger.warning("Chromium недоступен — сбор объявлений работать не будет")
-        server = ServerApp(app, config)
         if not server.start():
             logger.warning("Сервер уже запущен, выходим")
             return 0

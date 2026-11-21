@@ -23,6 +23,16 @@ APPLICATION_NAME = "APrice-Client"
 WINDOW_ID = "client_main"
 
 
+def _show_fatal(message: str) -> None:
+    """Критическое сообщение без падения (само окно сообщения может не открыться)."""
+    try:
+        from PyQt6.QtWidgets import QMessageBox
+
+        QMessageBox.critical(None, "АвтоПрайс", message)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось показать сообщение об ошибке")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """Создаёт окно и контроллер, запускает цикл событий. Возвращает код выхода."""
     app = QApplication.instance() or QApplication(sys.argv if argv is None else argv)
@@ -35,7 +45,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # 5.5: база не вшита в дистрибутив — при первом запуске скачиваем её с зеркала.
     # Не вышло — ошибка уже показана, основное окно не открываем (без марок/моделей оно бесполезно).
-    if not ensure_database(config):
+    # 5.7: любая непредвиденная ошибка здесь — не трейсбек, а сообщение и штатный выход (код 1).
+    try:
+        database_ready = ensure_database(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Сбой при подготовке справочника")
+        _show_fatal(f"Не удалось подготовить справочник: {exc}")
+        return 1
+    if not database_ready:
         logger.error("Client не запущен: нет справочника aprice.db")
         return 1
 
